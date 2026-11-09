@@ -33,7 +33,7 @@ class VlmHandler(BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requested_model = request["model"]
         image = request["messages"][-1]["content"][1]["image_url"]["url"]
-        assert image.startswith("data:image/jpeg;base64,")
+        assert image.startswith("data:image/png;base64,")
         decision = self.server.decisions.pop(0)
         self.reply({"choices": [{"message": {"content": json.dumps(decision)}, "finish_reason": "stop"}]})
 
@@ -64,7 +64,7 @@ class HarnessTest(unittest.TestCase):
 
     def observe(self):
         self.frame += 1
-        return {"id": str(self.frame), "image": image_data((ROOT / "examples/baxter-d455.jpg").read_bytes())}
+        return {"id": str(self.frame), "image": image_data((ROOT / "tests/fixtures/white-pixel.png").read_bytes())}
 
     def predict(self, obs, options):
         self.inputs.append((obs["id"], obs["task_descriptions"]))
@@ -93,7 +93,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_file_preview_never_contacts_robot(self):
         self.vlm.decisions = [self.act]
-        self.assertEqual(self.invoke("--image", str(ROOT / "examples/baxter-d455.jpg")), 0)
+        self.assertEqual(self.invoke("--image", str(ROOT / "tests/fixtures/white-pixel.png")), 0)
         self.assertEqual(self.frame, 0)
         self.assertEqual(self.steps, [])
         self.assertEqual(len(self.inputs), 1)
@@ -103,7 +103,7 @@ class HarnessTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             code = main(["--vlm-port", str(self.vlm.server_port), "--vlm-model", "local-9b",
                          "--robot-port", "0", "--vla-port", "0", "plan",
-                         "--image", str(ROOT / "examples/baxter-d455.jpg"), "--task", "拿起红色物体"])
+                         "--image", str(ROOT / "tests/fixtures/white-pixel.png"), "--task", "拿起红色物体"])
         self.assertEqual(code, 0)
         self.assertEqual(self.vlm.requested_model, "local-9b")
         self.assertEqual(json.loads(out.getvalue())["subtask"], self.act["subtask"])
