@@ -124,7 +124,7 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.frame, 1)
         self.assertEqual(self.steps, [])
         self.assertEqual(self.inputs, [])
-        self.assertEqual(len(list(Path(self.dir.name).rglob('000-planner.jpg'))), 1)
+        self.assertEqual(len(list(Path(self.dir.name).rglob('000-planner.png'))), 1)
 
     def test_untranslated_subtask_never_reaches_english_policy(self):
         self.vlm.decisions = [{**self.act, "subtask": "抓取红色方块"}]
