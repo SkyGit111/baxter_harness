@@ -1,0 +1,13 @@
+name: Engineering regression
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run offline tests (no robot or GPU)
+        run: python3 -m unittest discover -s tests -v
+      - name: Check Python syntax
+        run: python3 -m compileall -q cix_harness deploy integrations

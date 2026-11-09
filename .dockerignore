@@ -1,0 +1,12 @@
+**
+!cix_harness/
+!cix_harness/*.py
+!cix_harness/upstream/
+!cix_harness/upstream/*.py
+!deploy/
+!deploy/Dockerfile.*
+!deploy/llama-b12121-arm64.tar.gz
+!deploy/wheels/
+!deploy/wheels/*.whl
+!third_party/
+!third_party/*

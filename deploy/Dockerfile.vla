@@ -1,0 +1,13 @@
+FROM harbor.iluvatar.com.cn:10443/saas/ty1100-4.4.0-aarch64-ubuntu20.04-py3.10-ty-vla:v1.1-ty1100-4.4.0@sha256:1e77e024b61eff89945a9389fda3a42e271d611283efa33389db16591473d58b
+# The public checkpoint's custom generation code targets Transformers 4.40.1.
+# Keep the vendor's torch, flash attention, torchvision and COREX in place.
+COPY deploy/wheels /opt/cix-wheels
+RUN python3 -m pip install --no-index --find-links /opt/cix-wheels --no-deps --target /opt/openvla-python transformers==4.40.1 tokenizers==0.19.1 sentencepiece==0.2.0 timm==0.9.10
+ENV PYTHONPATH=/opt/openvla-python:/opt/harness:/usr/local/corex/lib64/python3/dist-packages
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUFFERED=1
+WORKDIR /opt/harness
+COPY cix_harness ./cix_harness
+COPY third_party ./third_party
+RUN python3 -c "import torch, transformers, timm, tokenizers, accelerate, sentencepiece; assert (transformers.__version__, tokenizers.__version__, timm.__version__) == ('4.40.1', '0.19.1', '0.9.10')"
+ENTRYPOINT ["python3", "-m", "cix_harness.vla"]
+CMD ["--model", "/models/openvla"]

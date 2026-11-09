@@ -1,0 +1,10 @@
+FROM ubuntu:24.04
+# Official ARM64 CPU binary requires glibc >= 2.38. Keep it in its own runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3t64 libgomp1 libstdc++6 && rm -rf /var/lib/apt/lists/*
+COPY deploy/llama-b12121-arm64.tar.gz /tmp/llama.tar.gz
+RUN echo '7b172aa70a9963737991baeaf4e5f2c0338860bdca91e5e9ea6836838a58e7bc  /tmp/llama.tar.gz' | sha256sum -c - \
+ && tar -xzf /tmp/llama.tar.gz -C /opt && rm /tmp/llama.tar.gz
+ENV LD_LIBRARY_PATH=/opt/llama-b12121
+WORKDIR /opt/llama-b12121
+RUN ./llama-server --version
+ENTRYPOINT ["/opt/llama-b12121/llama-server"]

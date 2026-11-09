@@ -1,0 +1,126 @@
+{
+  "qwen35-9b": {
+    "optional": true,
+    "repo": "unsloth/Qwen3.5-9B-GGUF",
+    "revision": "3885219b6810b007914f3a7950a8d1b469d598a5",
+    "files": [
+      {
+        "name": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size": 5680522464,
+        "hash": "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"
+      },
+      {
+        "name": "mmproj-F16.gguf",
+        "size": 918166080,
+        "hash": "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f"
+      }
+    ]
+  },
+  "qwen": {
+    "repo": "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF",
+    "revision": "5037fcf163dd95d1e41d1974465f0898ed108ca2",
+    "files": [
+      {
+        "name": "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+        "size": 1929901056,
+        "hash": "d02fe9b69ad8cadbbd228e387667af66612c44bed29ffc8eb1e7caf9ac486c12"
+      },
+      {
+        "name": "mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf",
+        "size": 844757728,
+        "hash": "980c9b2f78c04e6cff93d277ada09e768394f112d75db3b4e9dea8a69f9fb904"
+      }
+    ]
+  },
+  "openvla": {
+    "repo": "openvla/openvla-7b",
+    "revision": "47a0ec7fc4ec123775a391911046cf33cf9ed83f",
+    "files": [
+      {
+        "name": "README.md",
+        "size": 5038,
+        "hash": "5c6c0b051a677873c01aca3dbb84877b7189e53b"
+      },
+      {
+        "name": "added_tokens.json",
+        "size": 21,
+        "hash": "8671820d1bb0dfd4dd92d5bd0fa9b5a7773f843e"
+      },
+      {
+        "name": "config.json",
+        "size": 60712,
+        "hash": "42ea81c7c783049559839e305afdfe97e30581a3"
+      },
+      {
+        "name": "configuration_prismatic.py",
+        "size": 5865,
+        "hash": "c2625753c4da1a6ef274a02645d4086bc7a7fb2b"
+      },
+      {
+        "name": "generation_config.json",
+        "size": 136,
+        "hash": "2cefc1e51e6ccfe846d2b509ced403df73a8efe2"
+      },
+      {
+        "name": "model-00001-of-00003.safetensors",
+        "size": 6948961960,
+        "hash": "10d8636256018712c5e5c823d12e22b5797f99bb721bd123bf6bf2379892be85"
+      },
+      {
+        "name": "model-00002-of-00003.safetensors",
+        "size": 6971232040,
+        "hash": "2050b14f21d48904d269f48d5a980fecea87cd7b36641d9b0f015e72d1fe216a"
+      },
+      {
+        "name": "model-00003-of-00003.safetensors",
+        "size": 1162406824,
+        "hash": "ea65305a1577f36f721965bf84c8caec0a948ce7ce84d754701637376c531fef"
+      },
+      {
+        "name": "model.safetensors.index.json",
+        "size": 94764,
+        "hash": "d946bb8d409850ee48c26d09457670341e9289cf"
+      },
+      {
+        "name": "modeling_prismatic.py",
+        "size": 26062,
+        "hash": "4a26c487190fa2359007b30a78094a6c432d6519"
+      },
+      {
+        "name": "preprocessor_config.json",
+        "size": 1650,
+        "hash": "92975ace548590d24f65f497d7610af3b92b4dcd"
+      },
+      {
+        "name": "processing_prismatic.py",
+        "size": 12718,
+        "hash": "3f2daaf82c3b8946fe57596f656f14a031eaef93"
+      },
+      {
+        "name": "processor_config.json",
+        "size": 130,
+        "hash": "f892f8a8f53e2f3603a7cf86043a1add317c1787"
+      },
+      {
+        "name": "special_tokens_map.json",
+        "size": 552,
+        "hash": "ab75c8e0a22550f0667501a0c52758f071a9efd8"
+      },
+      {
+        "name": "tokenizer.json",
+        "size": 1842976,
+        "hash": "591f1fc6ff695d967513100f707e66d5bf731414"
+      },
+      {
+        "name": "tokenizer.model",
+        "size": 499723,
+        "hash": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347"
+      },
+      {
+        "name": "tokenizer_config.json",
+        "size": 1192,
+        "hash": "d39defd338dee423ae0a71abfd7ea69a44fb1e52"
+      }
+    ]
+  }
+}

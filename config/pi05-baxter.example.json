@@ -1,0 +1,7 @@
+{
+  "commissioned": false,
+  "policy_from_base_xyzw": [0, 0, 0, 1],
+  "policy_from_base_translation_m": [0, 0, 0],
+  "tool_frame_offset_xyzw": [0, 0, 0, 1],
+  "notes": "Uncalibrated read-only preview. Measure the task frame and tool frame before motion. Gripper percent is mapped to virtual Panda finger coordinates (+0.04*f, -0.04*f)."
+}

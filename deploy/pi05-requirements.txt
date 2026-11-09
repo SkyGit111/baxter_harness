@@ -1,0 +1,24 @@
+# Installed only into vendor/pi05-python with --no-deps. Keep vendor COREX Torch.
+tokenizers==0.21.4
+draccus==0.10.0
+datasets==3.6.0
+deepdiff==8.6.1
+gymnasium==1.1.1
+termcolor==3.1.0
+jsonlines==4.0.0
+av==14.2.0
+accelerate==1.10.1
+sentencepiece==0.2.0
+diffusers==0.35.1
+typing-inspect==0.9.0
+mypy-extensions==1.1.0
+pyyaml-include==1.4.1
+orderly-set==5.5.0
+mergedeep==1.3.4
+dill==0.3.8
+multiprocess==0.70.16
+xxhash==3.5.0
+pyarrow==20.0.0
+farama-notifications==0.0.4
+imageio==2.37.0
+pyserial==3.5
