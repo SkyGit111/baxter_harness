@@ -79,7 +79,7 @@ def action(skill,evidence):
     return {'decision':'act','reason':'none','skill':skill,'uv':None,'evidence':evidence}
 
 
-def run(args,log,robot=None,planner=decide):
+def run(args,log,robot=None,planner=decide,recovery_allowed=None):
     robot=robot or HttpRpcClient(args.robot_port)
     status=robot.call('healthz')
     if status.get('motion_scope')!='supervised_primitive_task':raise RuntimeError('Start the primitive bridge profile')
@@ -102,6 +102,8 @@ def run(args,log,robot=None,planner=decide):
         log('decision',**decision)
         if decision['decision']=='blocked' and decision['reason']=='occluded':
             log('recoverable_block',**decision)
+            if recovery_allowed and not recovery_allowed('occluded'):
+                log('finish',status='recovery_policy_stop');return 2
             decision=action('clear_view','Move aside and acquire a new image of the occluded target')
         if decision['decision']=='act' and decision['skill']=='clear_view':
             if not views:
@@ -145,6 +147,8 @@ def run(args,log,robot=None,planner=decide):
                 raise RuntimeError('Primitive failure is not safe to recover automatically')
             if empty_grasps>=max_grasp_retries or recoveries>=max_recoveries:
                 log('finish',status='grasp_recovery_budget_exhausted');return 2
+            if recovery_allowed and not recovery_allowed('empty_grasp'):
+                log('finish',status='recovery_policy_stop');return 2
             empty_grasps+=1;recoveries+=1;retract_pending=True;used_views.clear()
             log('recovery',kind='empty_grasp_retraction',attempt=empty_grasps)
             continue

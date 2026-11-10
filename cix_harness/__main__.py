@@ -48,7 +48,7 @@ def check_models(args):
     return vla, meta
 
 
-def run(args, log):
+def run(args, log, planner=decide):
     goal = instruction(args.task)
     model, meta = check_models(args)
     monitor=TaskMonitor(getattr(args,'task_kind','generic'))
@@ -88,10 +88,13 @@ def run(args, log):
         monitor.observe(obs.get('state',{}))
         if args.execute:
             monitor.require_progress()
-        if args.execute and monitor.stalled():
+        if args.execute and monitor.stalled() and not getattr(args, 'managed_harness', False):
             log('finish',status='no_measured_progress',evidence=monitor.evidence())
             return 2
-        decision = decide(args.vlm_port, goal, planner_obs, history, model=args.vlm_model)
+        if getattr(args, 'managed_harness', False):
+            planner_obs = {**planner_obs, 'harness_feedback': {'stalled': monitor.stalled(),
+                           'measured': monitor.evidence()}}
+        decision = planner(args.vlm_port, goal, planner_obs, history, model=args.vlm_model)
         log("decision", **decision)
         if decision['decision']=='done' and args.execute and not monitor.can_complete():
             log('finish',status='completion_not_supported_by_grasp_feedback',evidence=monitor.evidence())

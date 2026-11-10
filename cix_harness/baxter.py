@@ -137,7 +137,9 @@ class Baxter:
         self.camera = D455Camera(cfg.get("camera_serial", ""))
 
     def health(self):
+        from .memory import geometry_fingerprint
         return {"armed": self.armed, "can_preview_ik": self.calibrated_profile,
+                "environment_fingerprint": geometry_fingerprint(self.cfg),
                 "ik_solver": self.cfg.get('ik_solver', 'baxter_service'),
                 "can_inspect_ik": True,
                 "max_action_window": 4,
