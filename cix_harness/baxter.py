@@ -12,6 +12,9 @@ from .rpc import serve
 
 
 def validate_config(cfg, armed):
+    offset=cfg.get('robot_clock_offset_s',0.0)
+    if type(offset) not in (int,float) or not math.isfinite(offset) or abs(offset)>2:
+        raise ValueError('Measured robot clock offset must be finite and within two seconds')
     if cfg.get('ik_solver', 'baxter_service') not in ('baxter_service', 'kdl_continuous'):
         raise ValueError('Unknown IK solver')
     if cfg["arm"] not in ("left", "right") or not isinstance(cfg.get("camera_serial", ""), str):
@@ -157,7 +160,8 @@ class Baxter:
     def telemetry_time(self, stamp, key):
         # Independent robot/host clocks can differ by a few milliseconds. Never
         # extend freshness into the future, or refresh it with a repeated stamp.
-        age = (self.ros.Time.now() - stamp).to_sec()
+        # Explicit measured robot-minus-host offset, not a relaxed freshness limit.
+        age = (self.ros.Time.now() - stamp).to_sec() + self.cfg.get('robot_clock_offset_s',0.0)
         seconds = stamp.to_sec()
         if (not math.isfinite(age) or not math.isfinite(seconds) or
                 not -0.1 <= age < 0.5 or seconds <= self.state_stamps.get(key, -math.inf)):

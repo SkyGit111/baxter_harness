@@ -51,6 +51,10 @@ class BridgeTest(unittest.TestCase):
             self.assertIsNone(self.robot.telemetry_time(Stamp(100.2), 'endpoint'))
             self.assertIsNone(self.robot.telemetry_time(Stamp(99.4), 'endpoint'))
             self.assertAlmostEqual(self.robot.telemetry_time(Stamp(99.8), 'endpoint'), 199.8)
+            self.robot.cfg['robot_clock_offset_s']=.16
+            self.assertEqual(self.robot.telemetry_time(Stamp(100.16), 'offset_probe'),200)
+            self.assertIsNone(self.robot.telemetry_time(Stamp(100.16), 'offset_probe'))
+            self.assertIsNone(self.robot.telemetry_time(Stamp(99.5), 'stale_with_offset'))
 
     def test_action_is_one_shot_even_after_success(self):
         self.robot.step("frame", ACTION_SPEC, [0]*7)

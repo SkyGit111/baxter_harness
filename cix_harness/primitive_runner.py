@@ -9,9 +9,14 @@ SCHEMA={'type':'object','properties':{
  'decision':{'type':'string','enum':['act','done','blocked']},
  'skill':{'type':'string','enum':['',*SKILLS]},
  'uv':{'anyOf':[{'type':'null'},{'type':'array','items':{'type':'number'},'minItems':2,'maxItems':2}]},
- 'evidence':{'type':'string'}},'required':['decision','skill','uv','evidence'],'additionalProperties':False}
+ 'evidence':{'type':'string','minLength':1,'maxLength':300}},'required':['decision','skill','uv','evidence'],'additionalProperties':False}
 SYSTEM='''Control one Baxter arm using a fixed deterministic primitive library.
 Read the user's Chinese or English goal and the CURRENT image and measured state.
+The image may contain both arms; telemetry describes only state.arm. Do not assume
+the most prominent arm in the image is the controlled arm. The robot's left arm
+may appear on the right of an external camera view. Being far from the object,
+not yet above it, or having an empty closed gripper is NOT a reason to block pick:
+the pick primitive handles reaching, tool orientation and opening. IK checks reachability.
 Choose ONE skill: pick, place, stack, move_to, lift, retreat, open, close, home.
 For pick identify an interior point on the target object's TOP surface.
 For place identify the visible SUPPORT surface (table/container bottom); for stack identify
@@ -25,6 +30,7 @@ A closed empty gripper is not holding: gripping=false. gripper_percent 0=closed,
 Only choose done if the requested physical outcome is visible AND consistent with telemetry.
 If the intended target or support surface is occluded/ambiguous choose blocked.
 Terminal decisions require skill="" and uv=null. Return only decision,skill,uv,evidence JSON.'''
+SYSTEM += '\nKeep evidence to one or two short sentences, at most 120 characters. Do not repeat the task or instructions.'
 
 def decide(port,model,goal,obs,history):
     body={'model':model,'temperature':0,'max_tokens':350,'messages':[
