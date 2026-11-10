@@ -2,6 +2,10 @@
 import math
 
 
+class IKUnreachableError(ValueError):
+    """A different target/path may solve; model and telemetry validation passed."""
+
+
 class ContinuousIK:
     def __init__(self, arm):
         # Noetic's Python 3 parser must precede the obsolete Python 2 copy in
@@ -52,16 +56,16 @@ class ContinuousIK:
         goal = self.frame(target.pose.position,target.pose.orientation)
         output = k.JntArray(7)
         if self.solver.CartToJnt(seed,goal,output) < 0:
-            raise ValueError('No continuous joint-limited KDL solution')
+            raise IKUnreachableError('No continuous joint-limited KDL solution')
         for i in range(7):
             if not math.isfinite(output[i]) or not self.lower[i] <= output[i] <= self.upper[i]:
                 raise ValueError('KDL output violates joint limits')
             if abs(output[i]-seed[i]) > .15:
-                raise ValueError('KDL output exceeds 0.15 rad joint continuity limit')
+                raise IKUnreachableError('KDL output exceeds 0.15 rad joint continuity limit')
         verified = k.Frame()
         if self.fk.JntToCart(output,verified) < 0:
             raise RuntimeError('KDL result forward kinematics failed')
         residual = k.diff(verified,goal)
         if residual.vel.Norm() > .001 or residual.rot.Norm() > .005:
-            raise ValueError('KDL result does not reach the requested pose')
+            raise IKUnreachableError('KDL result does not reach the requested pose')
         return {name:float(output[i]) for i,name in enumerate(self.names)}

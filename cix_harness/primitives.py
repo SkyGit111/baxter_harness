@@ -6,7 +6,11 @@ import math
 from .contract import vector
 from .pi05_contract import quaternion, rotate
 
-SKILLS = ('pick', 'place', 'stack', 'move_to', 'lift', 'retreat', 'open', 'close', 'home')
+SKILLS = ('pick', 'place', 'stack', 'move_to', 'lift', 'retreat', 'open', 'close', 'home', 'clear_view')
+
+
+class TargetDepthError(ValueError):
+    """No motion occurred; a fresh image and a different interior pixel can help."""
 
 def number(value, low, high, name):
     if type(value) not in (float, int) or not math.isfinite(value) or not low <= value <= high:
@@ -29,6 +33,12 @@ def validate_profile(p):
         number(p[key],lo,hi,key)
     if not p['table_z_m']+p['table_clearance_m'] <= p['transit_z_m'] <= high[2]:
         raise ValueError('Transit height outside workspace')
+    views=p.get('observation_tcp_m',[])
+    if not isinstance(views,list) or len(views)>4:raise ValueError('Expected up to four observation positions')
+    for view in views:
+        xyz=vector(view,3,'observation TCP')
+        if any(not lo<=v<=hi for v,lo,hi in zip(xyz,low,high)) or xyz[2]<p['transit_z_m']:
+            raise ValueError('Observation position must be inside workspace and at/above transit height')
     return p
 
 def tcp_from_eef(xyz,q,p):
@@ -46,23 +56,24 @@ def ground_pixel(uv,depth,intrinsics,p):
     x=int(round(u*(w-1)));y=int(round(v*(h-1)))
     patch=depth[max(0,y-2):min(h,y+3),max(0,x-2):min(w,x+3)]
     good=patch[np.isfinite(patch)&(patch>.1)&(patch<3)]
-    if good.size<9: raise ValueError('Insufficient valid aligned depth at target')
+    if good.size<9: raise TargetDepthError('Insufficient valid aligned depth at target; select another interior point')
     z=float(np.median(good))
     if float(np.percentile(good,90)-np.percentile(good,10))>.025:
-        raise ValueError('Target point crosses a depth discontinuity; choose object interior')
+        raise TargetDepthError('Target point crosses a depth discontinuity; choose object interior')
     # Use RealSense deprojection, including the actual distortion model.
     import pyrealsense2 as rs
     camera=rs.rs2_deproject_pixel_to_point(intrinsics,[x,y],z)
     return [float(a+b) for a,b in zip(rotate(p['camera_to_base_xyzw'],camera),p['camera_to_base_translation_m'])]
 
-def plan(skill,state,p,target=None):
+def plan(skill,state,p,target=None,view_index=0):
     validate_profile(p)
     if skill not in SKILLS: raise ValueError('Unknown primitive')
     current=tcp_from_eef(state['eef_m'],state['eef_xyzw'],p)
     orientation=p['tool_orientation_xyzw']
     holding=state.get('gripping')
-    if holding not in (True,False): raise ValueError('Grasp telemetry unknown')
+    if type(holding) is not bool: raise ValueError('Grasp telemetry unknown')
     if skill=='pick' and holding: raise ValueError('Already holding an object')
+    if skill=='open' and holding: raise ValueError('Use place/stack to release a held object onto a support')
     if skill in ('place','stack') and not holding: raise ValueError('Placement requires a held object')
     stages=[]
     def move(xyz,q=None):
@@ -91,6 +102,21 @@ def plan(skill,state,p,target=None):
         elif skill in ('place','stack'):
             grip(True);stages.append({'kind':'verify_grasp','held':False})
             move([point[0],point[1],z])
+    elif skill=='clear_view':
+        views=p.get('observation_tcp_m',[])
+        if type(view_index) is not int or not 0<=view_index<len(views):
+            raise ValueError('No configured observation position at this index')
+        view=vector(views[view_index],3,'observation TCP')
+        if math.dist(current,view)<.02:raise ValueError('Already at observation position')
+        floor=p['table_z_m']+p['table_clearance_m']
+        if holding and view[2]<floor+p['held_bottom_below_tcp_m']:
+            raise ValueError('Held object would cross table at observation position')
+        z=max(current[2],view[2],p['transit_z_m'])
+        # Lift before translating. Preserve tool orientation and never operate the gripper.
+        move([current[0],current[1],z],state['eef_xyzw'])
+        move([view[0],view[1],z],state['eef_xyzw'])
+        move(view,state['eef_xyzw'])
+        if holding:stages.append({'kind':'verify_grasp','held':True})
     elif skill in ('lift','retreat'):
         move([current[0],current[1],current[2]+p['lift_m']],state['eef_xyzw'])
         if holding:stages.append({'kind':'verify_grasp','held':True})

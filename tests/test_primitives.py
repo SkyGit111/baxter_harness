@@ -8,6 +8,7 @@ from unittest.mock import Mock
 from cix_harness.primitives import plan, tcp_from_eef, eef_from_tcp, validate_profile
 from cix_harness.primitive_service import PrimitiveService
 from cix_harness.primitive_runner import run
+from cix_harness.kinematics import IKUnreachableError
 
 
 def profile():
@@ -62,13 +63,24 @@ class Execution(unittest.TestCase):
         with self.assertRaises(ValueError):s.execute('token')
     def test_empty_grasp_prevents_lift(self):
         s,r=self.service([{'kind':'gripper','open':False},{'kind':'verify_grasp','held':True},{'kind':'move'}])
-        with self.assertRaisesRegex(RuntimeError,'Empty grasp'):s.execute('token')
+        receipt=s.execute('token')
+        self.assertEqual(receipt['failure_code'],'empty_grasp')
+        self.assertTrue(receipt['stopped']);self.assertEqual(receipt['status'],'failed')
         r.move_segment.assert_not_called();r.grip.stop.assert_called_once()
     def test_ik_tracking_failure_prevents_release(self):
         s,r=self.service([{'kind':'move'},{'kind':'gripper','open':True}],True)
         r.arrival_error.return_value=(.03,0.)
         with self.assertRaisesRegex(RuntimeError,'reach target'):s.execute('token')
         r.grip.command_position.assert_not_called()
+    def test_failed_stop_never_returns_recoverable_empty_grasp(self):
+        s,r=self.service([{'kind':'gripper','open':False},{'kind':'verify_grasp','held':True}])
+        r.limb.set_joint_positions.side_effect=RuntimeError('Stop unavailable')
+        with self.assertRaisesRegex(RuntimeError,'Empty grasp'):s.execute('token')
+        with self.assertRaises(ValueError):s.execute('token')
+    def test_object_lost_after_lift_is_not_reported_as_empty_grasp(self):
+        s,r=self.service([{'kind':'verify_grasp','held':True},{'kind':'verify_grasp','held':True}],True)
+        r.grip.gripping.side_effect=[True,True,False]
+        with self.assertRaisesRegex(RuntimeError,'lost'):s.execute('token')
     def test_success_and_no_replay(self):
         s,r=self.service([{'kind':'gripper','open':True}])
         self.assertTrue(s.execute('token')['applied'])
@@ -91,15 +103,15 @@ class Runner(unittest.TestCase):
             if method=='primitive.prepare':return {'plan_id':'p'}
             if method=='primitive.execute':return {'plan_id':'p','applied':True}
             raise AssertionError(method)
-        robot=NS(call=call);planner=Mock(side_effect=[{'decision':'act','skill':'pick','uv':[.5,.5],'evidence':'cube'},
-                                                   {'decision':'done','skill':'','uv':None,'evidence':'lifted'}])
+        robot=NS(call=call);planner=Mock(side_effect=[{'decision':'act','reason':'none','skill':'pick','uv':[.5,.5],'evidence':'cube'},
+                                                   {'decision':'done','reason':'none','skill':'','uv':None,'evidence':'lifted'}])
         self.assertEqual(run(self.args(),Mock(),robot,planner),0)
         self.assertEqual(calls.count('primitive.execute'),1)
     def test_lost_reply_never_retries(self):
         robot=Mock()
         robot.call.side_effect=[{'motion_scope':'supervised_primitive_task','armed':True},
                                 {'id':'obs','image':'test','state':{'gripping':False}}, {'plan_id':'p'},TimeoutError('lost')]
-        planner=Mock(return_value={'decision':'act','skill':'pick','uv':[.5,.5],'evidence':'cube'})
+        planner=Mock(return_value={'decision':'act','reason':'none','skill':'pick','uv':[.5,.5],'evidence':'cube'})
         with self.assertRaises(TimeoutError):run(self.args(),Mock(),robot,planner)
         self.assertEqual(sum(c.args[0]=='primitive.execute' for c in robot.call.call_args_list),1)
 
@@ -112,13 +124,13 @@ class Preflight(unittest.TestCase):
         p=profile();r=Mock();r.cfg={'primitives':p,'max_observation_age_s':3}
         r.motion_remaining=64;r.joints.return_value={'j':0.}
         r.limb.endpoint_pose.return_value={'position':NS(x=.6,y=.2,z=.1),'orientation':NS(x=1.,y=0.,z=0.,w=0.)}
-        r.continuous_ik.solve.side_effect=[{'j':0.},ValueError('No continuous solution')]
+        r.continuous_ik.solve.side_effect=[{'j':0.},IKUnreachableError('No continuous solution')]
         service=PrimitiveService(r)
         st=state();st.update(joint_names=['j'],joint_rad=[0.])
         service.observation=({'id':'o','state':st},time.monotonic(),None)
         with patch.dict(sys.modules,{'geometry_msgs':NS(msg=geometry),'geometry_msgs.msg':geometry,'tf':tf}):
-            with self.assertRaisesRegex(ValueError,'No continuous'):
-                service.prepare('o','pick',target_base_m=[.7,.25,-.12])
+            result=service.prepare('o','pick',target_base_m=[.7,.25,-.12])
+            self.assertEqual(result['failure_code'],'ik_preflight');self.assertFalse(result['applied'])
         r.move_segment.assert_not_called();r.grip.command_position.assert_not_called()
         self.assertIsNone(service.prepared)
         self.assertIsNone(service.observation)

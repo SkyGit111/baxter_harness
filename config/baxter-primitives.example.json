@@ -65,6 +65,7 @@
     "held_bottom_below_tcp_m": 0.015,
     "max_leg_m": 0.4,
     "perception_max_age_s": 30,
+    "observation_tcp_m": [],
     "home_tcp_m": [
       0.6,
       0.2,
