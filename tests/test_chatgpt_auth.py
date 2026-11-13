@@ -204,6 +204,8 @@ class ChatGPTAuthTests(unittest.TestCase):
             from cryptography.hazmat.backends import default_backend
         except ImportError:
             self.skipTest('PyJWT[crypto] optional login dependency is not installed')
+        if not hasattr(jwt,'PyJWKClient'):
+            self.skipTest('Installed PyJWT is older than the optional ChatGPT authentication requirements')
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
         other = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
         base = {'sub': 'verified-subject', 'iss': auth.ISSUER, 'aud': 'oaiapp_test',
