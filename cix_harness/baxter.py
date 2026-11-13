@@ -32,12 +32,13 @@ def validate_config(cfg, armed):
             raise ValueError('Diagnostic travel radius must be at most 20 cm')
         if cfg.get('ik_solver') != 'kdl_continuous':
             raise ValueError('Supervised diagnostic requires continuous IK')
-    primitive_trial = scope == 'supervised_primitive_task'
-    task_trial = scope in ('supervised_policy_task','supervised_primitive_task')
+    hybrid_trial = scope == 'supervised_hybrid_task'
+    primitive_trial = scope in ('supervised_primitive_task','supervised_hybrid_task')
+    task_trial = scope in ('supervised_policy_task','supervised_primitive_task','supervised_hybrid_task')
     if task_trial:
         from .task_guard import validate_guard
-        if not primitive_trial: validate_guard(cfg['contact_guard'])
-        else:
+        if not primitive_trial or hybrid_trial: validate_guard(cfg['contact_guard'])
+        if primitive_trial:
             from .primitives import validate_profile
             validate_profile(cfg['primitives'])
             if armed and cfg['primitives'].get('calibrated') is not True:
@@ -138,7 +139,13 @@ class Baxter:
 
     def health(self):
         from .memory import geometry_fingerprint
+        scope = self.cfg.get('commissioning_scope', 'task_workspace')
+        capabilities = (['primitives', 'vla'] if scope == 'supervised_hybrid_task' else
+                        ['primitives'] if scope == 'supervised_primitive_task' else
+                        ['vla'] if scope in ('supervised_policy_task', 'task_workspace') else [])
         return {"armed": self.armed, "can_preview_ik": self.calibrated_profile,
+                "backend_capabilities": capabilities,
+                "hybrid_protocol": 'serialized_backends_v1' if scope == 'supervised_hybrid_task' else None,
                 "environment_fingerprint": geometry_fingerprint(self.cfg),
                 "ik_solver": self.cfg.get('ik_solver', 'baxter_service'),
                 "can_inspect_ik": True,
@@ -368,6 +375,17 @@ class Baxter:
         raise RuntimeError('Joint target did not settle')
 
     def guard_pose(self, pose):
+        if self.cfg.get('commissioning_scope') == 'supervised_hybrid_task':
+            # Both backends obey the intersection of the commissioned geometries.
+            from .primitives import tcp_from_eef
+            p, q = pose['position'], pose['orientation']
+            profile = self.cfg['primitives']
+            tcp = tcp_from_eef([p.x,p.y,p.z], [q.x,q.y,q.z,q.w], profile)
+            if any(not low <= value <= high for value,low,high in
+                   zip(tcp,profile['tcp_workspace_min_m'],profile['tcp_workspace_max_m'])):
+                raise ValueError('Hybrid TCP outside calibrated primitive workspace')
+            if tcp[2] < profile['table_z_m'] + profile['table_clearance_m']:
+                raise ValueError('Hybrid TCP below primitive table clearance')
         guard = self.cfg.get('contact_guard')
         if guard:
             from .task_guard import check_contact_pose
@@ -477,7 +495,7 @@ class Baxter:
         if not isinstance(actions,list) or not 1 <= len(actions) <= 4:
             raise ValueError('Expected a bounded action window of 1..4')
         actions=[action7(a) for a in actions]
-        if self.cfg.get('commissioning_scope') != 'supervised_policy_task':
+        if self.cfg.get('commissioning_scope') not in ('supervised_policy_task','supervised_hybrid_task'):
             raise RuntimeError('Action windows require a bounded task profile')
         if self.pending is None or self.pending[0] != obs_id:
             raise ValueError('Window requires a current unconsumed observation')
@@ -524,7 +542,7 @@ class Baxter:
         from .segments import compose_prefix
         from .task_guard import contact_bounds
         pending,self.pending=self.pending,None
-        if self.cfg.get('commissioning_scope') != 'supervised_policy_task' or not self.calibrated_profile:
+        if self.cfg.get('commissioning_scope') not in ('supervised_policy_task','supervised_hybrid_task') or not self.calibrated_profile:
             raise RuntimeError('Policy segments require a commissioned task profile')
         if spec != ACTION_SPEC or pending is None or pending[0] != obs_id:
             raise ValueError('Segment requires the current unconsumed observation')
@@ -651,6 +669,43 @@ class Baxter:
         return receipt
 
 
+def build_rpc_methods(robot):
+    """One serialized bridge owns both backends; never run competing robot writers."""
+    scope = robot.cfg.get('commissioning_scope')
+    primitives = None
+    methods = {'healthz': robot.health, 'env.observe': robot.observe,
+               'env.scene_snapshot': robot.scene_snapshot}
+    if scope in ('supervised_primitive_task','supervised_hybrid_task'):
+        from .primitive_service import PrimitiveService
+        primitives = PrimitiveService(robot)
+        methods.update({'primitive.observe': primitives.observe, 'primitive.prepare': primitives.prepare,
+                        'primitive.execute': primitives.execute})
+    if scope != 'supervised_primitive_task':
+        methods.update({'env.preview': robot.preview, 'env.inspect': robot.inspect_action, 'env.step': robot.step,
+                        'env.step_chunk': robot.step_chunk, 'env.preview_segment': robot.preview_segment,
+                        'env.step_segment': robot.step_segment})
+    if scope == 'supervised_hybrid_task':
+        # serve() uses HTTPServer, so a tool call cannot overlap another tool call.
+        # Invalidate on entry even if validation fails. A fresh observation is
+        # required after changing backend; a primitive observation cannot be used
+        # as an accidentally valid policy token created by its internal observe().
+        def bind(name, method):
+            def invoke(*args, **kwargs):
+                if name.startswith('primitive.'):
+                    robot.pending = None
+                    try:
+                        return method(*args, **kwargs)
+                    finally:
+                        robot.pending = None
+                primitives.observation = None
+                primitives.prepared = None
+                return method(*args, **kwargs)
+            return invoke
+        methods = {name: (method if name == 'healthz' else bind(name,method))
+                   for name,method in methods.items()}
+    return methods
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -667,18 +722,7 @@ def main():
     def terminate(signum, frame):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, terminate)
-    methods = {}
-    if cfg.get('commissioning_scope') == 'supervised_primitive_task':
-        from .primitive_service import PrimitiveService
-        primitives = PrimitiveService(robot)
-        methods = {'primitive.observe':primitives.observe, 'primitive.prepare':primitives.prepare,
-                   'primitive.execute':primitives.execute}
-    methods.update({"healthz":robot.health,"env.observe":robot.observe,
-                    "env.scene_snapshot":robot.scene_snapshot})
-    if cfg.get('commissioning_scope') != 'supervised_primitive_task':
-        methods.update({"env.preview":robot.preview,"env.inspect":robot.inspect_action,"env.step":robot.step,
-                        "env.step_chunk":robot.step_chunk,"env.preview_segment":robot.preview_segment,
-                        "env.step_segment":robot.step_segment})
+    methods = build_rpc_methods(robot)
     try:
         serve(args.port, methods)
     finally:

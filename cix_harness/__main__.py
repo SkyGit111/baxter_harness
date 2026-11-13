@@ -38,9 +38,10 @@ class Journal:
 
 
 def check_models(args):
-    models = local_json(args.vlm_port, "/v1/models", timeout=8)
-    if args.vlm_model not in [model.get("id") for model in models["data"]]:
-        raise RuntimeError("Local planner does not serve requested model: " + args.vlm_model)
+    if getattr(args,'planner_provider','local') != 'api':
+        models = local_json(args.vlm_port, "/v1/models", timeout=8)
+        if args.vlm_model not in [model.get("id") for model in models["data"]]:
+            raise RuntimeError("Local planner does not serve requested model: " + args.vlm_model)
     vla = HttpRpcClient(args.vla_port)
     meta = vla.call("healthz", timeout_s=8)
     if meta.get("action_spec") != ACTION_SPEC:

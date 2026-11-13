@@ -1,0 +1,85 @@
+{
+  "arm": "left",
+  "camera_serial": "",
+  "commissioned": false,
+  "policy_to_base_xyzw": [
+    0,
+    0,
+    0,
+    1
+  ],
+  "workspace_min_m": null,
+  "workspace_max_m": null,
+  "max_observation_age_s": 3,
+  "commissioning_scope": "supervised_hybrid_task",
+  "ik_solver": "kdl_continuous",
+  "motion_budget": 64,
+  "lease_seconds": 600,
+  "max_translation_m": 0.12,
+  "max_rotation_rad": 0.15,
+  "joint_speed_rad_s": 0.12,
+  "arrival_position_tolerance_m": 0.01,
+  "require_wrist": false,
+  "primitives": {
+    "calibrated": false,
+    "frame": "base",
+    "camera_to_base_xyzw": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "camera_to_base_translation_m": [
+      0,
+      0,
+      0
+    ],
+    "tcp_offset_tool_m": [
+      0,
+      0,
+      0
+    ],
+    "tool_orientation_xyzw": [
+      1,
+      0,
+      0,
+      0
+    ],
+    "tcp_workspace_min_m": [
+      0.35,
+      -0.65,
+      -0.15
+    ],
+    "tcp_workspace_max_m": [
+      1.05,
+      0.65,
+      0.45
+    ],
+    "table_z_m": -0.18,
+    "table_clearance_m": 0.01,
+    "transit_z_m": 0.05,
+    "approach_m": 0.1,
+    "lift_m": 0.1,
+    "grasp_inset_m": 0.015,
+    "release_clearance_m": 0.005,
+    "held_bottom_below_tcp_m": 0.015,
+    "max_leg_m": 0.4,
+    "perception_max_age_s": 30,
+    "observation_tcp_m": [],
+    "home_tcp_m": [
+      0.6,
+      0.2,
+      0.15
+    ],
+    "notes": "EXAMPLE ONLY: measure camera optical frame -> base, TCP and held-object bottom offset. No prior lab calibration is asserted."
+  },
+  "contact_guard": {
+    "source": "operator_confirmed_fingertips_at_table",
+    "reference_eef_m": null,
+    "reference_eef_xyzw": null,
+    "clearance_m": 0.01,
+    "radius_m": 0.2,
+    "tool_extent_bound_m": 0.1
+  },
+  "hybrid_notes": "EXAMPLE ONLY: fill measured contact_guard, primitive geometry and policy frame; both geometries apply. Do not arm with example data."
+}

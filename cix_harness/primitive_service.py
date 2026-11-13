@@ -26,6 +26,7 @@ class PrimitiveService:
 
     def observe(self):
         self.prepared=None
+        self.observation=None
         obs=self.robot.observe()
         depth=self.robot.camera.last_depth
         if depth is None:raise RuntimeError('Aligned depth missing')
@@ -113,7 +114,7 @@ class PrimitiveService:
         prepared,self.prepared=self.prepared,None
         if prepared is None or prepared[0]!=plan_id:raise ValueError('Plan consumed or superseded; never replay')
         token,created,initial,stages,paths,operations,skill,holding=prepared;r=self.robot;p=self.profile
-        if not r.armed or r.cfg.get('commissioning_scope')!='supervised_primitive_task':raise RuntimeError('Primitive bridge is read-only or wrong scope')
+        if not r.armed or r.cfg.get('commissioning_scope') not in ('supervised_primitive_task','supervised_hybrid_task'):raise RuntimeError('Primitive bridge is read-only or wrong scope')
         if p.get('calibrated') is not True:raise RuntimeError('Primitive geometry is not calibrated')
         if time.monotonic()-created>r.cfg['max_observation_age_s']:raise RuntimeError('Plan expired')
         if max(abs(r.joints()[k]-initial[k]) for k in initial)>.015:raise RuntimeError('Arm moved since planning')

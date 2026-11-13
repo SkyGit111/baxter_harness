@@ -2,6 +2,60 @@
 
 接手开发请先阅读 [项目完整交接](docs/项目完整交接.md)，包含当前路线、源码地图、现场验证边界、部署流程与后续计划。
 
+## 2026-11-13 备选路线：API 高层与逐步混合执行
+
+开发分支 `codex/api-hybrid-harness` 保存此前的任务执行管理/记忆修改，并增加这条备选路线。两个配置维度现在独立：`--planner-provider local/api` 决定高层模型在哪里运行；`--route primitives/vla/hybrid` 决定可选工具集合。原来的板端路线仍可使用。以下是新代码的能力，11 月 10 日的记录是当时版本的边界。
+
+```mermaid
+flowchart TD
+    U[中文任务 / 新图 / 实测状态 / 任务记忆] --> P[本地 VLM 或旗舰模型 API]
+    P --> E[TaskExecutive：每步选择 backend、技能、目标、完成条件]
+    E --> C[code：受限计算程序 / 候选步骤数据]
+    C --> P
+    E --> D[统一串行调度]
+    D --> A[原语：RGB-D / 连续 IK / 抓放阶段]
+    D --> B[VLA：本地 π0.5 / 本体适配 / 有界 rollout]
+    A --> R[同一 Baxter 桥 / 预算 / 几何约束 / 运动租约]
+    B --> R
+    R --> F[真实回执与新观测]
+    F --> P
+```
+
+**本轮重构的实际内容：**
+
+- `task_plan.py`、`executive.py`：混合计划的每一步有独立 `backend=primitives/vla/code`。已验证失败后可以重新规划并更换后端；历史成功步骤仍保留。目标点必须重新绑定当前图像，模型不能凭旧点直接执行。代码结果保留在本次工作记忆中，供后续选择和重规划使用。
+- `api_planner.py`：Responses API 图像输入、结构化计划/检查点、环境变量认证、超时、拒绝/未完成响应检查、调用耗时和 token 用量记录。默认 `gpt-6-astra`，模型名和 HTTPS endpoint 可配置；不要求本地 VLM 同时运行。官方文档列出了该模型与图像输入/结构化输出支持：[模型文档](https://developers.openai.com/api/docs/models/gpt-6-astra)、[Responses 接口](https://developers.openai.com/api/reference/resources/responses/methods/create)。账号访问权限仍需实际验证。
+- `hybrid.py`：从实际服务发现可用后端，再把工具目录交给高层。不可用、契约不匹配或本体适配未放行的 VLA 不进入可执行工具集。收到不明执行结果时停止，不立即换另一个后端重做可能已经完成的动作。
+- `baxter.py`、`primitive_service.py`：新增 `supervised_hybrid_task`。同一桥进程串行承载原语和 VLA，两者共用运动预算和租约，服从原语 TCP 几何与接触边界的交集。切换后端会使另一后端的旧观测/计划失效；单路线配置不会因为客户端选择 hybrid 就自动开放另一种运动接口。
+- `code_tool.py`：解释受限 Python 语法，用 `data` 读取本轮数据、用 `result` 返回计算结果；支持计算、选择、排序和有限循环，也可返回候选技能组合数据。使用 AST 解释和资源限制，没有调用 Python `eval/exec`。不具备文件、网络、shell 或电机访问权限；它的结果须回到规划与验证流程，不能冒充物理任务完成。
+
+这里的 **code 是已经实现的计算工具，不是任意 Python/ROS 代码自动上线**。若后续需要模型自主编写新机器人技能，还需单独的隔离开发环境、技能构建/检查及工具注册流程。当前不把模型生成的代码直接放进有机器人权限的进程执行。
+
+### 参考了哪些开源实现
+
+| 实现与已核对源码 | 参考的具体逻辑 | 本项目的取舍 |
+| --- | --- | --- |
+| [RPent tools](https://github.com/RLinf/RPent/blob/main/robots/franka/tools.py)、[toolkit](https://github.com/RLinf/RPent/blob/main/rpent/tools/toolkit.py)（Apache-2.0） | VLA 与解析动作进入同一工具目录，统一参数/回执，改变环境的工具排他执行 | 保留当前已移植的 RPC/rollout 基础，新增逐步调度和同桥串行混合执行 |
+| [MAESTRO runner](https://github.com/penn-pal-lab/maestro/blob/main/maestro/runner.py)、[架构说明](https://github.com/penn-pal-lab/maestro/blob/main/docs/ARCHITECTURE.md)（MIT） | 生成执行代码，执行后回传图像、输出和机器人状态，再判断完成或重规划 | 参考反馈闭环，不照搬其 Franka/DROID 控制栈或直接 exec。其公开说明明确当前 release 尚不包含论文的 VLA 工具 |
+| [Code as Policies](https://github.com/google-research/google-research/blob/master/code_as_policies/Interactive_Demo.ipynb) | 生成 helper、组合语义工具与数据计算 | 参考代码组合方式；其简单 `exec_safe` 字符串过滤不能作为隔离执行机制，本项目使用受限解释器 |
+
+以上新增部分是基于这些实现逻辑做的 Baxter 适配，不声称完整移植这些项目，也不声称已解决 π0.5 跨本体迁移效果问题。
+
+### 配置与预览
+
+控制主机使用 `config/baxter-hybrid.example.json` 作为模板。它保留未标定状态和空测量字段，须填入现场核验的两套几何配置；启动方式仍是 `python3 -m cix_harness.baxter --config config/baxter-hybrid.local.json`，默认只读。两种运动后端由一个桥承载，不要启动两个抢占相机/机械臂的桥进程。
+
+在运行高层的机器上自行设置 `OPENAI_API_KEY` 环境变量，不将密钥写进配置或 Git。随后可预览：
+
+```bash
+python3 -m cix_harness.harness --planner-provider api --api-model gpt-6-astra \
+  --route hybrid --task '把青色方块叠到黄色方块上' --task-kind stack
+```
+
+该 API 模式会把当前图像、精简遥测、任务和相关经验发给配置的 API；请求使用 `store=false`，这不代表对供应商数据保留政策作额外保证。默认预览只计算/规划并预检选中的运动工具，不动机器人；现场配置和桥放行后才添加 `--execute`。本地高层也可选择 `--planner-provider local --route hybrid`。纯 API+原语不需要 π0.5；真正混用 VLA 需要动作模型服务与其已核验的本体适配。
+
+验证范围：本轮离线测试覆盖完整高层→代码计算→原语抓取→VLA 放置→结果核验、后端更换、共享预算与跨后端旧令牌拒绝、代码资源限制、API 响应解析以及通信不明时不重放。尚未发送真实云 API 请求、上传现场图像或执行新的真机动作；API 延迟、成本、模型选工具的可靠性以及混合抓取成功率均待实测。
+
 ## 2026-11-10 任务规划、执行管理与记忆
 
 新增日常任务入口 `python -m cix_harness.harness`。它共用同一套高层，显式选择 `--route primitives` 或 `--route vla`，再调用已经存在的原语执行器或 VLA rollout。旧入口保留用于直接联调；只有新入口启用下述任务计划和记忆，不会因更新文件就让正在运行的进程自动换行为。

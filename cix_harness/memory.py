@@ -52,7 +52,7 @@ class EpisodeMemory:
     def finish(self, episode, status, verified_steps, failures, recoveries=()):
         if status not in ('verified', 'blocked', 'unknown', 'preview'): raise ValueError('Invalid episode outcome')
         # Persist only a semantic recipe and classified failures, never UV/XYZ/joints/commands.
-        recipe = [{k: step[k] for k in ('skill', 'target', 'expect')}
+        recipe = [{k: step[k] for k in ('skill', 'target', 'expect', 'backend') if k in step}
                   for step in verified_steps[-6:]]
         summary = json.dumps({'recipe': recipe, 'failures': list(dict.fromkeys(failures))[-4:],
                               'recovery_attempts': list(dict.fromkeys(recoveries))[-3:]}, ensure_ascii=False)

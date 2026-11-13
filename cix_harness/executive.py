@@ -23,12 +23,19 @@ class TaskExecutive:
         self.applied = 0; self.origin = None; self.attempts = 0; self.step_failures = 0
         self.task_verified = False; self.closed = False; self.last_obs = None; self.status = 'running'
         self.last_target = None
+        self.code_result = None
+        self.code_completed = False
+        self.computations = []
         self.emit('task_started', episode=self.episode, goal=goal, route=route, mode=mode,
                   memory_matches=self.memories, cross_run_memory_enabled=scope is not None)
 
     @property
     def current(self):
         return self.steps[self.index] if self.index < len(self.steps) else None
+
+    @property
+    def backend(self):
+        return self.current.get('backend',self.route) if self.current else self.route
 
     def emit(self, event, **fields):
         self.log(event, **fields)
@@ -49,10 +56,13 @@ class TaskExecutive:
         self.monitor = TaskMonitor(); self.released = False; self.predictions = {}
         self.applied = 0; self.attempts = 0; self.step_failures = 0
         self.last_target = None
+        self.code_result = None
+        self.code_completed = False
         self.origin = obs.get('state', {}).get('eef_m')
         self.monitor.observe(obs.get('state', {}))
 
     def skills(self, obs):
+        if self.route=='hybrid':return sorted({s for values in obs.get('backend_skills',{}).values() for s in values})
         if self.route == 'vla': return list(VLA_SKILLS)
         return [s for s in obs.get('primitive_skills', SKILLS)
                 if s in SKILLS and (s != 'clear_view' or obs.get('recovery', {}).get('view_indices'))]
@@ -73,11 +83,14 @@ class TaskExecutive:
                    'available_skills': skills, 'skill_expect': {s: EXPECTED[s] for s in skills},
                    'verified': [{k: s[k] for k in ('skill', 'target')} for s in self.verified[-4:]],
                    'cause': cause, 'memory': self.memories[:1]}
+        if self.route=='hybrid':context['backend_skills']=obs.get('backend_skills',{})
+        if self.computations:context['computed_results']=self.computations[-2:]
         # One read-only format/contract repair. Never turn an invalid plan into a motor command.
         for repair in range(2):
             try:
                 reply = self.call_planner('plan', obs, context)
-                steps = validate_plan(reply, skills, obs.get('state', {}).get('gripping'))
+                steps = validate_plan(reply, skills, obs.get('state', {}).get('gripping'),
+                                      obs.get('backend_skills',{}) if self.route=='hybrid' else None)
                 break
             except ValueError as error:
                 self.emit('task_plan_rejected', message=str(error))
@@ -105,10 +118,11 @@ class TaskExecutive:
         return result
 
     def can_verify(self, obs):
+        if self.backend=='code':return self.code_completed and obs['id']!=self.last_action_obs
         if self.mode != 'live' or not self.current: return False
         state = obs.get('state', {}); skill = self.current['skill']; evidence = self.step_evidence(obs)
         if not evidence['fresh_after_action']: return False
-        if self.route == 'primitives':
+        if self.backend == 'primitives':
             if not self.primitive_ok: return False
             if skill == 'pick': return state.get('gripping') is True
             if skill in ('place', 'stack', 'open'):
@@ -123,7 +137,7 @@ class TaskExecutive:
         return (evidence['distance_from_start_m'] or 0) >= .02
 
     def terminal(self, kind, evidence, reason='none'):
-        if self.route == 'primitives':
+        if self.route in ('primitives','hybrid'):
             # The existing primitive executor understands these terminal categories.
             if reason == 'no_progress': reason = 'unreachable'
             return {'decision': kind, 'reason': reason, 'skill': '', 'uv': None, 'evidence': evidence}
@@ -152,7 +166,7 @@ class TaskExecutive:
                     return self.terminal('blocked', 'Replanning budget exhausted', 'no_progress')
         rejected = 0
         for _ in range(16):
-            if self.current and self.route == 'vla' and (self.attempts >= 3 or obs.get('harness_feedback', {}).get('stalled')):
+            if self.current and self.backend == 'vla' and (self.attempts >= 3 or obs.get('harness_feedback', {}).get('stalled')):
                 self.failures.append('no_progress')
                 if self.current['on_failure'] == 'stop':
                     return self.terminal('blocked', 'Step recovery policy requests stop after no verified progress', 'no_progress')
@@ -165,6 +179,7 @@ class TaskExecutive:
                        'remaining': [{'skill': s['skill'], 'target': s['target']} for s in self.steps[self.index+1:]],
                        'verified': [{'skill': s['skill'], 'target': s['target']} for s in self.verified[-4:]],
                        'step_evidence': self.step_evidence(obs), 'feedback': self.feedback}
+            if self.computations:context['computed_results']=self.computations[-2:]
             try:
                 answer = validate_check(self.call_planner('check', obs, context), self.route, self.current)
             except ValueError as error:
@@ -183,7 +198,7 @@ class TaskExecutive:
                     return self.terminal('blocked', 'Occlusion replanning budget exhausted', 'no_progress')
                 return self.terminal('blocked', answer['evidence'], answer['reason'])
             if kind == 'task_done':
-                if self.current or not self.verified or self.mode != 'live' or not self.final_state_consistent(obs):
+                if self.current or not self.verified or self.mode != 'live' or not self.final_state_consistent(obs) or all(s.get('backend')=='code' for s in self.verified):
                     self.feedback = {'failure_code': 'unverified_task_completion'}
                     self.emit('task_checkpoint_rejected', **self.feedback)
                     if rejected: return self.terminal('blocked', 'Task completion has no verified support', 'no_progress')
@@ -211,6 +226,10 @@ class TaskExecutive:
             self.dispatch = self.current['id'];self.last_action_obs = obs['id']
             self.last_target = {'obs_id': obs['id'], 'uv': answer['uv'], 'target': self.current['target']}
             self.emit('task_step_dispatch', step=self.current, obs_id=obs['id'], evidence=answer['evidence'])
+            if self.route=='hybrid':
+                return {'decision':'act','backend':self.backend,'skill':self.current['skill'],
+                        'subtask':self.current['instruction'],'uv':answer['uv'],'code':answer['code'],
+                        'evidence':answer['evidence']}
             if self.route == 'primitives':
                 return {'decision': 'act', 'reason': 'none', 'skill': self.current['skill'],
                         'uv': answer['uv'], 'evidence': answer['evidence']}
@@ -232,7 +251,15 @@ class TaskExecutive:
             self.feedback = {'failure_code': fields['reason']}
             return
         if not self.current or self.dispatch != self.current['id']: return
-        if name == 'primitive_plan':
+        if name == 'code_result':
+            if fields.get('status')=='failed':self.failed(fields.get('failure_code','code_error'))
+            else:
+                self.code_result=fields.get('result');self.current['status']='awaiting_verification';self.dispatch=None
+                self.code_completed=True
+                self.computations.append({'step_id':self.current['id'],'obs_id':self.last_action_obs,'result':self.code_result})
+                self.feedback={'status':'computed','result':self.code_result}
+                self.emit('task_step_computed',result=self.code_result)
+        elif name == 'primitive_plan':
             if fields.get('status') == 'rejected': self.failed(fields.get('failure_code', 'preflight_rejected'))
         elif name == 'primitive_result':
             if fields.get('skill') != self.current['skill']: return

@@ -19,16 +19,25 @@ def run(args, journal, robot=None, planner=None):
         raise RuntimeError('Primitive route requires the primitive bridge profile')
     if args.route == 'vla' and args.execute and health.get('motion_scope') not in ('supervised_policy_task', 'task_workspace'):
         raise RuntimeError('Managed VLA tasks require a task bridge, not a diagnostic/primitive profile')
+    provider=getattr(args,'planner_provider','local')
+    if planner is None and provider=='api':
+        from .api_planner import ResponsesTaskPlanner
+        planner=ResponsesTaskPlanner(args.api_model,args.api_base_url,args.api_key_env,args.api_timeout,journal)
+    planner=planner or VisualTaskPlanner(args.vlm_port,args.vlm_model)
+    identity=(getattr(args,'api_base_url','')+':'+getattr(args,'api_model','')) if provider=='api' else args.vlm_model
     memory = EpisodeMemory(args.memory)
     executive = None
     try:
         executive = TaskExecutive(instruction(args.task), args.route,
-            planner or VisualTaskPlanner(args.vlm_port, args.vlm_model), memory,
-            scope_key(health, args.route, args.vlm_model), journal,
+            planner, memory, scope_key(health, args.route, identity), journal,
             mode='live' if args.execute else 'preview', max_replans=args.max_replans,
             max_calls=args.max_planner_calls, snapshot=Path(journal.folder)/'task-state.json')
         log = ExecutiveJournal(journal, executive)
-        if args.route == 'primitives':
+        if args.route=='hybrid':
+            from .hybrid import run as run_hybrid
+            from .code_tool import CodeTool
+            result=run_hybrid(args,log,executive,robot=robot,code_tool=CodeTool())
+        elif args.route == 'primitives':
             result = run_primitives(args, log, robot=robot,
                 planner=lambda port, model, goal, obs, history: executive.choose(obs),
                 recovery_allowed=executive.recovery_allowed)
@@ -48,7 +57,12 @@ def run(args, journal, robot=None, planner=None):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--task', required=True)
-    p.add_argument('--route', choices=['primitives', 'vla'], default='primitives')
+    p.add_argument('--route', choices=['primitives', 'vla','hybrid'], default='primitives')
+    p.add_argument('--planner-provider',choices=['local','api'],default='local')
+    p.add_argument('--api-model',default='gpt-6-astra')
+    p.add_argument('--api-base-url',default='https://api.openai.com/v1')
+    p.add_argument('--api-key-env',default='OPENAI_API_KEY')
+    p.add_argument('--api-timeout',type=float,default=120)
     p.add_argument('--execute', action='store_true')
     p.add_argument('--vlm-port', type=int, default=9110)
     p.add_argument('--vlm-model', default='qwen35-9b')

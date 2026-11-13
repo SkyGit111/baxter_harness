@@ -1,6 +1,7 @@
 """Bounded semantic plans and fresh-image checkpoint decisions for both routes."""
 import json
 import re
+import copy
 
 from .contract import instruction, vector
 from .primitives import SKILLS, number
@@ -10,6 +11,7 @@ VLA_SKILLS = ('pick', 'place', 'stack', 'move_to', 'lift', 'retreat')
 EXPECTED = {'pick': 'held_and_lifted', 'place': 'released_on_support', 'stack': 'stacked',
             'move_to': 'at_target', 'lift': 'raised', 'retreat': 'clear_of_target',
             'clear_view': 'view_clear', 'home': 'at_home', 'open': 'gripper_open', 'close': 'gripper_closed'}
+EXPECTED['compute'] = 'computed'
 REASONS = ('none', 'occluded', 'ambiguous_target', 'not_found', 'unsafe', 'unreachable', 'no_progress')
 
 
@@ -63,7 +65,7 @@ Memory and previous pixels are historical, never grounds to replay a command.
 Evidence must be short (at most 120 characters) and refer to the CURRENT image.'''
 
 
-def validate_plan(reply, skills, held):
+def validate_plan(reply, skills, held, backend_skills=None):
     if not isinstance(reply, dict) or set(reply) != {'steps'}:
         raise ValueError('Expected a steps-only semantic plan')
     steps = reply['steps']
@@ -71,8 +73,11 @@ def validate_plan(reply, skills, held):
         raise ValueError('Plan needs 1-6 steps')
     holding = held
     for step in steps:
-        if not isinstance(step, dict) or set(step) != set(STEP_SCHEMA['required']):
+        required = set(STEP_SCHEMA['required']) | ({'backend'} if backend_skills is not None else set())
+        if not isinstance(step, dict) or set(step) != required:
             raise ValueError('Invalid plan step fields')
+        if backend_skills is not None and step.get('skill') not in backend_skills.get(step.get('backend'), []):
+            raise ValueError('Selected backend/skill is unavailable on this bridge')
         for key, limit in [('target', 100), ('instruction', 160)]:
             instruction(step[key])
             if len(step[key]) > limit: raise ValueError('Plan text too long')
@@ -98,7 +103,8 @@ def validate_plan(reply, skills, held):
 
 
 def validate_check(reply, route, step):
-    if not isinstance(reply, dict) or set(reply) != set(CHECK_SCHEMA['required']):
+    required=set(CHECK_SCHEMA['required']) | ({'code'} if route=='hybrid' else set())
+    if not isinstance(reply, dict) or set(reply) != required:
         raise ValueError('Invalid checkpoint decision fields')
     kind = reply['decision']
     if kind not in CHECK_SCHEMA['properties']['decision']['enum'] or reply['reason'] not in REASONS:
@@ -108,11 +114,16 @@ def validate_check(reply, route, step):
     if (kind in ('blocked', 'replan')) != (reply['reason'] != 'none'):
         raise ValueError('Checkpoint reason does not match decision')
     if kind in ('act', 'step_done') and step is None: raise ValueError('No remaining step')
-    targeted = kind == 'act' and route == 'primitives' and step['skill'] in ('pick', 'place', 'stack', 'move_to')
+    backend = step.get('backend', route) if step else route
+    targeted = kind == 'act' and backend == 'primitives' and step['skill'] in ('pick', 'place', 'stack', 'move_to')
     if targeted:
         for value in vector(reply['uv'], 2, 'target uv'): number(value, 0, 1, 'target uv')
     elif reply['uv'] is not None:
         raise ValueError('This decision cannot carry an image target')
+    if route=='hybrid':
+        code=reply['code']
+        if not isinstance(code,str) or len(code)>4000:raise ValueError('Invalid code source')
+        if (kind=='act' and backend=='code') != bool(code.strip()):raise ValueError('Code only belongs to a code action')
     return reply
 
 
@@ -140,7 +151,17 @@ class VisualTaskPlanner:
         return json.loads(choice['message']['content'])
 
     def plan(self, obs, context):
-        return self.request('task_plan', PLAN_SYSTEM, PLAN_SCHEMA, obs, context, 640)
+        schema=copy.deepcopy(PLAN_SCHEMA);system=PLAN_SYSTEM
+        if context.get('route')=='hybrid':
+            schema['properties']['steps']['items']['properties']['backend']={'type':'string','enum':['primitives','vla','code']}
+            schema['properties']['steps']['items']['required'].append('backend')
+            schema['properties']['steps']['items']['properties']['skill']['enum'].append('compute')
+            system+='\nChoose backend per step from backend_skills, not once per task. Use primitives for calibrated deterministic movement, VLA for learned motor behavior, code/compute for calculations or selecting/ordering data. Code does not actuate; its result informs later motor steps. Replan can switch backend after a verified failure. Never choose an unavailable backend.'
+        return self.request('task_plan', system, schema, obs, context, 640)
 
     def check(self, obs, context):
-        return self.request('task_checkpoint', CHECK_SYSTEM, CHECK_SCHEMA, obs, context, 180)
+        schema=copy.deepcopy(CHECK_SCHEMA);system=CHECK_SYSTEM;tokens=180
+        if context.get('route')=='hybrid':
+            schema['properties']['code']={'type':'string','maxLength':4000};schema['required'].append('code');tokens=1200
+            system+='\nUse current.backend. For code/compute act, code is a short Python subset assigning JSON-compatible result; input dictionary is named data. Only assignments, bounded for/if, arithmetic, lists/dicts/subscripts and safe min/max/sum/len/sorted/range/abs/round are available. No imports, attributes, files, shell, networking or motor API. Other decisions use code="". Code results are computational evidence, not physical task success; use them in later replanning.'
+        return self.request('task_checkpoint', system, schema, obs, context, tokens)
