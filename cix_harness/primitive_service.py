@@ -3,7 +3,8 @@ import math
 import time
 import uuid
 from .kinematics import IKUnreachableError
-from .primitives import SKILLS, TargetDepthError, validate_profile, plan, ground_pixel, eef_from_tcp, tcp_from_eef
+from .primitives import SKILLS, TargetDepthError, TargetWorkspaceError, validate_profile, plan, ground_pixel, eef_from_tcp, tcp_from_eef
+from .workspace import workspace_metadata
 
 
 class SceneChangedError(ValueError):
@@ -36,14 +37,17 @@ class PrimitiveService:
         obs['recovery']={'view_indices':[i for i,v in enumerate(views) if math.dist(tcp,v)>=.02],
                          'motion_remaining':self.robot.motion_remaining}
         obs['primitive_skills']=[s for s in SKILLS if s!='clear_view' or obs['recovery']['view_indices']]
+        import pyrealsense2 as rs
+        obs['workspace']=workspace_metadata(self.profile,self.robot.camera.intrinsics,rs.rs2_project_point_to_pixel)
         return obs
 
     def prepare(self,obs_id,skill,uv=None,target_base_m=None,view_index=0):
         try:
             return self._prepare(obs_id,skill,uv,target_base_m,view_index)
-        except (TargetDepthError,SceneChangedError,IKPreflightError) as error:
+        except (TargetDepthError,TargetWorkspaceError,SceneChangedError,IKPreflightError) as error:
             # Only these explicit, pre-actuation failures permit replanning.
-            code={TargetDepthError:'target_depth',SceneChangedError:'scene_changed',IKPreflightError:'ik_preflight'}[type(error)]
+            code={TargetDepthError:'target_depth',TargetWorkspaceError:'target_workspace',
+                  SceneChangedError:'scene_changed',IKPreflightError:'ik_preflight'}[type(error)]
             result={'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,
                     'failure_code':code,'message':str(error),'recoverable':True}
             self.robot.audit('primitive_prepare_rejected',**result)

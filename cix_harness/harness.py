@@ -22,7 +22,8 @@ def run(args, journal, robot=None, planner=None):
     provider=getattr(args,'planner_provider','local')
     if planner is None and provider=='api':
         from .api_planner import ResponsesTaskPlanner
-        planner=ResponsesTaskPlanner(args.api_model,args.api_base_url,args.api_key_env,args.api_timeout,journal)
+        planner=ResponsesTaskPlanner(args.api_model,args.api_base_url,args.api_key_env,args.api_timeout,journal,
+            auth=getattr(args,'api_auth','api-key'),credential_path=getattr(args,'chatgpt_credentials',None))
     planner=planner or VisualTaskPlanner(args.vlm_port,args.vlm_model)
     identity=(getattr(args,'api_base_url','')+':'+getattr(args,'api_model','')) if provider=='api' else args.vlm_model
     memory = EpisodeMemory(args.memory)
@@ -62,6 +63,8 @@ def main(argv=None):
     p.add_argument('--api-model',default='gpt-6-astra')
     p.add_argument('--api-base-url',default='https://api.openai.com/v1')
     p.add_argument('--api-key-env',default='OPENAI_API_KEY')
+    p.add_argument('--api-auth',choices=['api-key','chatgpt'],default='api-key')
+    p.add_argument('--chatgpt-credentials',type=Path,help='This project\'s OAuth store; defaults to user configuration directory')
     p.add_argument('--api-timeout',type=float,default=120)
     p.add_argument('--execute', action='store_true')
     p.add_argument('--vlm-port', type=int, default=9110)

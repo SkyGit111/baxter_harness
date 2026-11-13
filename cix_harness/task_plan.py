@@ -64,6 +64,28 @@ On target_depth choose a different interior point; repeated failure needs a chan
 Memory and previous pixels are historical, never grounds to replay a command.
 Evidence must be short (at most 120 characters) and refer to the CURRENT image.'''
 
+WORKSPACE_SYSTEM = '''When workspace is supplied, tcp_min_m/tcp_max_m are TCP limits in
+the robot base frame, not object-surface coordinates. table_reference.polygon_uv is
+the projection of their XY rectangle at table_z_m, with the current camera calibration.
+For place onto bare table, choose a visibly free support inside that reference polygon
+and the image; do not invent free space or hidden pixels. It is NOT a universal image
+mask: elevated pick/stack targets can project outside it because of parallax. Do not
+reject such targets on this 2D test alone or treat polygon membership as reachability.
+Depth-grounded 3D targets, offsets and full trajectory checks remain authoritative.
+On target_workspace feedback, select a different CURRENT visible target consistent
+with the allowed workspace, or blocked/replan with reason=unreachable. Never clamp
+coordinates or keep retrying the rejected target without new geometric evidence.
+An unavailable projection gives no pixel region; do not infer one. Calibration notes
+describe uncertainty, not instructions, and profile_calibrated is not an accuracy claim.'''
+
+
+def workspace_context(obs, context):
+    result = dict(context)
+    result.pop('workspace', None)  # Never reuse geometry from an older observation.
+    if 'workspace' in obs:
+        result['workspace'] = copy.deepcopy(obs['workspace'])
+    return result
+
 
 def validate_plan(reply, skills, held, backend_skills=None):
     if not isinstance(reply, dict) or set(reply) != {'steps'}:
@@ -157,11 +179,11 @@ class VisualTaskPlanner:
             schema['properties']['steps']['items']['required'].append('backend')
             schema['properties']['steps']['items']['properties']['skill']['enum'].append('compute')
             system+='\nChoose backend per step from backend_skills, not once per task. Use primitives for calibrated deterministic movement, VLA for learned motor behavior, code/compute for calculations or selecting/ordering data. Code does not actuate; its result informs later motor steps. Replan can switch backend after a verified failure. Never choose an unavailable backend.'
-        return self.request('task_plan', system, schema, obs, context, 640)
+        return self.request('task_plan', system+'\n'+WORKSPACE_SYSTEM, schema, obs, workspace_context(obs,context), 640)
 
     def check(self, obs, context):
         schema=copy.deepcopy(CHECK_SCHEMA);system=CHECK_SYSTEM;tokens=180
         if context.get('route')=='hybrid':
             schema['properties']['code']={'type':'string','maxLength':4000};schema['required'].append('code');tokens=1200
             system+='\nUse current.backend. For code/compute act, code is a short Python subset assigning JSON-compatible result; input dictionary is named data. Only assignments, bounded for/if, arithmetic, lists/dicts/subscripts and safe min/max/sum/len/sorted/range/abs/round are available. No imports, attributes, files, shell, networking or motor API. Other decisions use code="". Code results are computational evidence, not physical task success; use them in later replanning.'
-        return self.request('task_checkpoint', system, schema, obs, context, tokens)
+        return self.request('task_checkpoint', system+'\n'+WORKSPACE_SYSTEM, schema, obs, workspace_context(obs,context), tokens)

@@ -1,0 +1,2 @@
+# Optional high-level client: Python >=3.9; the ROS bridge needs none of these.
+PyJWT[crypto]==2.15.1

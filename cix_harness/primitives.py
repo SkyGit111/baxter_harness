@@ -12,6 +12,23 @@ SKILLS = ('pick', 'place', 'stack', 'move_to', 'lift', 'retreat', 'open', 'close
 class TargetDepthError(ValueError):
     """No motion occurred; a fresh image and a different interior pixel can help."""
 
+
+class TargetWorkspaceError(ValueError):
+    """An explicitly selected contact target is outside the calibrated TCP region."""
+
+
+def check_tcp(xyz,p,selected_target=False):
+    xyz=vector(xyz,3,'TCP target')
+    floor=p['table_z_m']+p['table_clearance_m']
+    # Table violations remain hard failures even if the same point is also
+    # outside the workspace. Retargeting must not disguise a contact-boundary error.
+    if xyz[2]<floor:raise ValueError('TCP target below table clearance')
+    if any(not lo<=v<=hi for v,lo,hi in zip(xyz,p['tcp_workspace_min_m'],p['tcp_workspace_max_m'])):
+        error=TargetWorkspaceError if selected_target else ValueError
+        raise error('TCP target outside calibrated workspace; select a visible in-workspace target or replan/stop')
+    return xyz
+
+
 def number(value, low, high, name):
     if type(value) not in (float, int) or not math.isfinite(value) or not low <= value <= high:
         raise ValueError('Invalid '+name)
@@ -77,11 +94,7 @@ def plan(skill,state,p,target=None,view_index=0):
     if skill in ('place','stack') and not holding: raise ValueError('Placement requires a held object')
     stages=[]
     def move(xyz,q=None):
-        xyz=vector(xyz,3,'TCP target')
-        if any(not lo<=v<=hi for v,lo,hi in zip(xyz,p['tcp_workspace_min_m'],p['tcp_workspace_max_m'])):
-            raise ValueError('TCP target outside calibrated workspace')
-        floor=p['table_z_m']+p['table_clearance_m']
-        if xyz[2]<floor: raise ValueError('TCP target below table clearance')
+        xyz=check_tcp(xyz,p)
         stages.append({'kind':'move','tcp_m':xyz,'xyzw':q or orientation})
     def grip(opened): stages.append({'kind':'gripper','open':opened})
     if skill in ('pick','place','stack','move_to'):
@@ -89,6 +102,9 @@ def plan(skill,state,p,target=None,view_index=0):
         if skill=='pick':point[2]-=p['grasp_inset_m']
         elif skill in ('place','stack'):
             point[2]+=p['held_bottom_below_tcp_m']+p['release_clearance_m']
+        # Validate only the selected contact target as a recoverable perception
+        # rejection. Generated hover/retreat waypoints retain hard validation.
+        point=check_tcp(point,p,selected_target=True)
         z=max(current[2],point[2]+p['approach_m'],p['transit_z_m'])
         move([current[0],current[1],z],state['eef_xyzw'])
         move([current[0],current[1],z])

@@ -45,7 +45,21 @@ flowchart TD
 
 控制主机使用 `config/baxter-hybrid.example.json` 作为模板。它保留未标定状态和空测量字段，须填入现场核验的两套几何配置；启动方式仍是 `python3 -m cix_harness.baxter --config config/baxter-hybrid.local.json`，默认只读。两种运动后端由一个桥承载，不要启动两个抢占相机/机械臂的桥进程。
 
-在运行高层的机器上自行设置 `OPENAI_API_KEY` 环境变量，不将密钥写进配置或 Git。随后可预览：
+高层可以使用项目独立的 **Sign in with ChatGPT** 授权，也可以使用 `OPENAI_API_KEY`。前者需要用户在浏览器授权本项目，不能直接继承 Codex 的登录状态；可用模型以该账号实时目录为准。Python 3.9+ 的高层机器上执行：
+
+```bash
+python -m pip install -r deploy/chatgpt-auth-requirements.txt
+python -m cix_harness.chatgpt_auth login
+python -m cix_harness.chatgpt_auth models
+python -m cix_harness.harness --planner-provider api --api-auth chatgpt \
+  --api-model gpt-6-astra --route hybrid --task '把青色方块叠到黄色方块上' --task-kind stack
+```
+
+认证文件默认保存在用户配置目录，使用仅当前用户可读写的权限；可用 `--credentials`（认证工具）和 `--chatgpt-credentials`（任务入口）指定同一私有路径。不要提交凭据、打印令牌或复用其他应用的登录文件。高层可以在已登录的控制电脑上运行，通过 SSH 连接机器人桥；无需把账号令牌复制到板子。若迁移到另一台主机，应停止原主机刷新，确保轮换令牌只有一个刷新拥有者。`status` 查询登录状态，`logout` 清除本地令牌并尝试服务端注销，不能确认服务端注销时会明确报告。
+
+该授权模式按[官方接口要求](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)使用公共 Responses API、`store=false` 和流式响应；只在收到 `response.completed` 后接受决定，流中错误、断流或不完整响应都不会触发电机。它使用 ChatGPT 计划额度，实际可用性由账号决定。[限制说明](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+
+如使用 API Key，在高层机器的 `OPENAI_API_KEY` 环境变量中设置，不将密钥写进配置或 Git。随后可预览：
 
 ```bash
 python3 -m cix_harness.harness --planner-provider api --api-model gpt-6-astra \
@@ -54,7 +68,7 @@ python3 -m cix_harness.harness --planner-provider api --api-model gpt-6-astra \
 
 该 API 模式会把当前图像、精简遥测、任务和相关经验发给配置的 API；请求使用 `store=false`，这不代表对供应商数据保留政策作额外保证。默认预览只计算/规划并预检选中的运动工具，不动机器人；现场配置和桥放行后才添加 `--execute`。本地高层也可选择 `--planner-provider local --route hybrid`。纯 API+原语不需要 π0.5；真正混用 VLA 需要动作模型服务与其已核验的本体适配。
 
-验证范围：本轮离线测试覆盖完整高层→代码计算→原语抓取→VLA 放置→结果核验、后端更换、共享预算与跨后端旧令牌拒绝、代码资源限制、API 响应解析以及通信不明时不重放。尚未发送真实云 API 请求、上传现场图像或执行新的真机动作；API 延迟、成本、模型选工具的可靠性以及混合抓取成功率均待实测。
+验证范围：本轮离线测试覆盖完整高层→代码计算→原语抓取→VLA 放置→结果核验、后端更换、共享预算与跨后端旧令牌拒绝、代码资源限制、API 响应解析以及通信不明时不重放。11 月 13 日现场已完成本项目 ChatGPT 授权、确认账号开放 Astra，并用新 D455 图像完成真实计划与检查调用；首轮分别约 7.7 秒、7.3 秒。首次选点超出局部工作区，被动作预检拒绝，未发电机命令。这证明账号与图像规划接通，不能计为抓取或混合路线真机成功。
 
 ## 2026-11-10 任务规划、执行管理与记忆
 
