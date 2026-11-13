@@ -10,6 +10,7 @@ from .planner import decide
 from .rollout import predict, rollout, validate_motion_model
 from .rpc import HttpRpcClient, local_json
 from .task_monitor import TaskMonitor
+from .timing import TimingSummary, timed_rpc
 
 
 class Journal:
@@ -19,12 +20,17 @@ class Journal:
         print("Run files:", self.folder, flush=True)
         self.start = time.monotonic()
         self.frames = 0
+        self.timings = TimingSummary()
 
     def __call__(self, event, **fields):
         item = {"t": round(time.monotonic() - self.start, 3), "event": event, **fields}
         line = json.dumps(item, ensure_ascii=False, allow_nan=False)
         with (self.folder / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(line + "\n")
+        self.timings.record(event,fields)
+        if event in ('component_timing','planner_api','primitive_result','finish','stop','task_finished'):
+            (self.folder/'timing-summary.json').write_text(
+                json.dumps(self.timings.snapshot(item['t']),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
         print(line, flush=True)
 
     def camera(self, obs, role):
@@ -37,12 +43,13 @@ class Journal:
         self("observation", file=name, obs_id=obs["id"], state=obs.get("state", {}))
 
 
-def check_models(args):
+def check_models(args, log=None):
     if getattr(args,'planner_provider','local') != 'api':
         models = local_json(args.vlm_port, "/v1/models", timeout=8)
         if args.vlm_model not in [model.get("id") for model in models["data"]]:
             raise RuntimeError("Local planner does not serve requested model: " + args.vlm_model)
     vla = HttpRpcClient(args.vla_port)
+    if log:vla=timed_rpc(vla,log,'policy_rpc')
     meta = vla.call("healthz", timeout_s=8)
     if meta.get("action_spec") != ACTION_SPEC:
         raise RuntimeError("Local VLA action specification mismatch")
@@ -51,9 +58,10 @@ def check_models(args):
 
 def run(args, log, planner=decide):
     goal = instruction(args.task)
-    model, meta = check_models(args)
+    model, meta = check_models(args, log)
     monitor=TaskMonitor(getattr(args,'task_kind','generic'))
     robot = HttpRpcClient(args.robot_port) if args.image is None else None
+    if robot:robot=timed_rpc(robot,log)
     if robot:
         status = robot.call("healthz", timeout_s=8)
         if args.execute and (status.get("armed") is not True or status.get("action_spec") != ACTION_SPEC):

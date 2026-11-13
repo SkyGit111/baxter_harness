@@ -45,12 +45,14 @@ def _policy_candidate(health):
 
 
 def run(args, log, executive, robot=None, model=None, code_tool=None):
-    robot = robot or HttpRpcClient(args.robot_port)
+    from .timing import timed_rpc
+    robot = timed_rpc(robot or HttpRpcClient(args.robot_port),log)
     initial = robot.call('healthz')
     if args.execute and initial.get('armed') is not True: raise RuntimeError('Robot is read-only')
     policy_health = None
     if _policy_candidate(initial):
         model = model or HttpRpcClient(args.vla_port)
+        model = timed_rpc(model,log,'policy_rpc')
         try:
             policy_health = model.call('healthz', timeout_s=8)
         except (OSError, RuntimeError, ValueError) as error:

@@ -9,10 +9,11 @@ from .memory import EpisodeMemory, scope_key
 from .primitive_runner import run as run_primitives
 from .rpc import HttpRpcClient
 from .task_plan import VisualTaskPlanner
+from .timing import timed_rpc
 
 
 def run(args, journal, robot=None, planner=None):
-    robot = robot or HttpRpcClient(args.robot_port)
+    robot = timed_rpc(robot or HttpRpcClient(args.robot_port),journal)
     health = robot.call('healthz')
     if args.execute and health.get('armed') is not True: raise RuntimeError('Robot is read-only')
     if args.route == 'primitives' and health.get('motion_scope') != 'supervised_primitive_task':

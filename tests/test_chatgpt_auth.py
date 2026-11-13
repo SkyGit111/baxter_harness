@@ -201,10 +201,11 @@ class ChatGPTAuthTests(unittest.TestCase):
         try:
             import jwt
             from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.backends import default_backend
         except ImportError:
             self.skipTest('PyJWT[crypto] optional login dependency is not installed')
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        other = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
         base = {'sub': 'verified-subject', 'iss': auth.ISSUER, 'aud': 'oaiapp_test',
                 'iat': int(time.time()), 'exp': int(time.time()) + 300, 'nonce': 'expected-nonce'}
         with patch.object(jwt.PyJWKClient, 'get_signing_key_from_jwt',

@@ -1,10 +1,66 @@
 """Shared task executive: semantic plans, measured checkpoints, recovery and memory."""
 import copy
 import math
+import time
 
 from .task_plan import EXPECTED, VLA_SKILLS, compact_state, validate_plan, validate_check
 from .primitives import SKILLS
 from .task_monitor import TaskMonitor
+
+
+def primitive_measurements(receipt):
+    """Derive physical postconditions from ordered, measured stage receipts.
+
+    Older completion-only clients remain identifiable as lacking measurements;
+    absence of a stage trace is not evidence that zero commands or no lift occurred.
+    """
+    if 'completed_stages' not in receipt:
+        return {'source':'primitive_completion_contract','commands_applied':None,
+                'held_and_lifted':None,'confirmed_release':None,'lift_distance_m':None,
+                'drop_detected':False}
+    stages=receipt['completed_stages']
+    if not isinstance(stages,list):raise ValueError('Primitive stage receipts must be a list')
+    for item in stages:
+        if not isinstance(item,dict) or not isinstance(item.get('stage'),dict):
+            raise ValueError('Invalid primitive stage receipt')
+        xyz=item.get('eef_m')
+        if (not isinstance(xyz,(list,tuple)) or len(xyz)!=3 or
+            any(type(v) not in (float,int) or not math.isfinite(v) for v in xyz) or
+            type(item.get('gripping')) is not bool):
+            raise ValueError('Primitive stage receipt lacks finite measured pose/grasp data')
+        if item['stage'].get('kind') not in ('move','gripper','verify_grasp'):
+            raise ValueError('Unknown primitive receipt stage')
+    result={'source':'primitive_stage_measurements',
+            'commands_applied':sum(s['stage']['kind'] in ('move','gripper') for s in stages),
+            'held_and_lifted':None,'confirmed_release':None,'lift_distance_m':None,'drop_detected':False}
+    skill=receipt.get('skill')
+    if skill=='pick':
+        result['held_and_lifted']=False
+        close=next((i for i,s in enumerate(stages) if s['stage'].get('kind')=='gripper'
+                    and s['stage'].get('open') is False and s['gripping'] is True),None)
+        if close is not None:
+            after=stages[close+1:]
+            result['drop_detected']=any(s['gripping'] is False for s in after)
+            verifies=[i for i in range(close+1,len(stages))
+                      if stages[i]['stage']=={'kind':'verify_grasp','held':True} and stages[i]['gripping']]
+            if len(verifies)>=2 and verifies[-1]==len(stages)-1:
+                lifted=any(stages[i]['stage']['kind']=='move' for i in range(verifies[0]+1,verifies[-1]))
+                delta=stages[verifies[-1]]['eef_m'][2]-stages[close]['eef_m'][2]
+                result['lift_distance_m']=round(delta,6)
+                result['held_and_lifted']=(lifted and delta>=.025 and receipt.get('gripping') is True
+                                            and not result['drop_detected'])
+    elif skill in ('place','stack'):
+        result['confirmed_release']=False
+        for i,item in enumerate(stages):
+            if item['stage']!={'kind':'gripper','open':True} or i==0:continue
+            held_before=stages[i-1]['gripping'] is True
+            checked=(i+1<len(stages) and stages[i+1]['stage']=={'kind':'verify_grasp','held':False}
+                     and stages[i+1]['gripping'] is False)
+            if (held_before and item['gripping'] is False and checked and
+                all(s['gripping'] is False for s in stages[i:]) and receipt.get('gripping') is False):
+                result['confirmed_release']=True
+                break
+    return result
 
 
 class TaskExecutive:
@@ -19,6 +75,7 @@ class TaskExecutive:
         self.steps = []; self.index = 0; self.verified = []; self.archived = []
         self.failures = []; self.recoveries = []; self.pending_failure = None; self.feedback = None
         self.dispatch = None; self.primitive_ok = False; self.last_action_obs = None
+        self.primitive_evidence = None
         self.predictions = {}; self.monitor = TaskMonitor(); self.released = False
         self.applied = 0; self.origin = None; self.attempts = 0; self.step_failures = 0
         self.task_verified = False; self.closed = False; self.last_obs = None; self.status = 'running'
@@ -53,6 +110,7 @@ class TaskExecutive:
 
     def reset_step(self, obs):
         self.dispatch = None; self.primitive_ok = False; self.last_action_obs = None
+        self.primitive_evidence = None
         self.monitor = TaskMonitor(); self.released = False; self.predictions = {}
         self.applied = 0; self.attempts = 0; self.step_failures = 0
         self.last_target = None
@@ -70,7 +128,12 @@ class TaskExecutive:
     def call_planner(self, method, obs, context):
         if self.calls >= self.max_calls: raise RuntimeError('Task planner call budget exhausted')
         self.calls += 1
-        reply = getattr(self.planner, method)(obs, context)
+        began=time.monotonic();okay=False
+        try:
+            reply = getattr(self.planner, method)(obs, context);okay=True
+        finally:
+            self.log('component_timing',component='planner',method=method,
+                     duration_s=round(time.monotonic()-began,6),succeeded=okay)
         self.emit('task_model_reply', phase=method, obs_id=obs['id'], reply=reply)
         return reply
 
@@ -115,6 +178,15 @@ class TaskExecutive:
                   'fresh_after_action': self.last_action_obs is not None and obs['id'] != self.last_action_obs}
         position = obs.get('state', {}).get('eef_m')
         result['distance_from_start_m'] = round(math.dist(position, self.origin), 3) if position and self.origin else None
+        if self.backend=='primitives':
+            measured=self.primitive_evidence or {'source':'primitive_not_executed',
+                'held_and_lifted':None,'confirmed_release':None,'lift_distance_m':None,'drop_detected':False}
+            result.update(measured)
+            result['commands_applied']=(self.applied if measured.get('commands_applied',0) is not None else None)
+            # A release step can start already held at height; VLA's "lift since
+            # step start" criterion is not applicable to that primitive.
+            result['released_after_lift']=None
+            result['drop_detected']=measured['drop_detected'] or self.monitor.evidence()['drop_detected']
         return result
 
     def can_verify(self, obs):
@@ -124,9 +196,14 @@ class TaskExecutive:
         if not evidence['fresh_after_action']: return False
         if self.backend == 'primitives':
             if not self.primitive_ok: return False
-            if skill == 'pick': return state.get('gripping') is True
-            if skill in ('place', 'stack', 'open'):
-                return state.get('gripping') is False and state.get('gripper_percent', 0) > 70
+            detailed=evidence.get('source')=='primitive_stage_measurements'
+            if skill == 'pick':
+                return (state.get('gripping') is True and not evidence['drop_detected'] and
+                        (not detailed or evidence['held_and_lifted'] is True))
+            if skill in ('place', 'stack'):
+                return (state.get('gripping') is False and state.get('gripper_percent', 0)>70 and
+                        (not detailed or evidence['confirmed_release'] is True))
+            if skill=='open':return state.get('gripping') is False and state.get('gripper_percent',0)>70
             return not evidence['drop_detected']
         if not self.applied or evidence['drop_detected']: return False
         if skill == 'pick': return evidence['held_and_lifted'] and state.get('gripping') is True
@@ -263,13 +340,19 @@ class TaskExecutive:
             if fields.get('status') == 'rejected': self.failed(fields.get('failure_code', 'preflight_rejected'))
         elif name == 'primitive_result':
             if fields.get('skill') != self.current['skill']: return
+            self.primitive_evidence=primitive_measurements(fields)
+            self.applied+=self.primitive_evidence['commands_applied'] or 0
+            self.released=self.primitive_evidence['confirmed_release'] is True
             if fields.get('status') == 'failed': self.failed(fields.get('failure_code', 'execution_failed'))
             elif fields.get('status') == 'completed' and fields.get('applied') is True:
                 self.primitive_ok = True; self.current['status'] = 'awaiting_verification'; self.dispatch = None
                 # Verify_grasp stages belong to this primitive. Do not mistake a planned release for a drop.
-                if self.current['skill'] in ('place', 'stack'): self.monitor = TaskMonitor()
-                self.feedback = {'status': 'completed', 'skill': self.current['skill']}
-                self.emit('task_step_executed', step=self.current)
+                self.monitor = TaskMonitor()
+                stages=fields.get('completed_stages',[])
+                if stages:self.monitor.observe({'eef_m':stages[-1]['eef_m'],'gripping':stages[-1]['gripping']})
+                self.feedback = {'status': 'completed', 'skill': self.current['skill'],
+                                 'measured_outcome':self.primitive_evidence}
+                self.emit('task_step_executed', step=self.current, measured_outcome=self.primitive_evidence)
         elif name == 'prediction':
             self.predictions = {fields['obs_id']: fields['actions']}
         elif name == 'applied':

@@ -207,8 +207,10 @@ class Baxter:
         return angles
 
     def observe(self):
+        began=time.monotonic()
         self.pending = None
         image, captured, frame_number = self.camera.capture()
+        after_camera=time.monotonic()
         obs_id = uuid.uuid4().hex
         angles = self.joints()
         pose = self.limb.endpoint_pose()
@@ -228,6 +230,7 @@ class Baxter:
         state["joint_names"] = names
         state["joint_rad"] = [angles[n] for n in names]
         obs = {"id": obs_id, "image": image, "state": state}
+        after_state=time.monotonic()
         wrist = getattr(self, "wrist_state", None)
         if wrist is not None and time.monotonic() - wrist[0] < 0.5:
             import cv2
@@ -242,6 +245,9 @@ class Baxter:
         elif self.cfg.get("require_wrist", False):
             raise RuntimeError("Fresh real wrist camera image required by Pi05")
         self.pending = (obs_id, captured, angles)
+        ended=time.monotonic()
+        obs['timings_s']={'camera_capture':after_camera-began,'state_read':after_state-after_camera,
+                          'wrist_image':ended-after_state,'baxter_observe_total':ended-began}
         return obs
 
     def scene_snapshot(self):

@@ -80,7 +80,8 @@ def action(skill,evidence):
 
 
 def run(args,log,robot=None,planner=decide,recovery_allowed=None):
-    robot=robot or HttpRpcClient(args.robot_port)
+    from .timing import timed_rpc
+    robot=timed_rpc(robot or HttpRpcClient(args.robot_port),log)
     status=robot.call('healthz')
     if status.get('motion_scope')!='supervised_primitive_task':raise RuntimeError('Start the primitive bridge profile')
     if args.execute and status.get('armed') is not True:raise RuntimeError('Robot is read-only')
