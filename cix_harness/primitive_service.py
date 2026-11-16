@@ -4,7 +4,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from .kinematics import IKUnreachableError
-from .primitives import SKILLS, TargetDepthError, TargetWorkspaceError, validate_profile, plan, ground_pixel, eef_from_tcp, tcp_from_eef
+from .primitives import SKILLS, TargetDepthError, TargetWorkspaceError, validate_profile, plan, ground_pixel, eef_from_tcp, tcp_from_eef, check_tcp
 from .workspace import workspace_metadata
 
 
@@ -68,7 +68,9 @@ class PrimitiveService:
         views=self.profile.get('observation_tcp_m',[])
         obs['recovery']={'view_indices':[i for i,v in enumerate(views) if math.dist(tcp,v)>=.02],
                          'motion_remaining':self.robot.motion_remaining}
-        obs['primitive_skills']=[s for s in SKILLS if s!='clear_view' or obs['recovery']['view_indices']]
+        obs['primitive_skills']=[s for s in SKILLS
+                                 if (s!='clear_view' or obs['recovery']['view_indices'])
+                                 and (s!='home' or self.profile.get('home_tcp_m') is not None)]
         import pyrealsense2 as rs
         obs['workspace']=workspace_metadata(self.profile,self.robot.camera.intrinsics,rs.rs2_project_point_to_pixel)
 
@@ -117,10 +119,22 @@ class PrimitiveService:
                     'required_stages':operations,'motion_remaining':r.motion_remaining,'recoverable':False}
         with _measure(timings,'ik_preflight'):
             initial,paths=self._preflight(stages,obs,began)
+        # The dual-arm wrapper checks the other arm against ALL completed IK
+        # paths. No plan token exists until this geometry check succeeds.
+        peer_check=getattr(type(r),'check_other_arm_path',None)
+        if callable(peer_check):
+            with _measure(timings,'other_arm_preflight'):
+                if peer_check(r,paths) is False:raise ValueError('Other arm path check rejected the plan')
+            if time.monotonic()-began>p['perception_max_age_s']:
+                raise SceneChangedError('Scene expired during other-arm path preflight')
+            final=r.joints()
+            if set(final)!=set(initial) or max(abs(final[k]-initial[k]) for k in initial)>.015:
+                raise SceneChangedError('Arm moved during other-arm path preflight')
         token=uuid.uuid4().hex
         self.prepared=(token,time.monotonic(),initial,stages,paths,operations,skill,obs['state']['gripping'])
         return {'status':'ready','plan_id':token,'obs_id':obs_id,'skill':skill,'target_base_m':target,'stages':stages,
-                'applied':False,'ik_preflight':True,'expires_in_s':r.cfg['max_observation_age_s']}
+                'applied':False,'ik_preflight':True,'required_stages':operations,
+                'expires_in_s':r.cfg['max_observation_age_s']}
 
     def _preflight(self,stages,obs,began):
         from geometry_msgs.msg import PoseStamped
@@ -130,15 +144,18 @@ class PrimitiveService:
         measured=dict(zip(obs['state']['joint_names'],obs['state']['joint_rad']))
         if set(initial)!=set(measured) or max(abs(initial[k]-measured[k]) for k in initial)>.015:
             raise SceneChangedError('Arm moved during visual planning')
-        start=r.limb.endpoint_pose();observed=start;seed=initial;paths=[]
+        start=r.limb.endpoint_pose();observed=start;seed=initial;paths=[];holding=obs['state']['gripping']
         # Compute every leg before any gripper/motor operation. No prefix fallback.
         for stage in stages:
-            if stage['kind']!='move':paths.append(None);continue
+            if stage['kind']!='move':
+                if stage['kind']=='gripper':holding=not stage['open']
+                elif stage['kind']=='verify_grasp':holding=stage['held']
+                paths.append(None);continue
             dest=eef_from_tcp(stage['tcp_m'],stage['xyzw'],p)
             a=[observed['position'].x,observed['position'].y,observed['position'].z]
             oq=observed['orientation'];qa=[oq.x,oq.y,oq.z,oq.w];qb=stage['xyzw']
             distance=math.dist(a,dest)
-            if distance>p['max_leg_m']:raise ValueError('Primitive leg exceeds configured travel')
+            if distance>p['max_leg_m']+1e-9:raise ValueError('Primitive leg exceeds configured travel')
             angle=2*math.acos(min(1,abs(sum(x*y for x,y in zip(qa,qb)))))
             count=max(1,math.ceil(distance/.01),math.ceil(angle/.015));path=[]
             for i in range(1,count+1):
@@ -152,9 +169,9 @@ class PrimitiveService:
                 r.guard_pose(pose)
                 from .primitives import tcp_from_eef
                 tcp=tcp_from_eef(xyz,q,p)
-                if tcp[2]<p['table_z_m']+p['table_clearance_m']:raise ValueError('Interpolated TCP crosses table')
-                if any(not lo<=v<=hi for v,lo,hi in zip(tcp,p['tcp_workspace_min_m'],p['tcp_workspace_max_m'])):
-                    raise ValueError('Interpolated TCP leaves workspace')
+                try:check_tcp(tcp,p,held_bottom_m=p['held_bottom_below_tcp_m'] if holding else 0.)
+                except ValueError as error:
+                    raise ValueError('Interpolated TCP leaves workspace or crosses table: '+str(error)) from error
                 try:solution=r.continuous_ik.solve(point,seed,observed)
                 except IKUnreachableError as error:raise IKPreflightError(str(error)) from error
                 path.append((solution,point));seed=solution;observed=pose

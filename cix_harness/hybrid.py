@@ -79,6 +79,10 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
             if not observation.get('recovery', {}).get('view_indices'):
                 available['primitives'] = [s for s in available['primitives'] if s != 'clear_view']
         observation['backend_skills'] = available
+        if observation.get('arm_skills'):
+            # Planning can choose another arm; the bridge still validates its actual skill.
+            available['primitives']=sorted({s for a in observation.get('available_arms',[])
+                for s in observation['arm_skills'].get(a,[]) if s in SKILLS})
         log.camera(observation, 'hybrid')
         return observation, available
 
@@ -87,7 +91,7 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
         predict(model, warm_obs, 'observe the scene')
         log('warmup', backend='vla', discarded_prediction=True)
 
-    for _ in range(args.max_turns + max_recoveries + 1):
+    for _ in range(2*args.max_turns + max_recoveries + 2):
         health = robot.call('healthz')
         if health.get('motion_scope') != scope or health.get('environment_fingerprint') != fingerprint:
             raise RuntimeError('Robot profile changed during the task; reinitialize the task')
@@ -104,6 +108,11 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
         else:
             decision = executive.choose(obs)
         log('decision', **decision)
+        if decision['decision']=='observe_arm':
+            if decision['arm'] not in obs.get('available_arms',[]):raise RuntimeError('Unavailable arm selection')
+            robot.select(decision['arm']);used_views.clear()
+            log('arm_selected',arm=decision['arm'],applied=False)
+            continue
         if decision['decision'] == 'blocked' and decision.get('reason') == 'occluded':
             log('recoverable_block', **decision)
             if not executive.recovery_allowed('occluded'): return finish('recovery_policy_stop')
@@ -120,6 +129,7 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
 
         if backend == 'code':
             context = {'goal': args.task, 'state': obs.get('state', {}), 'obs_id': obs['id'],
+                       'arm_states':obs.get('arm_states',{}),'workspaces':obs.get('workspaces',{}),
                        'feedback': getattr(executive, 'feedback', None)}
             try:
                 result = code_tool.execute(decision.get('code', ''), context)

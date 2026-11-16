@@ -4,6 +4,7 @@ import json
 import math
 import time
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 
 from .camera import D455Camera
@@ -89,7 +90,7 @@ CLEARANCE_TRAVEL_MARGIN_M = .015
 
 
 class Baxter:
-    def __init__(self, cfg, armed):
+    def __init__(self, cfg, armed, *, camera=None):
         import rospy
         import baxter_interface
         from baxter_core_msgs.msg import EndEffectorState, EndpointState
@@ -129,13 +130,28 @@ class Baxter:
         wrist_topic = cfg.get("wrist_camera_topic", "/cameras/{}_hand_camera/image".format(cfg["arm"]))
         if wrist_topic:
             self.subscribers.append(rospy.Subscriber(wrist_topic, Image, self.note_wrist, queue_size=1, buff_size=4*1024*1024))
-        if armed:
-            self.ready()
-        if self.calibrated_profile:
-            service = "/ExternalTools/{}/PositionKinematicsNode/IKService".format(cfg["arm"])
-            rospy.wait_for_service(service, timeout=5)
-            self.ik = rospy.ServiceProxy(service, SolvePositionIK)
-        self.camera = D455Camera(cfg.get("camera_serial", ""))
+        self.owns_camera = camera is None
+        self.camera = camera
+        self._closed = False
+        try:
+            if armed:
+                self.ready()
+            if self.calibrated_profile:
+                service = "/ExternalTools/{}/PositionKinematicsNode/IKService".format(cfg["arm"])
+                rospy.wait_for_service(service, timeout=5)
+                self.ik = rospy.ServiceProxy(service, SolvePositionIK)
+            if camera is None:self.camera=D455Camera(cfg.get("camera_serial", ""))
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        """A dual owner closes its shared camera once, after both subscribers stop."""
+        if self._closed:return
+        self._closed=True
+        with ExitStack() as stack:
+            if self.owns_camera and self.camera is not None:stack.callback(self.camera.close)
+            for subscriber in self.subscribers:stack.callback(subscriber.unregister)
 
     def health(self):
         from .memory import geometry_fingerprint
@@ -206,12 +222,8 @@ class Baxter:
         vector([angles[n] for n in names], 7, "joint angles")
         return angles
 
-    def observe(self):
-        began=time.monotonic()
-        self.pending = None
-        image, captured, frame_number = self.camera.capture()
-        after_camera=time.monotonic()
-        obs_id = uuid.uuid4().hex
+    def read_state(self, frame_number=None):
+        """Fresh arm telemetry without acquiring another frame or operating a gripper."""
         angles = self.joints()
         pose = self.limb.endpoint_pose()
         position = pose["position"]
@@ -229,6 +241,16 @@ class Baxter:
         names = self.limb.joint_names()
         state["joint_names"] = names
         state["joint_rad"] = [angles[n] for n in names]
+        return state
+
+    def observe(self):
+        began=time.monotonic()
+        self.pending = None
+        image, captured, frame_number = self.camera.capture()
+        after_camera=time.monotonic()
+        obs_id = uuid.uuid4().hex
+        state=self.read_state(frame_number)
+        angles=dict(zip(state['joint_names'],state['joint_rad']))
         obs = {"id": obs_id, "image": image, "state": state}
         after_state=time.monotonic()
         wrist = getattr(self, "wrist_state", None)
@@ -381,17 +403,13 @@ class Baxter:
         raise RuntimeError('Joint target did not settle')
 
     def guard_pose(self, pose):
-        if self.cfg.get('commissioning_scope') == 'supervised_hybrid_task':
+        if self.cfg.get('commissioning_scope') in ('supervised_primitive_task','supervised_hybrid_task'):
             # Both backends obey the intersection of the commissioned geometries.
-            from .primitives import tcp_from_eef
+            from .primitives import tcp_from_eef, check_tcp
             p, q = pose['position'], pose['orientation']
             profile = self.cfg['primitives']
             tcp = tcp_from_eef([p.x,p.y,p.z], [q.x,q.y,q.z,q.w], profile)
-            if any(not low <= value <= high for value,low,high in
-                   zip(tcp,profile['tcp_workspace_min_m'],profile['tcp_workspace_max_m'])):
-                raise ValueError('Hybrid TCP outside calibrated primitive workspace')
-            if tcp[2] < profile['table_z_m'] + profile['table_clearance_m']:
-                raise ValueError('Hybrid TCP below primitive table clearance')
+            check_tcp(tcp,profile)
         guard = self.cfg.get('contact_guard')
         if guard:
             from .task_guard import check_contact_pose
@@ -733,7 +751,7 @@ def main():
         serve(args.port, methods)
     finally:
         try:
-            robot.camera.close()
+            robot.close()
         finally:
             rospy.signal_shutdown("bridge stopped")
 

@@ -66,7 +66,10 @@ Evidence must be short (at most 120 characters) and refer to the CURRENT image.'
 
 WORKSPACE_SYSTEM = '''When workspace is supplied, tcp_min_m/tcp_max_m are TCP limits in
 the robot base frame, not object-surface coordinates. table_reference.polygon_uv is
-the projection of their XY rectangle at table_z_m, with the current camera calibration.
+the allowed XY footprint projected onto table_reference.plane with the current camera
+calibration; legacy profiles use a rectangle at table_z_m. A sloping plane has a
+different height at each XY position. Per-arm workspaces are candidates, not proof
+that an arm can reach every point or that a complete trajectory is collision-free.
 For place onto bare table, choose a visibly free support inside that reference polygon
 and the image; do not invent free space or hidden pixels. It is NOT a universal image
 mask: elevated pick/stack targets can project outside it because of parallax. Do not
@@ -84,20 +87,27 @@ def workspace_context(obs, context):
     result.pop('workspace', None)  # Never reuse geometry from an older observation.
     if 'workspace' in obs:
         result['workspace'] = copy.deepcopy(obs['workspace'])
+    for key in ('arm_states','available_arms','workspaces','arm_skills','arm_recovery'):
+        if key in obs:result[key]=copy.deepcopy(obs[key])
     return result
 
 
-def validate_plan(reply, skills, held, backend_skills=None):
+def validate_plan(reply, skills, held, backend_skills=None, arm_states=None):
     if not isinstance(reply, dict) or set(reply) != {'steps'}:
         raise ValueError('Expected a steps-only semantic plan')
     steps = reply['steps']
     if not isinstance(steps, list) or not 1 <= len(steps) <= 6:
         raise ValueError('Plan needs 1-6 steps')
     holding = held
+    holdings={a:s.get('gripping') for a,s in (arm_states or {}).items()}
     for step in steps:
         required = set(STEP_SCHEMA['required']) | ({'backend'} if backend_skills is not None else set())
+        if arm_states is not None:required.add('arm')
         if not isinstance(step, dict) or set(step) != required:
             raise ValueError('Invalid plan step fields')
+        if arm_states is not None:
+            if step['arm'] not in holdings:raise ValueError('Selected arm is unavailable')
+            holding=holdings[step['arm']]
         if backend_skills is not None and step.get('skill') not in backend_skills.get(step.get('backend'), []):
             raise ValueError('Selected backend/skill is unavailable on this bridge')
         for key, limit in [('target', 100), ('instruction', 160)]:
@@ -121,6 +131,7 @@ def validate_plan(reply, skills, held, backend_skills=None):
         elif skill == 'close':
             # Closing alone cannot establish that a particular object was grasped.
             holding = None
+        if arm_states is not None:holdings[step['arm']]=holding
     return steps
 
 
@@ -174,6 +185,10 @@ class VisualTaskPlanner:
 
     def plan(self, obs, context):
         schema=copy.deepcopy(PLAN_SCHEMA);system=PLAN_SYSTEM
+        if 'arm_states' in obs:
+            schema['properties']['steps']['items']['properties']['arm']={'type':'string','enum':list(obs['arm_states'])}
+            schema['properties']['steps']['items']['required'].append('arm')
+            system+='\nSelect robot arm per step using arm_states and workspaces. Robot-left appears image-right. Arms execute one skill at a time, sharing camera and workspace. Track holding separately per arm. For cooperative transfers: place on a visible shared table support, retreat/clear the releasing arm, then let the other arm pick from a NEW observation. Never plan simultaneous co-grasp, human handover, or arm-to-arm midair transfer; these tools are unavailable. A computation also names one available arm. Prefer the closest available arm when the user does not specify one.'
         if context.get('route')=='hybrid':
             schema['properties']['steps']['items']['properties']['backend']={'type':'string','enum':['primitives','vla','code']}
             schema['properties']['steps']['items']['required'].append('backend')
@@ -183,6 +198,9 @@ class VisualTaskPlanner:
 
     def check(self, obs, context):
         schema=copy.deepcopy(CHECK_SCHEMA);system=CHECK_SYSTEM;tokens=180
+        if 'arm_states' in obs:
+            system+='\nCurrent step arm is authoritative; state and image token must belong to it. Other arm states are separate. Verify original goal across BOTH arms and objects. Shared workspace requires the other arm to remain clear; use table-supported sequential transfers only.'
+            system+='\nOn inter_arm_clearance, replan a sequence that moves the obstructing arm to an advertised clear_view/home pose or another grounded safe position before retrying; preserve its held object. On peer_changed, first use fresh observations. Never repeat the same rejected trajectory or request disabling collision checks. If a required parking skill is unavailable, report the missing capability.'
         if context.get('route')=='hybrid':
             schema['properties']['code']={'type':'string','maxLength':4000};schema['required'].append('code');tokens=1200
             system+='\nUse current.backend. For code/compute act, code is a short Python subset assigning JSON-compatible result; input dictionary is named data. Only assignments, bounded for/if, arithmetic, lists/dicts/subscripts and safe min/max/sum/len/sorted/range/abs/round are available. No imports, attributes, files, shell, networking or motor API. Other decisions use code="". Code results are computational evidence, not physical task success; use them in later replanning.'

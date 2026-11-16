@@ -7,6 +7,9 @@ class TimedRpc:
     def __init__(self, client, log, component):
         self.client, self.log, self.component = client, log, component
 
+    def select(self,arm):
+        return self.client.select(arm)
+
     def call(self, method, *args, **kwargs):
         began=time.monotonic();result=None;okay=False
         try:

@@ -47,9 +47,9 @@ class HybridConfiguration(unittest.TestCase):
         r=object.__new__(Baxter);r.cfg=config()
         def pose(x,y,z):return {'position':NS(x=x,y=y,z=z),'orientation':NS(x=1,y=0,z=0,w=0)}
         r.guard_pose(pose(.6,.2,.1))
-        with self.assertRaisesRegex(ValueError,'primitive workspace'):r.guard_pose(pose(.2,.2,.1))
+        with self.assertRaisesRegex(ValueError,'workspace'):r.guard_pose(pose(.2,.2,.1))
         r.cfg['primitives']['tcp_workspace_min_m'][2]=-.3
-        with self.assertRaisesRegex(ValueError,'primitive table'):r.guard_pose(pose(.6,.2,-.18))
+        with self.assertRaisesRegex(ValueError,'table'):r.guard_pose(pose(.6,.2,-.18))
         # A stricter fingertip reference still applies inside the primitive workspace.
         r.cfg['contact_guard']['reference_eef_m'][2]=.12
         with self.assertRaisesRegex(ValueError,'Fingertip'):r.guard_pose(pose(.6,.2,.1))

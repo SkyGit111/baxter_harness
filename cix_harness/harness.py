@@ -15,6 +15,20 @@ from .timing import timed_rpc
 def run(args, journal, robot=None, planner=None):
     robot = timed_rpc(robot or HttpRpcClient(args.robot_port),journal)
     health = robot.call('healthz')
+    arms=getattr(args,'arms','auto')
+    if health.get('dual_protocol') or arms!='auto':
+        from .arm_client import ArmClient
+        # Adapt below the single timing wrapper, so each transport request is
+        # counted once rather than as both primitive.* and dual.* round trips.
+        robot=ArmClient(robot.client,health,arms)
+        if robot.dual:
+            if args.route=='vla':raise ValueError('Dual bridge currently exposes primitives; use hybrid for arm selection')
+            if args.route=='primitives':
+                import copy
+                args=copy.copy(args);args.route='hybrid'
+            journal('arm_mode',available_arms=robot.allowed,execution='serialized')
+        robot=timed_rpc(robot,journal)
+        health=robot.call('healthz')
     if args.execute and health.get('armed') is not True: raise RuntimeError('Robot is read-only')
     if args.route == 'primitives' and health.get('motion_scope') != 'supervised_primitive_task':
         raise RuntimeError('Primitive route requires the primitive bridge profile')
@@ -60,6 +74,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--task', required=True)
     p.add_argument('--route', choices=['primitives', 'vla','hybrid'], default='primitives')
+    p.add_argument('--arms',choices=['auto','left','right','both'],default='auto')
     p.add_argument('--planner-provider',choices=['local','api'],default='local')
     p.add_argument('--api-model',default='gpt-6-astra')
     p.add_argument('--api-base-url',default='https://api.openai.com/v1')

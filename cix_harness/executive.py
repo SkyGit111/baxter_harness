@@ -116,8 +116,9 @@ class TaskExecutive:
         self.last_target = None
         self.code_result = None
         self.code_completed = False
-        self.origin = obs.get('state', {}).get('eef_m')
-        self.monitor.observe(obs.get('state', {}))
+        state=obs.get('arm_states',{}).get((self.current or {}).get('arm'),obs.get('state',{}))
+        self.origin = state.get('eef_m')
+        self.monitor.observe(state)
 
     def skills(self, obs):
         if self.route=='hybrid':return sorted({s for values in obs.get('backend_skills',{}).values() for s in values})
@@ -144,16 +145,21 @@ class TaskExecutive:
         skills = self.skills(obs)
         context = {'goal': self.goal, 'route': self.route, 'state': compact_state(obs),
                    'available_skills': skills, 'skill_expect': {s: EXPECTED[s] for s in skills},
-                   'verified': [{k: s[k] for k in ('skill', 'target')} for s in self.verified[-4:]],
+                   'verified': [{k: s[k] for k in ('skill', 'target','arm','backend') if k in s} for s in self.verified[-4:]],
                    'cause': cause, 'memory': self.memories[:1]}
         if self.route=='hybrid':context['backend_skills']=obs.get('backend_skills',{})
+        if self.feedback:context['execution_feedback']=copy.deepcopy(self.feedback)
         if self.computations:context['computed_results']=self.computations[-2:]
         # One read-only format/contract repair. Never turn an invalid plan into a motor command.
         for repair in range(2):
             try:
                 reply = self.call_planner('plan', obs, context)
                 steps = validate_plan(reply, skills, obs.get('state', {}).get('gripping'),
-                                      obs.get('backend_skills',{}) if self.route=='hybrid' else None)
+                                      obs.get('backend_skills',{}) if self.route=='hybrid' else None,
+                                      obs.get('arm_states'))
+                for step in steps:
+                    if step.get('backend')=='primitives' and step.get('arm') in obs.get('arm_skills',{}):
+                        if step['skill'] not in obs['arm_skills'][step['arm']]:raise ValueError('Skill unavailable for selected arm')
                 break
             except ValueError as error:
                 self.emit('task_plan_rejected', message=str(error))
@@ -170,7 +176,8 @@ class TaskExecutive:
 
     def observe(self, obs):
         self.last_obs = obs
-        if self.current: self.monitor.observe(obs.get('state', {}))
+        if self.current and self.current.get('arm',obs.get('state',{}).get('arm'))==obs.get('state',{}).get('arm'):
+            self.monitor.observe(obs.get('state', {}))
 
     def step_evidence(self, obs):
         result = {**self.monitor.evidence(), 'primitive_completed': self.primitive_ok,
@@ -190,12 +197,13 @@ class TaskExecutive:
         return result
 
     def can_verify(self, obs):
+        if self.current and self.current.get('arm',obs.get('state',{}).get('arm'))!=obs.get('state',{}).get('arm'):return False
         if self.backend=='code':return self.code_completed and obs['id']!=self.last_action_obs
         if self.mode != 'live' or not self.current: return False
         state = obs.get('state', {}); skill = self.current['skill']; evidence = self.step_evidence(obs)
         if not evidence['fresh_after_action']: return False
         if self.backend == 'primitives':
-            if not self.primitive_ok: return False
+            if not self.primitive_ok or type(state.get('gripping')) is not bool: return False
             detailed=evidence.get('source')=='primitive_stage_measurements'
             if skill == 'pick':
                 return (state.get('gripping') is True and not evidence['drop_detected'] and
@@ -222,6 +230,23 @@ class TaskExecutive:
 
     def final_state_consistent(self, obs):
         state = obs.get('state', {})
+        if 'arm_states' in obs:
+            observed=set()
+            for step in reversed(self.verified):
+                arm=step.get('arm')
+                if step.get('backend')=='code' or arm in observed:continue
+                observed.add(arm)
+                expected=step.get('verified_gripping')
+                if type(expected) is bool and obs['arm_states'].get(arm,{}).get('gripping') is not expected:return False
+            seen=set()
+            for step in reversed(self.verified):
+                arm=step.get('arm');skill=step['skill']
+                if arm in seen or skill not in ('pick','place','stack','open','close'):continue
+                seen.add(arm);s=obs['arm_states'].get(arm,{})
+                if skill=='pick' and s.get('gripping') is not True:return False
+                if skill in ('place','stack','open') and not (s.get('gripping') is False and s.get('gripper_percent',0)>70):return False
+                if skill=='close' and s.get('gripper_percent',100)>=70:return False
+            return True
         # Recheck the latest grasp/release after any final view-clearing motion.
         for step in reversed(self.verified):
             if step['skill'] == 'pick': return state.get('gripping') is True
@@ -243,6 +268,8 @@ class TaskExecutive:
                     return self.terminal('blocked', 'Replanning budget exhausted', 'no_progress')
         rejected = 0
         for _ in range(16):
+            if self.current and self.current.get('arm',obs.get('state',{}).get('arm'))!=obs.get('state',{}).get('arm'):
+                return {'decision':'observe_arm','arm':self.current['arm'],'evidence':'Acquire the selected arm state and invalidate prior observation tokens'}
             if self.current and self.backend == 'vla' and (self.attempts >= 3 or obs.get('harness_feedback', {}).get('stalled')):
                 self.failures.append('no_progress')
                 if self.current['on_failure'] == 'stop':
@@ -253,8 +280,8 @@ class TaskExecutive:
                 obs = {**obs, 'harness_feedback': {}}
             context = {'goal': self.goal, 'route': self.route, 'state': compact_state(obs),
                        'current': self.current,
-                       'remaining': [{'skill': s['skill'], 'target': s['target']} for s in self.steps[self.index+1:]],
-                       'verified': [{'skill': s['skill'], 'target': s['target']} for s in self.verified[-4:]],
+                       'remaining': [{k:s[k] for k in ('skill','target','arm','backend') if k in s} for s in self.steps[self.index+1:]],
+                       'verified': [{k:s[k] for k in ('skill','target','arm','backend') if k in s} for s in self.verified[-4:]],
                        'step_evidence': self.step_evidence(obs), 'feedback': self.feedback}
             if self.computations:context['computed_results']=self.computations[-2:]
             try:
@@ -269,8 +296,12 @@ class TaskExecutive:
                     return self.terminal('blocked', 'Replanning budget exhausted', 'no_progress')
                 continue
             if kind == 'blocked':
-                if answer['reason'] == 'occluded' and self.current and self.current['on_failure'] == 'replan':
+                replan_occlusion=(self.current and self.current['on_failure']=='replan') or (
+                    'arm_states' in obs and (not self.current or self.current['on_failure']!='stop'))
+                if answer['reason'] == 'occluded' and replan_occlusion:
                     self.failures.append('occluded')
+                    # In a dual scene the OTHER arm may be the occluder. Let the
+                    # planner select it explicitly; never blindly move the active arm.
                     if self.build_plan(obs, 'occluded: '+answer['evidence']): continue
                     return self.terminal('blocked', 'Occlusion replanning budget exhausted', 'no_progress')
                 return self.terminal('blocked', answer['evidence'], answer['reason'])
@@ -290,6 +321,7 @@ class TaskExecutive:
                     if rejected: return self.terminal('blocked', 'Step outcome is not supported by telemetry', 'no_progress')
                     rejected += 1; continue
                 self.current.update(status='verified', evidence=answer['evidence'], obs_id=obs['id'])
+                if self.backend!='code':self.current['verified_gripping']=obs.get('state',{}).get('gripping')
                 self.verified.append(copy.deepcopy(self.current));self.index += 1
                 self.feedback = None; self.reset_step(obs)
                 self.emit('task_step_verified', step=self.verified[-1])
@@ -337,7 +369,10 @@ class TaskExecutive:
                 self.feedback={'status':'computed','result':self.code_result}
                 self.emit('task_step_computed',result=self.code_result)
         elif name == 'primitive_plan':
-            if fields.get('status') == 'rejected': self.failed(fields.get('failure_code', 'preflight_rejected'))
+            if fields.get('status') == 'rejected':
+                self.failed(fields.get('failure_code', 'preflight_rejected'))
+                self.feedback.update(arm=self.current.get('arm'),message=str(fields.get('message',''))[:400],
+                                     applied=False)
         elif name == 'primitive_result':
             if fields.get('skill') != self.current['skill']: return
             self.primitive_evidence=primitive_measurements(fields)

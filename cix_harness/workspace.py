@@ -3,10 +3,11 @@ import math
 
 from .contract import vector
 from .pi05_contract import quaternion, rotate
+from .primitives import table_height, workspace_polygon, validate_table_geometry
 
 
 def workspace_metadata(profile, intrinsics, project_pixel):
-    """Project the TCP XY bounds onto the table reference plane.
+    """Project the allowed convex footprint onto the actual support plane.
 
     project_pixel(intrinsics, camera_point) uses the camera's distortion model.
     UVs refer to the unmodified color frame, matching ground_pixel normalization.
@@ -14,14 +15,17 @@ def workspace_metadata(profile, intrinsics, project_pixel):
     """
     low = vector(profile['tcp_workspace_min_m'], 3, 'workspace minimum')
     high = vector(profile['tcp_workspace_max_m'], 3, 'workspace maximum')
-    table_z = float(profile['table_z_m'])
+    validate_table_geometry(profile)
+    table_z = float(profile.get('table_z_m',table_height(0,0,profile)))
     if any(a >= b for a, b in zip(low, high)) or not math.isfinite(table_z):
         raise ValueError('Invalid workspace projection bounds')
     result = {
         'frame': 'base', 'tcp_min_m': low, 'tcp_max_m': high, 'table_z_m': table_z,
         'profile_calibrated': profile.get('calibrated') is True,
         'calibration_note': str(profile.get('notes', 'No calibration accuracy note supplied.'))[:300],
-        'table_reference': {'base_z_m': table_z, 'polygon_uv': None, 'status': 'unavailable'},
+        'table_reference': {'base_z_m': table_z if profile.get('table_plane') is None else None,
+                            'plane': profile.get('table_plane',{'normal':[0,0,1],'offset':-table_z}),
+                            'polygon_uv': None, 'status': 'unavailable'},
     }
     q = quaternion(profile['camera_to_base_xyzw'])
     inverse = [-q[0], -q[1], -q[2], q[3]]
@@ -29,8 +33,8 @@ def workspace_metadata(profile, intrinsics, project_pixel):
     width, height = intrinsics.width, intrinsics.height
     if width <= 1 or height <= 1:
         raise ValueError('Camera projection requires full color frame dimensions')
-    corners = [[low[0], low[1], table_z], [high[0], low[1], table_z],
-               [high[0], high[1], table_z], [low[0], high[1], table_z]]
+    corners = [[x,y,table_height(x,y,profile)] for x,y in workspace_polygon(profile)]
+    result['table_reference']['polygon_base_m']=corners
     camera_points = [rotate(inverse, [v - t for v, t in zip(point, translation)]) for point in corners]
     if any(point[2] <= 1e-6 for point in camera_points):
         result['table_reference']['status'] = 'not_in_front_of_camera'
