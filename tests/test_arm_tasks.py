@@ -67,6 +67,18 @@ class ArmTasks(unittest.TestCase):
         validate_plan({'steps':[arm_step('right','pick'),arm_step('left','place')]},['pick','place'],True,{'primitives':['pick','place']},states)
         with self.assertRaises(ValueError):validate_plan({'steps':[arm_step('right','place')]},['place'],True,{'primitives':['place']},states)
 
+    def test_site_clearance_plan_accepts_sentence_punctuation(self):
+        states={'left':{'gripping':True},'right':{'gripping':False}}
+        steps=[arm_step('left','clear_view'),arm_step('right','pick')]
+        steps[0]['instruction']='Keep gripping the cyan cube and move to the recorded clearance pose; recheck before moving the right arm.'
+        steps[1]['instruction']='After a fresh observation, grasp and lift the central pink cube; keep both cubes held and recheck.'
+        skills=['clear_view','pick']
+        validate_plan({'steps':steps},skills,True,{'primitives':skills},states)
+        for invalid in ('Keep the cube cœ', 'Keep the cube\nthen move', 'Keep the cube`code`'):
+            with self.subTest(invalid=invalid),self.assertRaises(ValueError):
+                altered=copy.deepcopy(steps);altered[0]['instruction']=invalid
+                validate_plan({'steps':altered},skills,True,{'primitives':skills},states)
+
     def test_right_only_complete_pick(self):
         with tempfile.TemporaryDirectory() as folder:
             robot=DualRobot()

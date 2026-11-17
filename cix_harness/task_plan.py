@@ -19,10 +19,13 @@ def text_schema(limit):
     return {'type': 'string', 'minLength': 1, 'maxLength': limit}
 
 
+MOTOR_INSTRUCTION_PATTERN = r"^[A-Za-z][A-Za-z0-9 ,.;:!?()/'-]{0,159}$"
+
+
 STEP_SCHEMA = {'type': 'object', 'properties': {
     'skill': {'type': 'string', 'enum': list(SKILLS)},
     'target': text_schema(100),
-    'instruction': text_schema(160),
+    'instruction': dict(text_schema(160), pattern=MOTOR_INSTRUCTION_PATTERN),
     'expect': {'type': 'string', 'enum': list(EXPECTED.values())},
     'on_failure': {'type': 'string', 'enum': ['reobserve', 'replan', 'stop']},
 }, 'required': ['skill', 'target', 'instruction', 'expect', 'on_failure'], 'additionalProperties': False}
@@ -39,7 +42,8 @@ CHECK_SCHEMA = {'type': 'object', 'properties': {
 PLAN_SYSTEM = '''Plan the REMAINING work for the original tabletop goal using available_skills.
 Return 1-6 ordered steps. Preserve object color, shape and identity from the user's goal
 and current image. target must distinguish the object/support; image-left differs from
-robot-left. instruction is a short English motor goal, even for Chinese users.
+robot-left. instruction is a short ASCII English motor goal (at most 160 characters),
+even for Chinese users. Use ordinary sentence punctuation, not code or line breaks.
 Each pick includes grasp AND lift. place/stack include release and retreat. Do not repeat
 verified steps. If currently holding, do not plan another pick before place/stack.
 Use skill_expect exactly. on_failure chooses reobserve (new image/point), replan (change
@@ -118,8 +122,8 @@ def validate_plan(reply, skills, held, backend_skills=None, arm_states=None):
             raise ValueError('Unsupported skill or incorrect completion condition')
         if step['on_failure'] not in ('reobserve', 'replan', 'stop'):
             raise ValueError('Unknown recovery strategy')
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9 ,.'-]{0,159}", step['instruction']):
-            raise ValueError('Motor instruction must be concise English')
+        if not re.fullmatch(MOTOR_INSTRUCTION_PATTERN, step['instruction']):
+            raise ValueError('Motor instruction must start with an English letter and use ASCII words and sentence punctuation, without line breaks')
         if skill == 'pick':
             if holding is not False: raise ValueError('Pick requires a known empty gripper')
             holding = True
