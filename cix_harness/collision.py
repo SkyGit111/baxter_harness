@@ -43,6 +43,10 @@ def validate_clearance_config(cfg, armed=False):
     _number(cfg['max_peer_joint_drift_rad'],.001,.05,'inactive-arm joint drift')
     _number(cfg['max_joint_sample_rad'],.001,.05,'collision sampling step')
     _number(cfg.get('max_peer_gripper_drift_percent',2.),.1,10.,'inactive-gripper drift')
+    if cfg.get('body_geometry','chain_segments') not in ('chain_segments','urdf_cylinders'):
+        raise ValueError('Unknown arm body geometry')
+    if cfg.get('body_geometry')=='urdf_cylinders':
+        _number(cfg.get('urdf_padding_m'),.005,.05,'URDF body padding')
     for arm in ('left','right'):
         radii=cfg['link_radii_m'][arm]
         if not isinstance(radii,dict) or not radii:
@@ -168,7 +172,8 @@ class KDLArmCapsules:
         from .upstream.kdl_parser import kdl_tree_from_urdf_model
         robot=URDF.from_parameter_server(key='robot_description')
         self.kdl=kdl;self.arm=arm;self.cfg=cfg
-        self.chain=kdl_tree_from_urdf_model(robot).getChain('base',arm+'_gripper')
+        tree=kdl_tree_from_urdf_model(robot)
+        self.chain=tree.getChain('base',arm+'_gripper')
         moving=[i for i in range(self.chain.getNrOfSegments())
                 if self.chain.getSegment(i).getJoint().getType()!=getattr(kdl.Joint,'None')]
         if len(moving)!=7:raise ClearanceUnavailableError('Collision model expects seven arm joints')
@@ -201,6 +206,53 @@ class KDLArmCapsules:
                 name:sum(lengths[j+1:])+extent for name,j in zip(self.names,moving)}
         if not math.isfinite(self.reach_bound) or self.reach_bound<=0:
             raise ClearanceUnavailableError('Invalid URDF motion-radius bound')
+        self.body_specs=None
+        if cfg.get('body_geometry')=='urdf_cylinders':
+            self._configure_urdf_cylinders(robot,tree)
+
+    def _configure_urdf_cylinders(self,robot,tree):
+        """Each padded capsule encloses a complete URDF collision cylinder.
+
+        Include fixed visual branches as well as the gripper chain. Endpoint
+        motion bounds include the cylinder offset and its own joint rotation.
+        Unsupported shapes or extra moving joints fail closed.
+        """
+        from urdf_parser_py.urdf import Cylinder
+        k=self.kdl;specs=[]
+        bounds={name:value for name,value in self.capsule_reach_bounds.items()
+                if name.startswith(self.arm+'_installed_tool_')}
+        padding=_number(self.cfg.get('urdf_padding_m'),.005,.05,'URDF body padding')
+        covered=set()
+        for link in robot.links:
+            if not link.name.startswith(self.arm+'_'):continue
+            for index,collision in enumerate(link.collisions):
+                shape=collision.geometry
+                if not isinstance(shape,Cylinder):
+                    raise ClearanceUnavailableError('Unsupported URDF collision shape on '+link.name)
+                length=_number(shape.length,.001,2.,'URDF cylinder length')
+                radius=_number(shape.radius,.001,.3,'URDF cylinder radius')+padding
+                chain=tree.getChain('base',link.name)
+                moving={chain.getSegment(i).getJoint().getName():i for i in range(chain.getNrOfSegments())
+                        if chain.getSegment(i).getJoint().getType()!=getattr(k.Joint,'None')}
+                if not moving or not set(moving).issubset(self.names):
+                    raise ClearanceUnavailableError('Unmodelled moving joints on '+link.name)
+                offsets=[float(chain.getSegment(i).getFrameToTip().p.Norm()) for i in range(chain.getNrOfSegments())]
+                origin=collision.origin
+                xyz=vector((origin.xyz if origin is not None else None) or [0,0,0],3,'URDF cylinder origin')
+                rpy=vector((origin.rpy if origin is not None else None) or [0,0,0],3,'URDF cylinder rotation')
+                local=k.Frame(k.Rotation.RPY(*rpy),k.Vector(*xyz))
+                ends=[local*k.Vector(0,0,z) for z in (-length/2,length/2)]
+                extent=max(float(v.Norm()) for v in ends)
+                name=link.name+'__collision_'+str(index)
+                bounds[name]={joint:sum(offsets[moving[joint]+1:])+extent if joint in moving else 0.
+                              for joint in self.names}
+                specs.append((name,k.ChainFkSolverPos_recursive(chain),list(moving),ends,radius))
+                covered.add(link.name)
+        if not specs or any(link not in covered for link in self.links[:-1]):
+            raise ClearanceUnavailableError('URDF collision geometry does not cover all main arm links')
+        self.body_specs=specs
+        self.capsule_reach_bounds=bounds
+        self.joint_reach_bounds={joint:max(b[joint] for b in bounds.values()) for joint in self.names}
 
     def displacement_bound(self,deltas):
         if set(deltas)!=set(self.names):raise ClearanceUnavailableError('Incomplete displacement joint state')
@@ -223,9 +275,20 @@ class KDLArmCapsules:
             frame=self.kdl.Frame()
             if self.fk.JntToCart(q,frame,index+1)<0:raise ClearanceUnavailableError('Link FK failed')
             origins.append(tuple(float(frame.p[i]) for i in range(3)));frames.append(frame)
-        capsules=[Capsule(self.chain.getSegment(i).getName(),origins[i],origins[i+1],
-                          self.cfg['link_radii_m'][self.arm][self.chain.getSegment(i).getName()])
-                  for i in range(self.first,self.chain.getNrOfSegments())]
+        if self.body_specs is None:
+            capsules=[Capsule(self.chain.getSegment(i).getName(),origins[i],origins[i+1],
+                              self.cfg['link_radii_m'][self.arm][self.chain.getSegment(i).getName()])
+                      for i in range(self.first,self.chain.getNrOfSegments())]
+        else:
+            capsules=[]
+            for name,fk,names,ends,radius in self.body_specs:
+                body_q=self.kdl.JntArray(len(names))
+                for i,joint in enumerate(names):body_q[i]=joints[joint]
+                frame=self.kdl.Frame()
+                if fk.JntToCart(body_q,frame)<0:raise ClearanceUnavailableError('Collision body FK failed')
+                world=[frame*v for v in ends]
+                capsules.append(Capsule(name,tuple(float(world[0][i]) for i in range(3)),
+                                        tuple(float(world[1][i]) for i in range(3)),radius))
         for index,tool in enumerate(self.cfg['tool_capsules'][self.arm]):
             ends=[]
             for key in ('start_m','end_m'):
@@ -307,7 +370,7 @@ class InterArmGuard:
                                             active_padding=swept,peer_padding=peer_bounds)
                     minimum=min(minimum,distance)
                 previous=q
-        return {'model':'urdf_chain_capsules','checked':True,'minimum_clearance_m':minimum,
+        return {'model':self.cfg.get('body_geometry','urdf_chain_capsules'),'checked':True,'minimum_clearance_m':minimum,
                 'peer_drift_padding_m':peer_padding,'swept_intervals_checked':True,
                 'padding_scope':'per_capsule_descendant_joints',
                 'limitations':'Cross-arm links/tools only; not torso, table or arbitrary scene obstacles'}

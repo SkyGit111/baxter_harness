@@ -316,13 +316,13 @@ def synthetic_urdf():
 
 
 class CollisionModelTests(unittest.TestCase):
-    def model_dependencies(self,cfg):
+    def model_dependencies(self,cfg,body=False):
         class Vector:
             def __init__(self,x=0,y=0,z=0):self.v=(x,y,z)
             def __getitem__(self,i):return self.v[i]
             def Norm(self):return sum(x*x for x in self.v)**.5
         class Frame:
-            def __init__(self):self.p=Vector()
+            def __init__(self,rotation=None,position=None):self.p=position or Vector()
             def __mul__(self,value):return Vector(*(self.p[i]+value[i] for i in range(3)))
         links=['left_arm_mount']+arm_chain_links(synthetic_urdf(),'left')
         segments=[]
@@ -334,13 +334,25 @@ class CollisionModelTests(unittest.TestCase):
         chain=NS(getNrOfSegments=lambda:len(segments),getSegment=lambda i:segments[i])
         calls=[]
         class FK:
-            def __init__(self,chain):pass
-            def JntToCart(self,q,frame,segment):calls.append(segment);frame.p=Vector(.1*segment,0,0);return 0
+            def __init__(self,chain):self.chain=chain
+            def JntToCart(self,q,frame,segment=None):
+                segment=self.chain.getNrOfSegments() if segment is None else segment
+                calls.append(segment);frame.p=Vector(.1*segment,0,0);return 0
         joint_type=NS();setattr(joint_type,'None',0)
-        kdl=NS(Joint=joint_type,JntArray=lambda n:[0.]*n,Frame=Frame,Vector=Vector,ChainFkSolverPos_recursive=FK)
+        kdl=NS(Joint=joint_type,JntArray=lambda n:[0.]*n,Frame=Frame,Vector=Vector,ChainFkSolverPos_recursive=FK,
+               Rotation=NS(RPY=lambda *args:None))
         robot=NS(joint_map={'left_j'+str(i):NS(limit=NS(lower=-2.,upper=2.)) for i in range(1,8)})
-        modules={'PyKDL':kdl,'urdf_parser_py.urdf':NS(URDF=NS(from_parameter_server=lambda **kw:robot)),
-                 'cix_harness.upstream.kdl_parser':NS(kdl_tree_from_urdf_model=lambda robot:NS(getChain=lambda *a:chain))}
+        class Cylinder:
+            length=.2;radius=.06
+        def get_chain(base,link):
+            if not body or link=='left_gripper':return chain
+            count=links.index(link)+1 if link in links else 5
+            return NS(getNrOfSegments=lambda:count,getSegment=lambda i:segments[i])
+        if body:
+            robot.links=[NS(name=name,collisions=[NS(geometry=Cylinder(),origin=NS(xyz=[0,0,.05],rpy=[0,0,0]))])
+                         for name in links[1:]+['left_fixed_visual']]
+        modules={'PyKDL':kdl,'urdf_parser_py.urdf':NS(URDF=NS(from_parameter_server=lambda **kw:robot),Cylinder=Cylinder),
+                 'cix_harness.upstream.kdl_parser':NS(kdl_tree_from_urdf_model=lambda robot:NS(getChain=get_chain))}
         return modules,calls
 
     def test_template_uses_actual_chain_names_and_never_verifies_or_arms(self):
@@ -379,6 +391,34 @@ class CollisionModelTests(unittest.TestCase):
         with self.assertRaises(ArmCollisionError):
             check_capsules(left,right,.04,active_padding={'left_shoulder':.02,'left_tool':0.},
                            peer_padding={'right_shoulder':0.,'right_tool':0.})
+
+    def test_urdf_cylinders_include_fixed_branches_offsets_and_own_joint_rotation(self):
+        cfg=build_collision_candidate(synthetic_urdf());cfg.update(body_geometry='urdf_cylinders',urdf_padding_m=.02)
+        modules,_=self.model_dependencies(cfg,body=True)
+        with patch.dict('sys.modules',modules):
+            model=KDLArmCapsules('left',cfg)
+            capsules=model.capsules({name:0. for name in model.names})
+        bodies={c.name:c for c in capsules}
+        shoulder=bodies['left_link_0__collision_0']
+        self.assertAlmostEqual(shoulder.radius,.08)
+        self.assertAlmostEqual(shoulder.start[2],-.05)
+        self.assertAlmostEqual(shoulder.end[2],.15)
+        self.assertIn('left_fixed_visual__collision_0',bodies)
+        self.assertIn('left_installed_tool_0',bodies)
+        deltas={n:0. for n in model.names};deltas['left_j1']=.1
+        padding=model.capsule_displacement_bounds(deltas)
+        self.assertAlmostEqual(padding[shoulder.name],.015)
+        self.assertEqual(set(padding),set(bodies))
+
+    def test_urdf_mode_rejects_uncovered_main_link_or_unsupported_shape(self):
+        cfg=build_collision_candidate(synthetic_urdf());cfg.update(body_geometry='urdf_cylinders',urdf_padding_m=.02)
+        for missing in (True,False):
+            modules,_=self.model_dependencies(cfg,body=True)
+            robot=modules['urdf_parser_py.urdf'].URDF.from_parameter_server()
+            if missing:robot.links[0].collisions=[]
+            else:robot.links[0].collisions[0].geometry=NS(mesh='unknown')
+            with patch.dict('sys.modules',modules),self.assertRaises(ClearanceUnavailableError):
+                KDLArmCapsules('left',cfg)
 
     def test_descendant_lever_bound_covers_compound_rotation_without_static_base_padding(self):
         import math

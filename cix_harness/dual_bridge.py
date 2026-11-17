@@ -150,7 +150,7 @@ class DualBridge:
                     'environment_fingerprint':fingerprint,'arms':per_arm,
                     'clearance':{'configured':self.guard is not None,
                                  'verified':bool((self.cfg.get('inter_arm_clearance') or {}).get('verified')),
-                                 'model':'urdf_chain_capsules',
+                                 'model':(self.cfg.get('inter_arm_clearance') or {}).get('body_geometry','urdf_chain_capsules'),
                                  'links':({arm:list(self.guard.models[arm].links) for arm in ARMS} if self.guard else {})}}
 
     def observe(self,arm):
