@@ -13,6 +13,8 @@ from .timing import timed_rpc
 
 
 def run(args, journal, robot=None, planner=None):
+    if getattr(args,'planner_provider','local')=='api' and getattr(args,'planner_view','scene')!='scene':
+        raise ValueError('API planning requires D455 as the primary view; use --api-images scene or scene_wrist')
     robot = timed_rpc(robot or HttpRpcClient(args.robot_port),journal)
     health = robot.call('healthz')
     arms=getattr(args,'arms','auto')
@@ -38,7 +40,8 @@ def run(args, journal, robot=None, planner=None):
     if planner is None and provider=='api':
         from .api_planner import ResponsesTaskPlanner
         planner=ResponsesTaskPlanner(args.api_model,args.api_base_url,args.api_key_env,args.api_timeout,journal,
-            auth=getattr(args,'api_auth','api-key'),credential_path=getattr(args,'chatgpt_credentials',None))
+            auth=getattr(args,'api_auth','api-key'),credential_path=getattr(args,'chatgpt_credentials',None),
+            image_mode=getattr(args,'api_images','scene_wrist'))
     planner=planner or VisualTaskPlanner(args.vlm_port,args.vlm_model)
     identity=(getattr(args,'api_base_url','')+':'+getattr(args,'api_model','')) if provider=='api' else args.vlm_model
     memory = EpisodeMemory(args.memory)
@@ -82,6 +85,8 @@ def main(argv=None):
     p.add_argument('--api-auth',choices=['api-key','chatgpt'],default='api-key')
     p.add_argument('--chatgpt-credentials',type=Path,help='This project\'s OAuth store; defaults to user configuration directory')
     p.add_argument('--api-timeout',type=float,default=120)
+    p.add_argument('--api-images',choices=['scene','scene_wrist'],default='scene_wrist',
+                   help='D455 only or D455 plus a fresh selected-arm wrist view; uv always uses D455')
     p.add_argument('--execute', action='store_true')
     p.add_argument('--vlm-port', type=int, default=9110)
     p.add_argument('--vlm-model', default='qwen35-9b')

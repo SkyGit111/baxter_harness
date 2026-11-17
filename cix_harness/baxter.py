@@ -53,6 +53,8 @@ def validate_config(cfg, armed):
         value=cfg.get(key,lo)
         if type(value) not in (int,float) or not math.isfinite(value) or not lo <= value <= hi:
             raise ValueError('Invalid '+key)
+    from .trajectory import motion_limits
+    motion_limits(cfg)
     translation_cap = 0.12 if task_trial else (0.05 if clearance_test else 0.01)
     for key, maximum in (("max_translation_m", translation_cap), ("max_rotation_rad", 0.15 if task_trial else 0.05)):
         value = cfg.get(key, maximum)
@@ -93,7 +95,7 @@ class Baxter:
     def __init__(self, cfg, armed, *, camera=None):
         import rospy
         import baxter_interface
-        from baxter_core_msgs.msg import EndEffectorState, EndpointState
+        from baxter_core_msgs.msg import EndEffectorState, EndpointState, CollisionAvoidanceState, CollisionDetectionState
         from baxter_core_msgs.srv import SolvePositionIK
         from sensor_msgs.msg import Image, JointState
 
@@ -120,12 +122,17 @@ class Baxter:
         self.state_times = {}
         self.state_stamps = {}
         self.wrist_state = None
+        self.controller_feedback = {}
         self.subscribers = [
             rospy.Subscriber("/robot/joint_states", JointState, self.note_state, callback_args="joints", queue_size=1),
             rospy.Subscriber("/robot/limb/{}/endpoint_state".format(cfg["arm"]), EndpointState,
                              self.note_state, callback_args="endpoint", queue_size=1),
             rospy.Subscriber("/robot/end_effector/{}_gripper/state".format(cfg["arm"]), EndEffectorState,
                              self.note_effector, queue_size=1),
+            rospy.Subscriber("/robot/limb/{}/collision_avoidance_state".format(cfg["arm"]), CollisionAvoidanceState,
+                             self.note_controller_feedback, callback_args="avoidance", queue_size=1),
+            rospy.Subscriber("/robot/limb/{}/collision_detection_state".format(cfg["arm"]), CollisionDetectionState,
+                             self.note_controller_feedback, callback_args="collision", queue_size=1),
         ]
         wrist_topic = cfg.get("wrist_camera_topic", "/cameras/{}_hand_camera/image".format(cfg["arm"]))
         if wrist_topic:
@@ -211,6 +218,21 @@ class Baxter:
         if received is not None:
             self.wrist_state = (received, message)
 
+    def note_controller_feedback(self,message,key):
+        received=self.telemetry_time(message.header.stamp,'controller_'+key)
+        if received is not None:
+            value=({'other_arm':bool(message.other_arm),'objects':list(message.collision_object)}
+                   if key=='avoidance' else bool(message.collision_state))
+            self.controller_feedback[key]=(received,value)
+
+    def check_controller_feedback(self):
+        from .trajectory import check_controller_feedback,ControllerSafetyError
+        try:check_controller_feedback(getattr(self,'controller_feedback',{}),time.monotonic())
+        except ControllerSafetyError as error:
+            self.audit('factory_controller_rejected',error=str(error),
+                       context=getattr(self,'motion_context',{}))
+            raise
+
     def joints(self):
         now = time.monotonic()
         if any(now - self.state_times.get(key, -math.inf) >= 0.5 for key in ("joints", "endpoint")):
@@ -268,6 +290,12 @@ class Baxter:
             raise RuntimeError("Fresh real wrist camera image required by Pi05")
         self.pending = (obs_id, captured, angles)
         ended=time.monotonic()
+        obs['camera_metadata']={'scene':{'source':'d455','frame_number':frame_number,
+                                        'age_s':round(max(0.,ended-captured),4)}}
+        if 'wrist_image' in obs:
+            obs['camera_metadata']['wrist']={'source':self.cfg['arm']+'_wrist','arm':self.cfg['arm'],
+                                            'frame_number':getattr(wrist[1].header,'seq',None),
+                                            'age_s':round(ended-wrist[0],4)}
         obs['timings_s']={'camera_capture':after_camera-began,'state_read':after_state-after_camera,
                           'wrist_image':ended-after_state,'baxter_observe_total':ended-began}
         return obs
@@ -382,6 +410,7 @@ class Baxter:
         start = self.endpoint_position()
         while time.monotonic() < deadline:
             self.ready()
+            self.check_controller_feedback()
             now = self.joints()
             position = self.endpoint_position()
             if math.sqrt(sum((a-b)**2 for a,b in zip(position,start))) > self.cfg.get('max_translation_m',.01)+CLEARANCE_TRAVEL_MARGIN_M:
@@ -628,76 +657,132 @@ class Baxter:
                 'composed_action':action,'source_path_m':length,'waypoints':len(path),
                 'endpoint_target_m':[p.x,p.y,p.z]}
 
-    def move_segment(self,initial,path,start,max_travel=None):
-        # Stream through intermediate IK points without arrival waits. Only
-        # the final point is checked for arrival; no tiny stop-and-go commands.
+    def move_segment(self,initial,path,start,max_travel=None,*,continuous=False,motion_phase=None):
+        """Execute checked paths; continuous interpolation requires joint-box/FK preflight."""
+        from .trajectory import JointTrajectory,motion_limits
+        began=time.monotonic();speed,acceleration=motion_limits(self.cfg,motion_phase)
         schedule=[];elapsed=0.;previous=initial
         for solution,target in path:
-            duration=max(.15,1.875*max(abs(solution[k]-previous[k]) for k in initial)/self.cfg.get('joint_speed_rad_s',.12))
+            duration=max(.15,1.875*max(abs(solution[k]-previous[k]) for k in initial)/speed)
             schedule.append((elapsed,duration,previous,solution))
             elapsed+=duration;previous=solution
-        began=time.monotonic();last_tick=began;progress=0.;index=0;settled=None
+        if not schedule:raise ValueError('Empty motion path')
+        legacy_seconds=elapsed
+        # Half the acceleration budget remains for feedback-driven clock changes.
+        trajectory=JointTrajectory(initial,[q for q,_ in path],speed,acceleration*.5) if continuous else None
+        if trajectory is not None:elapsed=trajectory.duration
+        knots=[initial]+[q for q,_ in path]
+        joint_travel={n:sum(abs(b[n]-a[n]) for a,b in zip(knots,knots[1:])) for n in initial}
+        try:
+            xyz=[list(start)]+[[float(getattr(target.pose.position,n)) for n in ('x','y','z')] for _,target in path]
+            planned_eef_path=sum(math.dist(a,b) for a,b in zip(xyz,xyz[1:]))
+        except (TypeError,ValueError):planned_eef_path=None
+        measured_path=0.;last_position=list(start);samples=0;peak_command_speed=0.
+        timings={name:0. for name in ('controller_checks','feedback_read','geometry_checks','interpolation',
+                                    'command_publish','arrival_check','sleep')}
+        build_seconds=time.monotonic()-began
+        context=dict(getattr(self,'motion_context',{}));trajectory_id=uuid.uuid4().hex
+        def audit(event,**fields):
+            self.audit(event,trajectory_id=trajectory_id,context=context,motion_phase=motion_phase,**fields)
+        audit('segment_started',scheduled_seconds=elapsed,legacy_schedule_seconds=legacy_seconds,
+              continuous=continuous,waypoints=len(path),joint_speed_rad_s=speed,
+              joint_acceleration_rad_s2=acceleration,build_seconds=build_seconds,
+              trajectory_metadata=trajectory.metadata if trajectory is not None else None)
+        loop_began=time.monotonic();last_tick=loop_began;progress=0.;index=0;settled=None
         command=dict(initial);paused_since=None;retimed_seconds=0.;peak_tracking=0.
+        scale=1.;feedback_delay=0.;loop_delay=0.;end_wall=None;last_audit=loop_began
         deadline=elapsed+min(60.,max(10.,elapsed))+2.5
-        while time.monotonic()-began < deadline:
-            self.ready();now=self.joints();position=self.endpoint_position()
-            self.inside(position);self.guard_pose(self.limb.endpoint_pose())
-            if math.dist(position,start)>(self.cfg['max_translation_m'] if max_travel is None else max_travel)+CLEARANCE_TRAVEL_MARGIN_M:
-                raise RuntimeError('Endpoint exceeded segment travel envelope')
-            wall=time.monotonic();t=wall-began
-            # Advance a virtual trajectory clock from measured following error.
-            # Keep all joints on the checked path; never compensate individual
-            # joints or switch to raw commands that bypass Baxter's controller.
-            tracking={k:command[k]-now[k] for k in initial}
-            worst=max(tracking,key=lambda k:abs(tracking[k]))
-            lead=abs(tracking[worst]);peak_tracking=max(peak_tracking,lead)
-            if lead>.05:
-                self.audit('segment_tracking_rejected',joint=worst,joint_errors_rad=tracking,
-                           command_rad=command,measured_rad=now,elapsed_s=t,
-                           trajectory_seconds=progress,scheduled_seconds=elapsed,
-                           schedule_index=index,endpoint_m=position)
-                raise RuntimeError('Joint tracking error exceeded segment limit ({}: {:.4f} rad)'.format(worst,tracking[worst]))
-            scale=min(1.,max(0.,(.035-lead)/.015))
-            dt=max(0.,wall-last_tick);last_tick=wall
-            # A delayed control iteration must not jump forward to catch up.
-            advance=min(.05,dt)*scale
-            if progress<elapsed:retimed_seconds+=dt-advance
-            progress=min(elapsed,progress+advance)
-            if scale<.01 and progress<elapsed:
-                if paused_since is None:paused_since=wall
-                if wall-paused_since>=8.:
-                    self.audit('segment_following_stalled',joint=worst,joint_errors_rad=tracking,
-                               command_rad=command,measured_rad=now,elapsed_s=t,
-                               trajectory_seconds=progress,endpoint_m=position)
-                    raise RuntimeError('Joint following stalled while trajectory waited for '+worst)
-            else:paused_since=None
-            while index+1<len(schedule) and progress>=schedule[index+1][0]:index+=1
-            offset,duration,previous,solution=schedule[index]
-            phase=min(1.,max(0.,(progress-offset)/duration))
-            f=10*phase**3-15*phase**4+6*phase**5
-            command={k:previous[k]+f*(solution[k]-previous[k]) for k in initial}
-            tracking={k:command[k]-now[k] for k in initial}
-            worst=max(tracking,key=lambda k:abs(tracking[k]))
-            if abs(tracking[worst])>.05:
-                self.audit('segment_tracking_rejected',joint=worst,joint_errors_rad=tracking,
-                           command_rad=command,measured_rad=now,elapsed_s=t,
-                           trajectory_seconds=progress,scheduled_seconds=elapsed,schedule_index=index,
-                           endpoint_m=position)
-                raise RuntimeError('Joint tracking error exceeded segment limit ({}: {:.4f} rad)'.format(worst,tracking[worst]))
-            self.limb.set_joint_positions(command)
-            if progress>=elapsed:
-                distance,angle=self.arrival_error(path[-1][1])
-                reached=(distance<self.cfg.get('arrival_position_tolerance_m',.01) and angle<.04)
-                settled=(settled if settled is not None else time.monotonic()) if reached else None
-                if settled is not None and time.monotonic()-settled>=.2:
-                    self.audit('segment_arrived',elapsed_s=t,scheduled_seconds=elapsed,
-                               retimed_seconds=retimed_seconds,peak_tracking_rad=peak_tracking)
-                    return
-            time.sleep(.01)
-        self.audit('segment_arrival_timeout',elapsed_s=time.monotonic()-began,
-                   trajectory_seconds=progress,scheduled_seconds=elapsed,
-                   retimed_seconds=retimed_seconds,peak_tracking_rad=peak_tracking)
-        raise RuntimeError('Segment did not arrive within bounded following/settling time')
+        def metrics():
+            loop_elapsed=time.monotonic()-loop_began
+            return {'trajectory_id':trajectory_id,'context':context,'motion_phase':motion_phase,
+                    'continuous':continuous,'scheduled_seconds':elapsed,'legacy_schedule_seconds':legacy_seconds,
+                    'trajectory_seconds':progress,'elapsed_s':loop_elapsed,
+                    'retimed_seconds':retimed_seconds,'feedback_slowdown_s':feedback_delay,
+                    'loop_delay_s':loop_delay,'settling_s':0. if end_wall is None else time.monotonic()-end_wall,
+                    'peak_tracking_rad':peak_tracking,'peak_command_speed_rad_s':peak_command_speed,
+                    'raw_measured_eef_path_m':measured_path,'path_note':'Raw telemetry path includes measurement jitter',
+                    'command_samples':samples,
+                    'build_seconds':build_seconds,'loop_timings_s':dict(timings),
+                    'unattributed_loop_s':max(0.,loop_elapsed-sum(timings.values())),
+                    'timing_note':'Loop sections are disjoint; slowdown, delay and settling are explanatory overlaps, not extra costs',
+                    'planned_eef_path_m':planned_eef_path,'joint_travel_rad':joint_travel,
+                    'bottleneck_joint':max(joint_travel,key=joint_travel.get),
+                    'joint_speed_limit_rad_s':speed,'joint_acceleration_limit_rad_s2':acceleration,
+                    'waypoints':len(path),'trajectory_metadata':trajectory.metadata if trajectory is not None else None}
+        try:
+            while time.monotonic()-loop_began < deadline:
+                stamp=time.monotonic();self.ready();self.check_controller_feedback()
+                timings['controller_checks']+=time.monotonic()-stamp
+                stamp=time.monotonic();now=self.joints();position=self.endpoint_position()
+                measured_path+=math.dist(position,last_position);last_position=position
+                timings['feedback_read']+=time.monotonic()-stamp
+                stamp=time.monotonic();self.inside(position);self.guard_pose(self.limb.endpoint_pose())
+                if math.dist(position,start)>(self.cfg['max_translation_m'] if max_travel is None else max_travel)+CLEARANCE_TRAVEL_MARGIN_M:
+                    raise RuntimeError('Endpoint exceeded segment travel envelope')
+                timings['geometry_checks']+=time.monotonic()-stamp
+                wall=time.monotonic();t=wall-loop_began
+                tracking={k:command[k]-now[k] for k in initial}
+                worst=max(tracking,key=lambda k:abs(tracking[k]))
+                lead=abs(tracking[worst]);peak_tracking=max(peak_tracking,lead)
+                if lead>.05:
+                    audit('segment_tracking_rejected',joint=worst,joint_errors_rad=tracking,
+                          command_rad=command,measured_rad=now,elapsed_s=t,
+                          trajectory_seconds=progress,scheduled_seconds=elapsed,endpoint_m=position)
+                    raise RuntimeError('Joint tracking error exceeded segment limit ({}: {:.4f} rad)'.format(worst,tracking[worst]))
+                dt=max(0.,wall-last_tick);last_tick=wall;effective=min(.05,dt)
+                desired=min(1.,max(0.,(.035-lead)/.015))
+                if trajectory is None:scale=desired
+                else:
+                    slew=acceleration/(2*max(trajectory.peak_velocity,1e-9))*effective
+                    scale+=min(slew,max(-slew,desired-scale))
+                advance=effective*scale
+                if progress<elapsed:
+                    feedback_delay+=effective-advance;loop_delay+=dt-effective
+                    retimed_seconds+=dt-advance
+                progress=min(elapsed,progress+advance)
+                if scale<.01 and progress<elapsed:
+                    if paused_since is None:paused_since=wall
+                    if wall-paused_since>=8.:
+                        audit('segment_following_stalled',joint=worst,joint_errors_rad=tracking,
+                              command_rad=command,measured_rad=now,elapsed_s=t,trajectory_seconds=progress,endpoint_m=position)
+                        raise RuntimeError('Joint following stalled while trajectory waited for '+worst)
+                else:paused_since=None
+                stamp=time.monotonic();previous_command=command
+                if trajectory is not None:command=trajectory.sample(progress)
+                else:
+                    while index+1<len(schedule) and progress>=schedule[index+1][0]:index+=1
+                    offset,duration,previous,solution=schedule[index]
+                    phase=min(1.,max(0.,(progress-offset)/duration))
+                    fraction=10*phase**3-15*phase**4+6*phase**5
+                    command={k:previous[k]+fraction*(solution[k]-previous[k]) for k in initial}
+                timings['interpolation']+=time.monotonic()-stamp
+                if dt>0:peak_command_speed=max(peak_command_speed,max(abs(command[k]-previous_command[k])/dt for k in initial))
+                tracking={k:command[k]-now[k] for k in initial}
+                worst=max(tracking,key=lambda k:abs(tracking[k]))
+                if abs(tracking[worst])>.05:
+                    audit('segment_tracking_rejected',joint=worst,joint_errors_rad=tracking,
+                          command_rad=command,measured_rad=now,elapsed_s=t,trajectory_seconds=progress,endpoint_m=position)
+                    raise RuntimeError('Joint tracking error exceeded segment limit ({}: {:.4f} rad)'.format(worst,tracking[worst]))
+                stamp=time.monotonic();self.limb.set_joint_positions(command);samples+=1
+                timings['command_publish']+=time.monotonic()-stamp
+                if wall-last_audit>=1.:
+                    audit('segment_progress',elapsed_s=t,trajectory_seconds=progress,tracking_rad=lead,
+                          clock_scale=scale,endpoint_m=position,feedback_slowdown_s=feedback_delay,loop_delay_s=loop_delay)
+                    last_audit=wall
+                if progress>=elapsed:
+                    if end_wall is None:end_wall=wall
+                    stamp=time.monotonic();distance,angle=self.arrival_error(path[-1][1])
+                    reached=(distance<self.cfg.get('arrival_position_tolerance_m',.01) and angle<.04)
+                    settled=(settled if settled is not None else time.monotonic()) if reached else None
+                    timings['arrival_check']+=time.monotonic()-stamp
+                    if settled is not None and time.monotonic()-settled>=.2:
+                        result=metrics();self.audit('segment_arrived',**result);return result
+                stamp=time.monotonic();time.sleep(.01);timings['sleep']+=time.monotonic()-stamp
+            raise RuntimeError('Segment did not arrive within bounded following/settling time')
+        except BaseException as error:
+            result=metrics();result['error']=str(error)
+            self.audit('segment_execution_failed',**result)
+            raise
 
     def step_segment(self,obs_id,spec,actions):
         if not self.armed:raise RuntimeError('Bridge is read-only')

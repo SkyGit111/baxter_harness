@@ -2,6 +2,10 @@ import io
 import json
 import unittest
 from unittest.mock import Mock, patch
+from pathlib import Path
+from cix_harness.contract import image_data
+
+IMAGE = image_data((Path(__file__).parent / "fixtures/white-pixel.png").read_bytes())
 
 from cix_harness.api_planner import ResponsesTaskPlanner, completed_stream
 
@@ -44,7 +48,7 @@ class ChatGPTPlanner(unittest.TestCase):
         planner=ResponsesTaskPlanner(auth='chatgpt',credential_path='own-project-store')
         with patch('cix_harness.chatgpt_auth.get_access_token',return_value='test-project-token') as token, \
                 patch('cix_harness.api_planner.build_opener',return_value=opener):
-            result=planner.request('check','decide',{}, {'image':'data:image/jpeg;base64,AA=='},{},200)
+            result=planner.request('check','decide',{}, {'image':IMAGE},{},200)
         self.assertEqual(result,{'ok':True})
         token.assert_called_once_with('own-project-store')
         request=opener.open.call_args.args[0]
@@ -86,7 +90,7 @@ class APIRequestTiming(unittest.TestCase):
         with patch('cix_harness.api_planner.time.monotonic',clock), \
                 patch('cix_harness.chatgpt_auth.get_access_token',side_effect=authorize), \
                 patch('cix_harness.api_planner.build_opener',return_value=opener):
-            self.assertEqual(planner.request('check','private prompt',{}, {'image':'private camera frame'},{},200),{'ok':True})
+            self.assertEqual(planner.request('check','private prompt',{}, {'image':IMAGE},{},200),{'ok':True})
         log.assert_called_once()
         self.assertEqual(log.call_args.args[0],'planner_api')
         fields=log.call_args.kwargs
@@ -116,7 +120,7 @@ class APIRequestTiming(unittest.TestCase):
         with patch('cix_harness.api_planner.time.monotonic',clock), \
                 patch('cix_harness.chatgpt_auth.get_access_token',return_value='private credential'), \
                 patch('cix_harness.api_planner.build_opener',return_value=opener):
-            with self.assertRaises(RuntimeError):planner.request('check','decide',{}, {'image':'test'},{},200)
+            with self.assertRaises(RuntimeError):planner.request('check','decide',{}, {'image':IMAGE},{},200)
         fields=log.call_args.kwargs
         self.assertEqual(fields['seconds'],7.)
         self.assertEqual(fields['first_sse_event_seconds'],3.)
@@ -133,7 +137,7 @@ class APIRequestTiming(unittest.TestCase):
         with patch('cix_harness.api_planner.time.monotonic',clock), \
                 patch('cix_harness.chatgpt_auth.get_access_token',side_effect=authorize), \
                 patch('cix_harness.api_planner.build_opener') as opener:
-            with self.assertRaises(RuntimeError):planner.request('check','decide',{}, {'image':'test'},{},200)
+            with self.assertRaises(RuntimeError):planner.request('check','decide',{}, {'image':IMAGE},{},200)
         opener.assert_not_called()
         fields=log.call_args.kwargs
         self.assertEqual(fields['auth_seconds'],4.)
@@ -152,7 +156,7 @@ class APIRequestTiming(unittest.TestCase):
         with patch.dict('os.environ',{'TEST_KEY':'dummy'}):planner=ResponsesTaskPlanner(key_env='TEST_KEY',log=log)
         with patch('cix_harness.api_planner.time.monotonic',clock), \
                 patch('cix_harness.api_planner.build_opener',return_value=opener):
-            planner.request('plan','decide',{}, {'image':'test'},{},200)
+            planner.request('plan','decide',{}, {'image':IMAGE},{},200)
         fields=log.call_args.kwargs
         self.assertEqual(fields['seconds'],5.)
         self.assertEqual(fields['auth_seconds'],0.)
@@ -169,7 +173,7 @@ class APIRequestTiming(unittest.TestCase):
         planner=ResponsesTaskPlanner(auth='chatgpt',log=log)
         with patch('cix_harness.chatgpt_auth.get_access_token',return_value='synthetic'), \
                 patch('cix_harness.api_planner.build_opener',return_value=opener):
-            with self.assertRaises(ValueError):planner.request('check','decide',{}, {'image':'test'},{},200)
+            with self.assertRaises(ValueError):planner.request('check','decide',{}, {'image':IMAGE},{},200)
         self.assertEqual(log.call_args.kwargs['status'],'error')
         self.assertEqual(log.call_args.kwargs['error_stage'],'decision_parse')
 

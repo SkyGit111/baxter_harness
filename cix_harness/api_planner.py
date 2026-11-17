@@ -8,6 +8,7 @@ from urllib.request import Request, build_opener
 
 from .rpc import NoRedirect, MAX_BYTES
 from .task_plan import VisualTaskPlanner
+from .planner_images import IMAGE_SYSTEM, select_images
 
 
 def completed_stream(stream, timing_observer=None):
@@ -54,11 +55,13 @@ def completed_stream(stream, timing_observer=None):
 class ResponsesTaskPlanner(VisualTaskPlanner):
     def __init__(self, model='gpt-6-astra', base_url='https://api.openai.com/v1',
                  key_env='OPENAI_API_KEY', timeout=120, log=None,
-                 auth='api-key', credential_path=None):
+                 auth='api-key', credential_path=None, image_mode='scene_wrist', wrist_max_age_s=.75):
         parsed=urlparse(base_url)
         if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError('API base URL must be HTTPS without credentials/query/fragment')
         self.model=model;self.base_url=base_url.rstrip('/');self.timeout=timeout;self.log=log
+        if image_mode not in ('scene','scene_wrist'):raise ValueError('Unknown API image mode')
+        self.image_mode=image_mode;self.wrist_max_age_s=wrist_max_age_s;self._observation_seen=None
         if auth not in ('api-key', 'chatgpt'):raise ValueError('Unknown API authentication mode')
         self.auth=auth;self.credential_path=credential_path
         if auth=='chatgpt' and self.base_url!='https://api.openai.com/v1':
@@ -69,16 +72,24 @@ class ResponsesTaskPlanner(VisualTaskPlanner):
     def request(self, name, system, schema, obs, context, tokens):
         total_began=time.monotonic()
         began=None;received=None;reply=None;auth_seconds=0.;error_type=None
-        stage='request_prepare';completed=False;milestones={}
+        stage='request_prepare';completed=False;milestones={};image_metadata=None
 
         def observe_timing(marker):
             milestones[marker+'_seconds']=round(time.monotonic()-began,3)
 
         try:
+            images,image_metadata=select_images(obs,self.image_mode,self.wrist_max_age_s)
+            # The bridge clock is remote. Only report the known lower bound on
+            # local reuse time, never subtract unsynchronised monotonic clocks.
+            identity=obs.get('id')
+            if identity is None or self._observation_seen is None or self._observation_seen[0]!=identity:
+                self._observation_seen=(identity,total_began)
+            image_metadata['observation_reuse_elapsed_s']=round(total_began-self._observation_seen[1],3)
+            visual_context=dict(context,planner_images=image_metadata)
             body={'model':self.model,'store':False,'max_output_tokens':max(4096,tokens),
-                  'input':[{'role':'developer','content':system},{'role':'user','content':[
-                      {'type':'input_text','text':json.dumps(context,ensure_ascii=False,separators=(',',':'))},
-                      {'type':'input_image','image_url':obs['image']}]}],
+                  'input':[{'role':'developer','content':system+'\n'+IMAGE_SYSTEM},{'role':'user','content':[
+                      {'type':'input_text','text':json.dumps(visual_context,ensure_ascii=False,separators=(',',':'))}]+
+                      [{'type':'input_image','image_url':url} for url in images]}],
                   'text':{'format':{'type':'json_schema','name':name,'strict':True,'schema':schema}}}
             key=self.key
             if self.auth=='chatgpt':
@@ -138,6 +149,6 @@ class ResponsesTaskPlanner(VisualTaskPlanner):
                         'total_seconds':round(ended-total_began,3),'auth_seconds':round(auth_seconds,3),
                         'first_sse_event_seconds':milestones.get('first_sse_event_seconds'),
                         'first_output_text_delta_seconds':milestones.get('first_output_text_delta_seconds'),
-                        'usage':counts,'response_id':response_id}
+                        'usage':counts,'response_id':response_id,'images':image_metadata}
                 if error_type:fields.update(error_type=error_type,error_stage=stage)
                 self.log('planner_api',**fields)

@@ -193,7 +193,9 @@ class DualBridge:
                 result=self.services[arm].prepare(obs_id,skill,uv,target_base_m,view_index)
             except (ArmCollisionError,PeerStateChangedError,ClearanceUnavailableError) as error:
                 self._invalidate()
-                code=('inter_arm_clearance' if isinstance(error,ArmCollisionError) else
+                from .collision import HeadCollisionError
+                code=('head_clearance' if isinstance(error,HeadCollisionError) else
+                      'inter_arm_clearance' if isinstance(error,ArmCollisionError) else
                       'peer_changed' if isinstance(error,PeerStateChangedError) else 'clearance_unavailable')
                 result={'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,
                         'failure_code':code,'message':str(error),'recoverable':code!='clearance_unavailable'}

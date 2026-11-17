@@ -10,7 +10,14 @@ from cix_harness.memory import EpisodeMemory
 from cix_harness.executive import ExecutiveJournal
 from cix_harness.code_tool import CodeTool
 from cix_harness.hybrid import run as run_hybrid
-from test_executive import step, check, obs, ScriptedPlanner
+from test_executive import step, check, obs as base_obs, ScriptedPlanner
+from pathlib import Path
+from cix_harness.contract import image_data
+
+def obs(*args, **kwargs):
+    result=base_obs(*args, **kwargs)
+    result["image"]=image_data((Path(__file__).parent/"fixtures/white-pixel.png").read_bytes())
+    return result
 
 
 def hybrid_step(skill,backend):return dict(step(skill),backend=backend)

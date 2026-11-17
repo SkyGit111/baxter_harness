@@ -1,6 +1,7 @@
 """Monotonic component timings. Nested durations must not be added together."""
 import math
 import time
+import uuid
 
 
 class TimedRpc:
@@ -11,16 +12,47 @@ class TimedRpc:
         return self.client.select(arm)
 
     def call(self, method, *args, **kwargs):
-        began=time.monotonic();result=None;okay=False
+        began=time.monotonic();result=None;okay=False;call_id=uuid.uuid4().hex
+        self.log('rpc_started',call_id=call_id,component=self.component,method=method)
         try:
             result=self.client.call(method,*args,**kwargs);okay=True
             return result
         finally:
             fields={'component':self.component,'method':method,
-                    'duration_s':round(time.monotonic()-began,6),'succeeded':okay}
+                    'call_id':call_id,'duration_s':round(time.monotonic()-began,6),'succeeded':okay}
             if isinstance(result,dict) and isinstance(result.get('timings_s'),dict):
                 fields['server_timings_s']=result['timings_s']
             self.log('component_timing',**fields)
+
+
+class CallChain:
+    """Ordered task/backend/RPC/phase ledger, without image or credential payloads."""
+    def __init__(self):self.context={};self.rows=[]
+
+    def record(self,item):
+        event=item['event']
+        if event=='task_started':self.context={'episode':item.get('episode'),'route':item.get('route')}
+        if event in ('task_step_dispatch','task_step_executed','task_step_failed'):
+            step=item.get('step',{})
+            self.context.update(step_id=step.get('id'),backend=step.get('backend'),
+                                skill=step.get('skill'),arm=step.get('arm'))
+            if event=='task_step_dispatch':self.context.pop('plan_id',None)
+        if event=='primitive_plan' and item.get('plan_id'):self.context['plan_id']=item['plan_id']
+        keys=('t','seq','event','call_id','component','method','duration_s','succeeded',
+              'phase','seconds','total_seconds','status','failure_code','reason','plan_id')
+        if event in ('task_started','task_plan','task_step_dispatch','rpc_started','component_timing',
+                     'planner_api','primitive_plan','primitive_result','recovery','task_step_executed',
+                     'task_step_failed','finish','stop','task_finished'):
+            row={**self.context,**{k:item[k] for k in keys if k in item}}
+            if event=='task_plan':row['steps']=item.get('steps',[])
+            if event=='primitive_result':
+                row['stages']=[{k:s[k] for k in ('stage_index','phase','duration_s','timings_s','motion_detail') if k in s}
+                               for s in item.get('completed_stages',[])]
+            self.rows.append(row)
+
+    def snapshot(self):
+        return {'format':'harness-call-chain-v1','calls':self.rows,
+                'note':'Chronological calls; RPC/server/stage timings overlap. Join robot audit by plan_id. A missing completion is unknown, not retried.'}
 
 
 def timed_rpc(client,log,component='robot_rpc'):

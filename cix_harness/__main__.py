@@ -10,7 +10,7 @@ from .planner import decide
 from .rollout import predict, rollout, validate_motion_model
 from .rpc import HttpRpcClient, local_json
 from .task_monitor import TaskMonitor
-from .timing import TimingSummary, timed_rpc
+from .timing import TimingSummary, CallChain, timed_rpc
 
 
 class Journal:
@@ -21,13 +21,19 @@ class Journal:
         self.start = time.monotonic()
         self.frames = 0
         self.timings = TimingSummary()
+        self.call_chain=CallChain();self.sequence=0
 
     def __call__(self, event, **fields):
-        item = {"t": round(time.monotonic() - self.start, 3), "event": event, **fields}
+        self.sequence+=1
+        item = {"t": round(time.monotonic() - self.start, 3), "event": event,
+                'seq':self.sequence,'trace_id':self.folder.name, **fields}
         line = json.dumps(item, ensure_ascii=False, allow_nan=False)
         with (self.folder / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(line + "\n")
         self.timings.record(event,fields)
+        self.call_chain.record(item)
+        (self.folder/'call-chain.json').write_text(
+            json.dumps(self.call_chain.snapshot(),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
         if event in ('component_timing','planner_api','primitive_result','finish','stop','task_finished'):
             (self.folder/'timing-summary.json').write_text(
                 json.dumps(self.timings.snapshot(item['t']),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')

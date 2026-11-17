@@ -184,7 +184,10 @@ def plan(skill,state,p,target=None,view_index=0):
     if skill not in SKILLS: raise ValueError('Unknown primitive')
     current=tcp_from_eef(state['eef_m'],state['eef_xyzw'],p)
     check_tcp(current,p)
-    orientation=p['tool_orientation_xyzw']
+    # A pick may select a different yaw. Carry its measured holding orientation
+    # through placement instead of rotating back to the default grasp profile.
+    orientation=(quaternion(state['eef_xyzw']) if skill in ('place','stack')
+                 else p['tool_orientation_xyzw'])
     holding=state.get('gripping')
     if type(holding) is not bool: raise ValueError('Grasp telemetry unknown')
     if skill=='pick' and holding: raise ValueError('Already holding an object')

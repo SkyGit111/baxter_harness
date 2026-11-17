@@ -17,6 +17,7 @@ class BridgeTest(unittest.TestCase):
         self.robot.cfg = {"max_observation_age_s": 2}
         self.robot.pending = ("frame", time.monotonic(), {"j": 0})
         self.robot.ready = Mock()
+        self.robot.check_controller_feedback = Mock()
         self.robot.joints = Mock(return_value={"j": 0})
         self.robot.solve = self.robot.target = Mock()
         self.robot.move = Mock()

@@ -18,6 +18,10 @@ class ArmCollisionError(ValueError):
     pass
 
 
+class HeadCollisionError(ArmCollisionError):
+    pass
+
+
 class PeerStateChangedError(RuntimeError):
     pass
 
@@ -47,6 +51,8 @@ def validate_clearance_config(cfg, armed=False):
         raise ValueError('Unknown arm body geometry')
     if cfg.get('body_geometry')=='urdf_cylinders':
         _number(cfg.get('urdf_padding_m'),.005,.05,'URDF body padding')
+    if type(cfg.get('check_head',False)) is not bool:raise ValueError('check_head must be boolean')
+    _number(cfg.get('head_minimum_distance_m',.04),.005,.15,'head exclusion clearance')
     for arm in ('left','right'):
         radii=cfg['link_radii_m'][arm]
         if not isinstance(radii,dict) or not radii:
@@ -162,7 +168,7 @@ def check_capsules(active,peer,minimum_distance,padding=0.,active_padding=None,p
 
 class KDLArmCapsules:
     """FK at every arm-chain link, plus explicitly measured local tool capsules."""
-    def __init__(self,arm,cfg):
+    def __init__(self,arm,cfg,robot_description=None):
         import sys
         from pathlib import Path
         noetic='/opt/ros/noetic/lib/python3/dist-packages'
@@ -170,7 +176,8 @@ class KDLArmCapsules:
         import PyKDL as kdl
         from urdf_parser_py.urdf import URDF
         from .upstream.kdl_parser import kdl_tree_from_urdf_model
-        robot=URDF.from_parameter_server(key='robot_description')
+        robot=(URDF.from_xml_string(robot_description) if robot_description is not None
+               else URDF.from_parameter_server(key='robot_description'))
         self.kdl=kdl;self.arm=arm;self.cfg=cfg
         tree=kdl_tree_from_urdf_model(robot)
         self.chain=tree.getChain('base',arm+'_gripper')
@@ -209,6 +216,31 @@ class KDLArmCapsules:
         self.body_specs=None
         if cfg.get('body_geometry')=='urdf_cylinders':
             self._configure_urdf_cylinders(robot,tree)
+        self.head_capsules=[]
+        if cfg.get('check_head',False):
+            from urdf_parser_py.urdf import Sphere
+            for name in ('collision_head_link_1','collision_head_link_2'):
+                link=robot.link_map.get(name)
+                if link is None or not link.collisions:raise ClearanceUnavailableError('Missing head collision body '+name)
+                chain=tree.getChain('base',name)
+                if chain.getNrOfJoints():raise ClearanceUnavailableError('Head exclusion body must be fixed to base')
+                frame=kdl.Frame()
+                if kdl.ChainFkSolverPos_recursive(chain).JntToCart(kdl.JntArray(0),frame)<0:
+                    raise ClearanceUnavailableError('Head FK failed')
+                for i,collision in enumerate(link.collisions):
+                    if not isinstance(collision.geometry,Sphere):raise ClearanceUnavailableError('Unsupported head collision geometry')
+                    origin=collision.origin
+                    xyz=vector((origin.xyz if origin else None) or [0,0,0],3,'head body origin')
+                    p=frame*kdl.Vector(*xyz);centre=tuple(float(p[j]) for j in range(3))
+                    radius=_number(collision.geometry.radius,.01,.5,'head collision radius')
+                    self.head_capsules.append(Capsule(name+'_'+str(i),centre,centre,radius))
+
+    def head_clearance(self,joints,holding=True,joint_deltas=None):
+        if not self.head_capsules:return None
+        active=self.capsules(joints,holding)
+        padding=self.capsule_displacement_bounds(joint_deltas) if joint_deltas is not None else None
+        try:return check_capsules(active,self.head_capsules,self.cfg.get('head_minimum_distance_m',.04),active_padding=padding)
+        except ArmCollisionError as error:raise HeadCollisionError('Head exclusion: '+str(error)) from error
 
     def _configure_urdf_cylinders(self,robot,tree):
         """Each padded capsule encloses a complete URDF collision cylinder.
@@ -331,6 +363,8 @@ class InterArmGuard:
         peer='right' if arm=='left' else 'left'
         if type(active_state.get('gripping')) is not bool or type(peer_state.get('gripping')) is not bool:
             raise PeerStateChangedError('Arm occupancy is unknown')
+        checker=getattr(self.models[arm],'head_clearance',None)
+        if callable(checker):checker(state_joints(active_state),active_state['gripping'])
         return check_capsules(self.models[arm].capsules(state_joints(active_state),active_state['gripping']),
                               self.models[peer].capsules(state_joints(peer_state),peer_state['gripping']),
                               self.cfg['minimum_distance_m'])
@@ -353,27 +387,39 @@ class InterArmGuard:
             return {c.name:displacement(model,deltas) for c in capsules}
         peer_bounds=capsule_bounds(peer_model,{n:self.cfg['max_peer_joint_drift_rad'] for n in peer_joints},peer_capsules)
         peer_padding=max(peer_bounds.values())
-        previous=dict(initial);minimum=math.inf
+        previous=dict(initial);minimum=math.inf;head_minimum=None
+        head_check=getattr(model,'head_clearance',None)
+        if callable(head_check):head_minimum=head_check(initial)
         configurations=[solution for path in paths if path is not None for solution,_ in path]
         if not configurations:configurations=[previous]
         for target in configurations:
             if set(target)!=set(previous):raise ClearanceUnavailableError('Incomplete planned collision joint state')
-            count=max(1,math.ceil(max(abs(target[n]-previous[n]) for n in target)/self.cfg['max_joint_sample_rad']))
+            # The whole ORIGINAL IK-knot box is needed: independent monotone
+            # cubic joints can leave every small box along the straight chord.
+            # Subdividing only that chord would incorrectly shrink coverage.
+            count=1
             start=dict(previous)
             for index in range(1,count+1):
                 q={n:start[n]+(target[n]-start[n])*index/count for n in start}
-                for endpoint in (previous,q):
+                centre={n:(previous[n]+q[n])/2 for n in q}
+                # Enclose the full joint box, including a monotone curved
+                # interpolant whose joints do not all have the same phase.
+                for endpoint in (centre,):
                     # A pick may acquire an object halfway through: use its envelope throughout.
                     active=model.capsules(endpoint,True)
                     swept=capsule_bounds(model,{n:.5*(q[n]-previous[n]) for n in q},active)
                     distance=check_capsules(active,peer_capsules,self.cfg['minimum_distance_m'],
                                             active_padding=swept,peer_padding=peer_bounds)
                     minimum=min(minimum,distance)
+                    if callable(head_check):
+                        gap=head_check(endpoint,joint_deltas={n:.5*(q[n]-previous[n]) for n in q})
+                        if gap is not None:head_minimum=gap if head_minimum is None else min(head_minimum,gap)
                 previous=q
         return {'model':self.cfg.get('body_geometry','urdf_chain_capsules'),'checked':True,'minimum_clearance_m':minimum,
                 'peer_drift_padding_m':peer_padding,'swept_intervals_checked':True,
-                'padding_scope':'per_capsule_descendant_joints',
-                'limitations':'Cross-arm links/tools only; not torso, table or arbitrary scene obstacles'}
+                'padding_scope':'per_capsule_descendant_joints','interpolation_envelope':'joint_interval_boxes',
+                'head_checked':head_minimum is not None,'minimum_head_clearance_m':head_minimum,
+                'limitations':'Cross-arm links/tools and optional fixed head exclusion bodies; not full self/torso/table/scene mesh collision certification'}
 
 
 def main():

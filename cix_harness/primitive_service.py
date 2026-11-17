@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from .kinematics import IKUnreachableError
 from .primitives import SKILLS, TargetDepthError, TargetWorkspaceError, validate_profile, plan, ground_pixel, eef_from_tcp, tcp_from_eef, check_tcp
 from .workspace import workspace_metadata
+from .planning import candidate_profiles,stage_phase
+from .collision import ArmCollisionError
 
 
 class SceneChangedError(ValueError):
@@ -50,6 +52,9 @@ def _measure(timings, name, aggregate=None):
 class PrimitiveService:
     def __init__(self,robot):
         self.robot=robot
+        options=robot.cfg.get('planning',{})
+        if not isinstance(options,dict) or options.get('trajectory_mode','legacy') not in ('legacy','continuous'):
+            raise ValueError('Unsupported primitive trajectory mode')
         self.profile=validate_profile(robot.cfg['primitives'])
         self.observation=None
         self.prepared=None
@@ -125,31 +130,42 @@ class PrimitiveService:
         with _measure(timings,'grounding'):
             target=(ground_pixel(uv,depth,r.camera.intrinsics,p) if uv is not None else target_base_m)
             if target is not None:target=vector(target,3,'base target')
-        with _measure(timings,'skill_plan'):
-            stages=plan(skill,obs['state'],p,target,view_index)
-        operations=sum(s['kind'] in ('move','gripper') for s in stages)
-        if r.motion_remaining is None or r.motion_remaining<operations:
-            return {'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,
-                    'failure_code':'stage_budget','message':'Insufficient primitive stage budget',
-                    'required_stages':operations,'motion_remaining':r.motion_remaining,'recoverable':False}
-        with _measure(timings,'ik_preflight'):
-            initial,paths=self._preflight(stages,obs,began,skill=skill)
-        # The dual-arm wrapper checks the other arm against ALL completed IK
-        # paths. No plan token exists until this geometry check succeeds.
         peer_check=getattr(type(r),'check_other_arm_path',None)
-        if callable(peer_check):
-            with _measure(timings,'other_arm_preflight'):
-                if peer_check(r,paths) is False:raise ValueError('Other arm path check rejected the plan')
-            if time.monotonic()-began>p['perception_max_age_s']:
-                raise SceneChangedError('Scene expired during other-arm path preflight')
-            final=r.joints()
-            if set(final)!=set(initial) or max(abs(final[k]-initial[k]) for k in initial)>.015:
-                raise SceneChangedError('Arm moved during other-arm path preflight')
+        attempts=[];last_error=None
+        for yaw,candidate in candidate_profiles(p,obs['state'],skill,r.cfg.get('planning',{})):
+            attempt_started=time.monotonic()
+            try:
+                with _measure(timings,'skill_plan'):
+                    stages=plan(skill,obs['state'],candidate,target,view_index)
+                operations=sum(s['kind'] in ('move','gripper') for s in stages)
+                if r.motion_remaining is None or r.motion_remaining<operations:
+                    return {'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,
+                            'failure_code':'stage_budget','message':'Insufficient primitive stage budget',
+                            'required_stages':operations,'motion_remaining':r.motion_remaining,'recoverable':False}
+                with _measure(timings,'ik_preflight'):
+                    initial,paths=self._preflight(stages,obs,began,skill=skill)
+                if callable(peer_check):
+                    with _measure(timings,'other_arm_preflight'):
+                        if peer_check(r,paths) is False:raise ValueError('Other arm path check rejected the plan')
+            except (IKPreflightError,ArmCollisionError) as error:
+                attempts.append({'yaw_rad':yaw,'status':'rejected','reason':str(error),'seconds':time.monotonic()-attempt_started})
+                last_error=error
+                continue
+            attempts.append({'yaw_rad':yaw,'status':'ready','seconds':time.monotonic()-attempt_started})
+            break
+        else:
+            r.audit('primitive_candidates_rejected',obs_id=obs_id,skill=skill,candidates=attempts)
+            raise last_error
+        if time.monotonic()-began>p['perception_max_age_s']:raise SceneChangedError('Scene expired during path preflight')
+        final=r.joints()
+        if set(final)!=set(initial) or max(abs(final[k]-initial[k]) for k in initial)>.015:
+            raise SceneChangedError('Arm moved during path preflight')
         token=uuid.uuid4().hex
         self.prepared=(token,time.monotonic(),initial,stages,paths,operations,skill,obs['state']['gripping'])
         return {'status':'ready','plan_id':token,'obs_id':obs_id,'skill':skill,'target_base_m':target,'stages':stages,
                 'applied':False,'ik_preflight':True,'required_stages':operations,
-                'expires_in_s':r.cfg['max_observation_age_s']}
+                'expires_in_s':r.cfg['max_observation_age_s'],'planning_candidates':attempts,
+                'selected_yaw_rad':yaw,'trajectory_mode':r.cfg.get('planning',{}).get('trajectory_mode','legacy')}
 
     def _preflight(self,stages,obs,began,skill=None):
         from geometry_msgs.msg import PoseStamped
@@ -163,7 +179,7 @@ class PrimitiveService:
         start=r.limb.endpoint_pose();observed=start;seed=initial;paths=[];holding=obs['state']['gripping']
         pending_departure=skill=='pick' and holding is False
         # Compute every leg before any gripper/motor operation. No prefix fallback.
-        for stage in stages:
+        for stage_index,stage in enumerate(stages):
             if stage['kind']!='move':
                 if stage['kind']=='gripper':holding=not stage['open']
                 elif stage['kind']=='verify_grasp':holding=stage['held']
@@ -175,6 +191,7 @@ class PrimitiveService:
             if departing:
                 check_support_departure(tcp_from_eef(a,qa,p),stage['tcp_m'],qa,qb,p)
                 pending_departure=False
+            curve_initial=dict(seed)
             distance=math.dist(a,dest)
             if distance>p['max_leg_m']+1e-9:raise ValueError('Primitive leg exceeds configured travel')
             angle=2*math.acos(min(1,abs(sum(x*y for x,y in zip(qa,qb)))))
@@ -195,10 +212,26 @@ class PrimitiveService:
                 try:solution=r.continuous_ik.solve(point,seed,observed)
                 except IKUnreachableError as error:raise IKPreflightError(str(error)) from error
                 path.append((solution,point));seed=solution;observed=pose
+            if r.cfg.get('planning',{}).get('trajectory_mode')=='continuous':
+                self._check_curve(curve_initial,path,holding,departing,stage_phase(stages,stage_index,skill))
             paths.append(path)
         if time.monotonic()-began>p['perception_max_age_s']:raise SceneChangedError('Scene expired during full IK preflight')
         if max(abs(r.joints()[k]-initial[k]) for k in initial)>.015:raise SceneChangedError('Arm moved during IK preflight')
         return initial,paths
+
+    def _check_curve(self,initial,path,holding,departing,phase):
+        """Check the same curve built by the executor, including measured start drift."""
+        from .trajectory import JointTrajectory,motion_limits
+        r=self.robot;p=self.profile
+        speed,acceleration=motion_limits(r.cfg,phase)
+        trajectory=JointTrajectory(initial,[q for q,_ in path],speed,acceleration*.5)
+        for joints in trajectory.sampled_positions(.005):
+            pose=r.continuous_ik.forward(joints);pos,q=pose['position'],pose['orientation']
+            xyz=[pos.x,pos.y,pos.z];r.inside(xyz);r.guard_pose(pose)
+            tcp=tcp_from_eef(xyz,[q.x,q.y,q.z,q.w],p)
+            try:check_tcp(tcp,p,held_bottom_m=p['held_bottom_below_tcp_m'] if holding and not departing else 0.)
+            except ValueError as error:raise IKPreflightError('Continuous curve violates TCP clearance: '+str(error)) from error
+        return trajectory.metadata
 
     def execute(self,plan_id):
         started=time.monotonic()
@@ -222,17 +255,34 @@ class PrimitiveService:
         token,created,initial,stages,paths,operations,skill,holding=prepared;r=self.robot;p=self.profile
         r.motion_remaining-=operations;receipts=[];grasp_verified=False
         r.audit('primitive_dispatch',plan_id=token,skill=skill,stages=stages,timings_s=dict(timings))
-        stage=None;stage_started=None;stage_timings={}
+        stage=None;stage_started=None;stage_timings={};departed=False
         try:
-            for stage,path in zip(stages,paths):
+            for stage_index,(stage,path) in enumerate(zip(stages,paths)):
                 stage_started=time.monotonic();stage_timings={}
+                phase=stage_phase(stages,stage_index,skill);motion_detail=None
+                r.audit('primitive_stage_started',plan_id=token,stage_index=stage_index,
+                        skill=skill,backend='primitives',phase=phase,stage=stage)
                 with _measure(stage_timings,'stage_validation',timings):
                     r.ready();r.joints()
                 if stage['kind']=='move':
                     with _measure(stage_timings,'motion_verification',timings):
                         if holding and not r.grip.gripping():raise RuntimeError('Held object lost before movement')
+                    initial=r.joints();options={}
+                    continuous=r.cfg.get('planning',{}).get('trajectory_mode')=='continuous'
+                    if continuous:
+                        with _measure(stage_timings,'trajectory_preflight',timings):
+                            departing=skill=='pick' and grasp_verified and not departed
+                            self._check_curve(initial,path,holding,departing,phase)
+                            peer_check=getattr(type(r),'check_other_arm_path',None)
+                            if callable(peer_check):peer_check(r,[path])
+                            # Preflight may be expensive; do not start from a pose which changed meanwhile.
+                            if max(abs(r.joints()[n]-initial[n]) for n in initial)>.015:
+                                raise RuntimeError('Arm moved during trajectory revalidation')
+                            if departing:departed=True
+                        options={'continuous':True,'motion_phase':phase}
+                    r.motion_context={'plan_id':token,'stage_index':stage_index,'skill':skill,'backend':'primitives','phase':phase}
                     with _measure(stage_timings,'motion',timings):
-                        r.move_segment(r.joints(),path,r.endpoint_position(),max_travel=p['max_leg_m'])
+                        motion_detail=r.move_segment(initial,path,r.endpoint_position(),max_travel=p['max_leg_m'],**options)
                     with _measure(stage_timings,'motion_verification',timings):
                         d,a=r.arrival_error(path[-1][1])
                         if d>r.cfg.get('arrival_position_tolerance_m',.01) or a>.04:
@@ -257,14 +307,15 @@ class PrimitiveService:
                 with _measure(stage_timings,'stage_validation',timings):
                     r.ready()
                     receipt={'stage':stage,'eef_m':r.endpoint_position(),'gripping':bool(r.grip.gripping())}
-                receipt.update(duration_s=time.monotonic()-stage_started,timings_s=dict(stage_timings))
+                receipt.update(stage_index=stage_index,phase=phase,duration_s=time.monotonic()-stage_started,timings_s=dict(stage_timings))
+                if isinstance(motion_detail,dict):receipt['motion_detail']=motion_detail
                 receipts.append(receipt)
                 stage_started=None
                 r.audit('primitive_stage_applied',plan_id=token,**receipt)
         except BaseException as error:
             failed_stage=None
             if stage_started is not None:
-                failed_stage={'stage':stage,'status':'failed','duration_s':time.monotonic()-stage_started,
+                failed_stage={'stage':stage,'stage_index':stage_index,'phase':phase,'status':'failed','duration_s':time.monotonic()-stage_started,
                               'timings_s':dict(stage_timings)}
             stopped=False
             with _measure(timings,'stop'):

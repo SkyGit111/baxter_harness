@@ -7,7 +7,7 @@ class IKUnreachableError(ValueError):
 
 
 class ContinuousIK:
-    def __init__(self, arm):
+    def __init__(self, arm, robot_description=None):
         # Noetic's Python 3 parser must precede the obsolete Python 2 copy in
         # this laboratory's Baxter workspace. Do not change the system install.
         import sys
@@ -19,7 +19,8 @@ class ContinuousIK:
         from urdf_parser_py.urdf import URDF
         from .upstream.kdl_parser import kdl_tree_from_urdf_model
         self.kdl = kdl
-        robot = URDF.from_parameter_server(key='robot_description')
+        robot = (URDF.from_xml_string(robot_description) if robot_description is not None
+                 else URDF.from_parameter_server(key='robot_description'))
         chain = kdl_tree_from_urdf_model(robot).getChain('base', arm+'_gripper')
         self.names = [chain.getSegment(i).getJoint().getName() for i in range(chain.getNrOfSegments())
                       if chain.getSegment(i).getJoint().getType() != getattr(kdl.Joint, 'None')]
@@ -32,6 +33,22 @@ class ContinuousIK:
         self.fk = kdl.ChainFkSolverPos_recursive(chain)
         self.velocity = kdl.ChainIkSolverVel_pinv(chain)
         self.solver = kdl.ChainIkSolverPos_NR_JL(chain,self.lower,self.upper,self.fk,self.velocity,150,1e-6)
+
+    def forward(self, joints):
+        """FK for checking the exact interpolated execution path; no ROS calls."""
+        from types import SimpleNamespace as NS
+        if set(joints)!=set(self.names):raise ValueError('Incomplete FK joint state')
+        q=self.kdl.JntArray(7)
+        for i,name in enumerate(self.names):
+            value=joints[name]
+            if not math.isfinite(value) or not self.lower[i]<=value<=self.upper[i]:
+                raise ValueError('FK joint outside model limits')
+            q[i]=value
+        frame=self.kdl.Frame()
+        if self.fk.JntToCart(q,frame)<0:raise RuntimeError('Forward kinematics failed')
+        x,y,z,w=frame.M.GetQuaternion()
+        return {'position':NS(x=frame.p[0],y=frame.p[1],z=frame.p[2]),
+                'orientation':NS(x=x,y=y,z=z,w=w)}
 
     def frame(self, position, orientation):
         k = self.kdl
