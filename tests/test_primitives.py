@@ -116,6 +116,17 @@ class Runner(unittest.TestCase):
         self.assertEqual(sum(c.args[0]=='primitive.execute' for c in robot.call.call_args_list),1)
 
 class Preflight(unittest.TestCase):
+    def test_support_departure_only_accepts_a_clear_straight_upward_lift(self):
+        from cix_harness.primitive_service import check_support_departure
+        p=profile();p['held_bottom_below_tcp_m']=.03
+        z=p['table_z_m']+.02;q=[1.,0.,0.,0.]
+        start=[.6,.2,z];end=[.6,.2,z+.10]
+        check_support_departure(start,end,q,q,p)
+        for bad in ([.61,.2,z+.10],[.6,.2,z-.01],[.6,.2,z+.001]):
+            with self.subTest(end=bad),self.assertRaises(ValueError):
+                check_support_departure(start,bad,q,q,p)
+        with self.assertRaises(ValueError):check_support_departure(start,end,q,[0.,1.,0.,0.],p)
+
     def test_full_ik_failure_precedes_every_actuator_operation(self):
         import sys
         from unittest.mock import patch
@@ -151,3 +162,23 @@ class Preflight(unittest.TestCase):
         self.assertTrue(result['ik_preflight']);self.assertFalse(result['applied'])
         r.move_segment.assert_not_called();r.grip.command_position.assert_not_called()
         self.assertGreater(r.continuous_ik.solve.call_count,10)
+
+    def test_small_supported_cube_can_lift_but_held_transit_still_checks_bottom(self):
+        import sys
+        from unittest.mock import patch
+        geometry=NS(PoseStamped=lambda:NS(header=NS(),pose=NS(position=NS(),orientation=NS())))
+        tf=NS(transformations=NS(quaternion_slerp=lambda a,b,f:a))
+        p=profile();p.update(held_bottom_below_tcp_m=.03,grasp_inset_m=.003,table_clearance_m=.004)
+        r=Mock();r.cfg={'primitives':p,'max_observation_age_s':3};r.motion_remaining=64
+        r.joints.return_value={'j':0.};r.continuous_ik.solve.return_value={'j':0.}
+        r.limb.endpoint_pose.return_value={'position':NS(x=.6,y=.2,z=.1),'orientation':NS(x=1.,y=0.,z=0.,w=0.)}
+        st=state();st.update(joint_names=['j'],joint_rad=[0.])
+        service=PrimitiveService(r);service.observation=({'id':'o','state':st},time.monotonic(),None)
+        with patch.dict(sys.modules,{'geometry_msgs':NS(msg=geometry),'geometry_msgs.msg':geometry,'tf':tf}):
+            result=service.prepare('o','pick',target_base_m=[.7,.25,p['table_z_m']+.022])
+            self.assertEqual(result['status'],'ready')
+            held=state(True);held.update(joint_names=['j'],joint_rad=[0.])
+            service.observation=({'id':'next','state':held},time.monotonic(),None)
+            with self.assertRaisesRegex(ValueError,'table clearance'):
+                service.prepare('next','move_to',target_base_m=[.7,.25,p['table_z_m']+.02])
+        r.move_segment.assert_not_called();r.grip.command_position.assert_not_called()

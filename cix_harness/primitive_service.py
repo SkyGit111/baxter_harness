@@ -19,6 +19,21 @@ class IKPreflightError(ValueError):
 class EmptyGrasp(RuntimeError):
     pass
 
+
+def check_support_departure(start_tcp, end_tcp, start_q, end_q, profile):
+    """A newly grasped object starts on its support, before free-space clearance.
+
+    This exception is only for the first straight upward pick leg. It never
+    permits sliding, lowering, rotating, or an endpoint that is still in contact.
+    Runtime grasp verification must succeed before this leg is dispatched.
+    """
+    if math.dist(start_tcp[:2],end_tcp[:2])>1e-7 or end_tcp[2]<=start_tcp[2]:
+        raise ValueError('Support departure must be straight upward')
+    if abs(sum(a*b for a,b in zip(start_q,end_q)))<1-1e-9:
+        raise ValueError('Support departure must preserve orientation')
+    check_tcp(start_tcp,profile)
+    check_tcp(end_tcp,profile,held_bottom_m=profile['held_bottom_below_tcp_m'])
+
 @contextmanager
 def _measure(timings, name, aggregate=None):
     """Count elapsed work even when it raises; nested totals are not additive."""
@@ -118,7 +133,7 @@ class PrimitiveService:
                     'failure_code':'stage_budget','message':'Insufficient primitive stage budget',
                     'required_stages':operations,'motion_remaining':r.motion_remaining,'recoverable':False}
         with _measure(timings,'ik_preflight'):
-            initial,paths=self._preflight(stages,obs,began)
+            initial,paths=self._preflight(stages,obs,began,skill=skill)
         # The dual-arm wrapper checks the other arm against ALL completed IK
         # paths. No plan token exists until this geometry check succeeds.
         peer_check=getattr(type(r),'check_other_arm_path',None)
@@ -136,7 +151,7 @@ class PrimitiveService:
                 'applied':False,'ik_preflight':True,'required_stages':operations,
                 'expires_in_s':r.cfg['max_observation_age_s']}
 
-    def _preflight(self,stages,obs,began):
+    def _preflight(self,stages,obs,began,skill=None):
         from geometry_msgs.msg import PoseStamped
         from tf import transformations as tf
         r=self.robot;p=self.profile
@@ -145,6 +160,7 @@ class PrimitiveService:
         if set(initial)!=set(measured) or max(abs(initial[k]-measured[k]) for k in initial)>.015:
             raise SceneChangedError('Arm moved during visual planning')
         start=r.limb.endpoint_pose();observed=start;seed=initial;paths=[];holding=obs['state']['gripping']
+        pending_departure=skill=='pick' and holding is False
         # Compute every leg before any gripper/motor operation. No prefix fallback.
         for stage in stages:
             if stage['kind']!='move':
@@ -154,6 +170,10 @@ class PrimitiveService:
             dest=eef_from_tcp(stage['tcp_m'],stage['xyzw'],p)
             a=[observed['position'].x,observed['position'].y,observed['position'].z]
             oq=observed['orientation'];qa=[oq.x,oq.y,oq.z,oq.w];qb=stage['xyzw']
+            departing=pending_departure and holding
+            if departing:
+                check_support_departure(tcp_from_eef(a,qa,p),stage['tcp_m'],qa,qb,p)
+                pending_departure=False
             distance=math.dist(a,dest)
             if distance>p['max_leg_m']+1e-9:raise ValueError('Primitive leg exceeds configured travel')
             angle=2*math.acos(min(1,abs(sum(x*y for x,y in zip(qa,qb)))))
@@ -167,9 +187,8 @@ class PrimitiveService:
                 point.pose.orientation.x,point.pose.orientation.y,point.pose.orientation.z,point.pose.orientation.w=q
                 pose={'position':point.pose.position,'orientation':point.pose.orientation}
                 r.guard_pose(pose)
-                from .primitives import tcp_from_eef
                 tcp=tcp_from_eef(xyz,q,p)
-                try:check_tcp(tcp,p,held_bottom_m=p['held_bottom_below_tcp_m'] if holding else 0.)
+                try:check_tcp(tcp,p,held_bottom_m=p['held_bottom_below_tcp_m'] if holding and not departing else 0.)
                 except ValueError as error:
                     raise ValueError('Interpolated TCP leaves workspace or crosses table: '+str(error)) from error
                 try:solution=r.continuous_ik.solve(point,seed,observed)
