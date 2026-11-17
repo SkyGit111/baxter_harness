@@ -253,7 +253,18 @@ class DualBridge:
                 self._invalidate()
 
     def methods(self):
-        return {'healthz':self.health,'dual.observe':self.observe,'dual.prepare':self.prepare,'dual.execute':self.execute}
+        return {'healthz':self.health,'dual.observe':self.observe,'dual.prepare':self.prepare,'dual.execute':self.execute,
+                'dual.scene_snapshot':self.scene_snapshot}
+
+    def scene_snapshot(self,arm):
+        """Capture fresh aligned RGB-D for onsite geometry checks using the shared camera."""
+        with self.lock:
+            obs=self.observe(arm)
+            folder=Path('runs/geometry');folder.mkdir(parents=True,exist_ok=True)
+            path=folder/(obs['id']+'.npz')
+            self.robots[arm].camera.save_depth(str(path))
+            return {'obs_id':obs['id'],'selected_arm':arm,'state':obs['state'],
+                    'arm_states':obs['arm_states'],'depth_file':str(path.resolve())}
 
     def close(self):
         # Close subscribers before releasing the shared USB stream exactly once.

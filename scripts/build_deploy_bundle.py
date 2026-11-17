@@ -119,7 +119,7 @@ def write_bundle(output, files, kind, revision):
             record.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(record, raw)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    output.with_name(output.name + '.sha256').write_text(digest + '  ' + output.name + '\n', encoding='ascii')
+    output.with_name(output.name + '.sha256').write_bytes((digest + '  ' + output.name + '\n').encode('ascii'))
     return {'file': str(output), 'sha256': digest, 'files': len(files), 'bytes': output.stat().st_size, 'kind': kind}
 
 

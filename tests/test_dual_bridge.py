@@ -113,7 +113,7 @@ class DualBridgeTests(unittest.TestCase):
         for field in ('workspaces','arm_skills','arm_recovery'):self.assertEqual(set(obs[field]),{'left','right'})
         self.assertEqual(bridge.health()['motion_scope'],'supervised_dual_primitive_task')
         self.assertEqual(bridge.health()['backend_capabilities'],['primitives'])
-        self.assertEqual(set(bridge.methods()),{'healthz','dual.observe','dual.prepare','dual.execute'})
+        self.assertEqual(set(bridge.methods()),{'healthz','dual.observe','dual.prepare','dual.execute','dual.scene_snapshot'})
         bridge.close();bridge.close();self.assertEqual(camera.closes,1)
 
     def test_home_is_not_advertised_when_profile_has_no_site_home(self):
@@ -121,6 +121,20 @@ class DualBridgeTests(unittest.TestCase):
         bridge=self.bridge(config=cfg);obs=bridge.observe('right')
         self.assertNotIn('home',obs['primitive_skills']);self.assertNotIn('home',obs['arm_skills']['right'])
         self.assertIn('home',obs['arm_skills']['left'])
+
+    def test_depth_snapshot_uses_shared_camera_and_revokes_previous_plan(self):
+        import tempfile
+        bridge=self.bridge();self.plan(bridge,'left')
+        camera=bridge.robots['left'].camera;camera.save_depth=Mock()
+        with tempfile.TemporaryDirectory() as folder,patch('cix_harness.dual_bridge.Path',return_value=Path(folder)):
+            result=bridge.scene_snapshot('right')
+        self.assertEqual(result['selected_arm'],'right')
+        self.assertEqual(camera.captures,2)
+        camera.save_depth.assert_called_once()
+        self.assertTrue(result['depth_file'].endswith('right-2.npz'))
+        for arm,service in bridge.services.items():
+            self.assertIsNone(service.prepared)
+            bridge.robots[arm].grip.command_position.assert_not_called()
 
     def test_dual_constructor_initial_ready_has_no_owner_but_later_ready_checks_peer(self):
         cfg=configuration(True)['arms']['left'];shared=SharedMotion(12,600)
