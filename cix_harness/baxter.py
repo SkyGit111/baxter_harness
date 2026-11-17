@@ -636,16 +636,44 @@ class Baxter:
             duration=max(.15,1.875*max(abs(solution[k]-previous[k]) for k in initial)/self.cfg.get('joint_speed_rad_s',.12))
             schedule.append((elapsed,duration,previous,solution))
             elapsed+=duration;previous=solution
-        began=time.monotonic();index=0;settled=None
-        while time.monotonic()-began < elapsed+2.5:
+        began=time.monotonic();last_tick=began;progress=0.;index=0;settled=None
+        command=dict(initial);paused_since=None;retimed_seconds=0.;peak_tracking=0.
+        deadline=elapsed+min(60.,max(10.,elapsed))+2.5
+        while time.monotonic()-began < deadline:
             self.ready();now=self.joints();position=self.endpoint_position()
             self.inside(position);self.guard_pose(self.limb.endpoint_pose())
             if math.dist(position,start)>(self.cfg['max_translation_m'] if max_travel is None else max_travel)+CLEARANCE_TRAVEL_MARGIN_M:
                 raise RuntimeError('Endpoint exceeded segment travel envelope')
-            t=time.monotonic()-began
-            while index+1<len(schedule) and t>=schedule[index+1][0]:index+=1
+            wall=time.monotonic();t=wall-began
+            # Advance a virtual trajectory clock from measured following error.
+            # Keep all joints on the checked path; never compensate individual
+            # joints or switch to raw commands that bypass Baxter's controller.
+            tracking={k:command[k]-now[k] for k in initial}
+            worst=max(tracking,key=lambda k:abs(tracking[k]))
+            lead=abs(tracking[worst]);peak_tracking=max(peak_tracking,lead)
+            if lead>.05:
+                self.audit('segment_tracking_rejected',joint=worst,joint_errors_rad=tracking,
+                           command_rad=command,measured_rad=now,elapsed_s=t,
+                           trajectory_seconds=progress,scheduled_seconds=elapsed,
+                           schedule_index=index,endpoint_m=position)
+                raise RuntimeError('Joint tracking error exceeded segment limit ({}: {:.4f} rad)'.format(worst,tracking[worst]))
+            scale=min(1.,max(0.,(.035-lead)/.015))
+            dt=max(0.,wall-last_tick);last_tick=wall
+            # A delayed control iteration must not jump forward to catch up.
+            advance=min(.05,dt)*scale
+            if progress<elapsed:retimed_seconds+=dt-advance
+            progress=min(elapsed,progress+advance)
+            if scale<.01 and progress<elapsed:
+                if paused_since is None:paused_since=wall
+                if wall-paused_since>=8.:
+                    self.audit('segment_following_stalled',joint=worst,joint_errors_rad=tracking,
+                               command_rad=command,measured_rad=now,elapsed_s=t,
+                               trajectory_seconds=progress,endpoint_m=position)
+                    raise RuntimeError('Joint following stalled while trajectory waited for '+worst)
+            else:paused_since=None
+            while index+1<len(schedule) and progress>=schedule[index+1][0]:index+=1
             offset,duration,previous,solution=schedule[index]
-            phase=min(1.,max(0.,(t-offset)/duration))
+            phase=min(1.,max(0.,(progress-offset)/duration))
             f=10*phase**3-15*phase**4+6*phase**5
             command={k:previous[k]+f*(solution[k]-previous[k]) for k in initial}
             tracking={k:command[k]-now[k] for k in initial}
@@ -653,19 +681,23 @@ class Baxter:
             if abs(tracking[worst])>.05:
                 self.audit('segment_tracking_rejected',joint=worst,joint_errors_rad=tracking,
                            command_rad=command,measured_rad=now,elapsed_s=t,
-                           scheduled_seconds=elapsed,schedule_index=index,
+                           trajectory_seconds=progress,scheduled_seconds=elapsed,schedule_index=index,
                            endpoint_m=position)
                 raise RuntimeError('Joint tracking error exceeded segment limit ({}: {:.4f} rad)'.format(worst,tracking[worst]))
             self.limb.set_joint_positions(command)
-            if t>=elapsed:
+            if progress>=elapsed:
                 distance,angle=self.arrival_error(path[-1][1])
                 reached=(distance<self.cfg.get('arrival_position_tolerance_m',.01) and angle<.04)
                 settled=(settled if settled is not None else time.monotonic()) if reached else None
-                if settled is not None and time.monotonic()-settled>=.2:return
+                if settled is not None and time.monotonic()-settled>=.2:
+                    self.audit('segment_arrived',elapsed_s=t,scheduled_seconds=elapsed,
+                               retimed_seconds=retimed_seconds,peak_tracking_rad=peak_tracking)
+                    return
             time.sleep(.01)
-        # Report final tracking quality to the visual loop. A task segment is
-        # not an exact point-positioning test; all physical guards stayed live.
-        return
+        self.audit('segment_arrival_timeout',elapsed_s=time.monotonic()-began,
+                   trajectory_seconds=progress,scheduled_seconds=elapsed,
+                   retimed_seconds=retimed_seconds,peak_tracking_rad=peak_tracking)
+        raise RuntimeError('Segment did not arrive within bounded following/settling time')
 
     def step_segment(self,obs_id,spec,actions):
         if not self.armed:raise RuntimeError('Bridge is read-only')

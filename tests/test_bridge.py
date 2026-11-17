@@ -218,3 +218,47 @@ class BridgeTest(unittest.TestCase):
         self.assertGreaterEqual(clock[0],2*1.875*.1/.12+.2)
         for (ta,a),(tb,b) in zip(samples,samples[1:]):
             self.assertLessEqual(abs(b-a)/(tb-ta),.12001)
+
+    def test_segment_waits_for_slow_feedback_without_exceeding_command_speed(self):
+        self.robot.cfg.update(max_translation_m=.12,joint_speed_rad_s=.12)
+        self.robot.inside=Mock();self.robot.limb=Mock();self.robot.audit=Mock()
+        measured={'j':0.};command={'j':0.};clock=[0.];samples=[]
+        self.robot.joints=lambda:dict(measured)
+        self.robot.arrival_error=lambda target:(abs(.2-measured['j']),0.)
+        def send(value):
+            command.update(value);samples.append((clock[0],value['j'],measured['j']))
+        def tick(dt):
+            # A first-order plant which would lag > .05 rad at nominal speed.
+            measured['j']+=(command['j']-measured['j'])*dt/.8
+            clock[0]+=dt
+        self.robot.limb.set_joint_positions.side_effect=send
+        with patch('cix_harness.baxter.time.monotonic',side_effect=lambda:clock[0]), \
+             patch('cix_harness.baxter.time.sleep',side_effect=tick):
+            self.robot.move_segment({'j':0.},[({'j':.1},Mock()),({'j':.2},Mock())],[.7,.1,.2])
+        self.assertLess(abs(measured['j']-.2),.01)
+        self.assertGreater(clock[0],2*1.875*.1/.12+1.)
+        self.assertLess(max(abs(c-m) for _,c,m in samples),.04)
+        for (ta,a,_),(tb,b,_) in zip(samples,samples[1:]):
+            self.assertLessEqual(abs(b-a)/(tb-ta),.12001)
+        receipt=self.robot.audit.call_args.kwargs
+        self.assertGreater(receipt['retimed_seconds'],1.)
+
+    def test_segment_stalled_feedback_stops_without_sending_final_target(self):
+        self.robot.cfg.update(max_translation_m=.12,joint_speed_rad_s=.12)
+        self.robot.inside=Mock();self.robot.limb=Mock();self.robot.audit=Mock()
+        clock=[0.];commands=[]
+        self.robot.limb.set_joint_positions.side_effect=lambda q:commands.append(q['j'])
+        with patch('cix_harness.baxter.time.monotonic',side_effect=lambda:clock[0]), \
+             patch('cix_harness.baxter.time.sleep',side_effect=lambda dt:clock.__setitem__(0,clock[0]+dt)):
+            with self.assertRaisesRegex(RuntimeError,'stalled|bounded following'):
+                self.robot.move_segment({'j':0.},[({'j':.2},Mock())],[.7,.1,.2])
+        self.assertLess(max(commands),.04)
+        self.assertLess(clock[0],16.)
+
+    def test_segment_still_rejects_external_joint_drift(self):
+        self.robot.cfg.update(max_translation_m=.12,joint_speed_rad_s=.12)
+        self.robot.inside=Mock();self.robot.limb=Mock();self.robot.audit=Mock()
+        self.robot.joints.return_value={'j':-.06}
+        with self.assertRaisesRegex(RuntimeError,'tracking error'):
+            self.robot.move_segment({'j':0.},[({'j':.2},Mock())],[.7,.1,.2])
+        self.robot.limb.set_joint_positions.assert_not_called()
