@@ -648,8 +648,14 @@ class Baxter:
             phase=min(1.,max(0.,(t-offset)/duration))
             f=10*phase**3-15*phase**4+6*phase**5
             command={k:previous[k]+f*(solution[k]-previous[k]) for k in initial}
-            if max(abs(command[k]-now[k]) for k in initial)>.05:
-                raise RuntimeError('Joint tracking error exceeded segment limit')
+            tracking={k:command[k]-now[k] for k in initial}
+            worst=max(tracking,key=lambda k:abs(tracking[k]))
+            if abs(tracking[worst])>.05:
+                self.audit('segment_tracking_rejected',joint=worst,joint_errors_rad=tracking,
+                           command_rad=command,measured_rad=now,elapsed_s=t,
+                           scheduled_seconds=elapsed,schedule_index=index,
+                           endpoint_m=position)
+                raise RuntimeError('Joint tracking error exceeded segment limit ({}: {:.4f} rad)'.format(worst,tracking[worst]))
             self.limb.set_joint_positions(command)
             if t>=elapsed:
                 distance,angle=self.arrival_error(path[-1][1])

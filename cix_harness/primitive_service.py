@@ -154,6 +154,7 @@ class PrimitiveService:
     def _preflight(self,stages,obs,began,skill=None):
         from geometry_msgs.msg import PoseStamped
         from tf import transformations as tf
+        from .primitives import tcp_from_eef
         r=self.robot;p=self.profile
         initial=r.joints()
         measured=dict(zip(obs['state']['joint_names'],obs['state']['joint_rad']))
