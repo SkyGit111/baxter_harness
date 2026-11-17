@@ -177,11 +177,22 @@ class KDLArmCapsules:
         self.fk=kdl.ChainFkSolverPos_recursive(self.chain)
         self.limits={name:(robot.joint_map[name].limit.lower,robot.joint_map[name].limit.upper) for name in self.names}
         # Sum of rigid offset lengths bounds point displacement from any joint.
-        offsets=sum(self.chain.getSegment(i).getFrameToTip().p.Norm() for i in range(self.chain.getNrOfSegments()))
+        lengths=[float(self.chain.getSegment(i).getFrameToTip().p.Norm()) for i in range(self.chain.getNrOfSegments())]
+        offsets=sum(lengths)
         tool_extent=max(math.sqrt(sum(x*x for x in tool[key])) for tool in cfg['tool_capsules'][arm] for key in ('start_m','end_m'))
         self.reach_bound=float(offsets+tool_extent)
+        # A joint rotates only its descendants. Its own origin and preceding
+        # base/arm offsets do not contribute to the lever arm. Triangle bounds
+        # on all downstream offsets cover every capsule endpoint at any pose.
+        self.joint_reach_bounds={name:sum(lengths[index+1:])+tool_extent
+                                 for name,index in zip(self.names,moving)}
         if not math.isfinite(self.reach_bound) or self.reach_bound<=0:
             raise ClearanceUnavailableError('Invalid URDF motion-radius bound')
+
+    def displacement_bound(self,deltas):
+        if set(deltas)!=set(self.names):raise ClearanceUnavailableError('Incomplete displacement joint state')
+        return sum(_number(abs(deltas[n]),0,2*math.pi,'joint displacement')*self.joint_reach_bounds[n]
+                   for n in self.names)
 
     def capsules(self,joints,holding=False):
         if set(joints)!=set(self.names):raise ClearanceUnavailableError('Collision joint state is incomplete')
@@ -251,7 +262,11 @@ class InterArmGuard:
         peer_model=self.models[peer];model=self.models[arm]
         peer_capsules=peer_model.capsules(peer_joints,peer_current['gripping'])
         # Protect the allowed peer drift as well as the intervals between samples.
-        peer_padding=len(peer_joints)*peer_model.reach_bound*self.cfg['max_peer_joint_drift_rad']
+        def displacement(model,deltas):
+            method=getattr(type(model),'displacement_bound',None)
+            if callable(method):return method(model,deltas)
+            return sum(abs(v) for v in deltas.values())*model.reach_bound
+        peer_padding=displacement(peer_model,{n:self.cfg['max_peer_joint_drift_rad'] for n in peer_joints})
         previous=dict(initial);minimum=math.inf
         configurations=[solution for path in paths if path is not None for solution,_ in path]
         if not configurations:configurations=[previous]
@@ -261,7 +276,7 @@ class InterArmGuard:
             start=dict(previous)
             for index in range(1,count+1):
                 q={n:start[n]+(target[n]-start[n])*index/count for n in start}
-                swept=.5*sum(abs(q[n]-previous[n]) for n in q)*model.reach_bound
+                swept=.5*displacement(model,{n:q[n]-previous[n] for n in q})
                 for endpoint in (previous,q):
                     # A pick may acquire an object halfway through: use its envelope throughout.
                     distance=check_capsules(model.capsules(endpoint,True),peer_capsules,

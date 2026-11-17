@@ -367,6 +367,17 @@ class CollisionModelTests(unittest.TestCase):
         self.assertAlmostEqual(capsules[-1].end[2],.2)
         self.assertAlmostEqual(capsules[-1].radius,.16)
 
+    def test_descendant_lever_bound_covers_compound_rotation_without_static_base_padding(self):
+        import math
+        model=object.__new__(KDLArmCapsules)
+        model.names=['shoulder','elbow'];model.joint_reach_bounds={'shoulder':1.6,'elbow':.6}
+        def endpoint(a,b):return (10+math.cos(a)+.6*math.cos(a+b),math.sin(a)+.6*math.sin(a+b))
+        for a,b,da,db in [(0,0,.015,.015),(1,-.7,-.02,.03),(-1,2,.01,-.02)]:
+            bound=model.displacement_bound({'shoulder':da,'elbow':db})
+            self.assertLessEqual(math.dist(endpoint(a,b),endpoint(a+da,b+db)),bound)
+            self.assertLess(bound,(abs(da)+abs(db))*11.6)
+        with self.assertRaises(ClearanceUnavailableError):model.displacement_bound({'shoulder':.01})
+
     def test_kdl_missing_actual_link_radius_fails_closed(self):
         cfg=build_collision_candidate(synthetic_urdf());modules,_=self.model_dependencies(cfg)
         del cfg['link_radii_m']['left']['left_link_3']
