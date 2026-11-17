@@ -366,6 +366,19 @@ class CollisionModelTests(unittest.TestCase):
         self.assertAlmostEqual(capsules[-1].end[0],.9)
         self.assertAlmostEqual(capsules[-1].end[2],.2)
         self.assertAlmostEqual(capsules[-1].radius,.16)
+        padding=model.capsule_displacement_bounds({n:.015 for n in model.names})
+        self.assertEqual(padding['left_link_0'],0.)
+        self.assertGreater(padding['left_installed_tool_0'],padding['left_link_1'])
+
+    def test_static_shoulder_does_not_inherit_wrist_motion_padding(self):
+        left=[Capsule('left_shoulder',(0,0,0),(0,0,0),.10),Capsule('left_tool',(1,0,0),(1,0,0),.05)]
+        right=[Capsule('right_shoulder',(0,.25,0),(0,.25,0),.10),Capsule('right_tool',(1,.5,0),(1,.5,0),.05)]
+        distance=check_capsules(left,right,.04,active_padding={'left_shoulder':0.,'left_tool':.10},
+                                peer_padding={'right_shoulder':0.,'right_tool':.10})
+        self.assertAlmostEqual(distance,.05)
+        with self.assertRaises(ArmCollisionError):
+            check_capsules(left,right,.04,active_padding={'left_shoulder':.02,'left_tool':0.},
+                           peer_padding={'right_shoulder':0.,'right_tool':0.})
 
     def test_descendant_lever_bound_covers_compound_rotation_without_static_base_padding(self):
         import math

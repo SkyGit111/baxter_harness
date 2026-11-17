@@ -137,12 +137,17 @@ class Capsule:
     radius: float
 
 
-def check_capsules(active,peer,minimum_distance,padding=0.):
+def check_capsules(active,peer,minimum_distance,padding=0.,active_padding=None,peer_padding=None):
     if not active or not peer:raise ClearanceUnavailableError('Missing full-arm capsule coverage')
+    for capsules,bounds in ((active,active_padding),(peer,peer_padding)):
+        if bounds is not None and (set(bounds)!={c.name for c in capsules} or
+                any(not math.isfinite(v) or v<0 for v in bounds.values())):
+            raise ClearanceUnavailableError('Incomplete capsule displacement bounds')
     minimum=math.inf
     for a in active:
         for b in peer:
             separation=segment_distance(a.start,a.end,b.start,b.end)-a.radius-b.radius-padding
+            separation-=(active_padding or {}).get(a.name,0.)+(peer_padding or {}).get(b.name,0.)
             if not math.isfinite(separation):raise ClearanceUnavailableError('Nonfinite capsule geometry')
             minimum=min(minimum,separation)
             if separation<minimum_distance:
@@ -186,6 +191,14 @@ class KDLArmCapsules:
         # on all downstream offsets cover every capsule endpoint at any pose.
         self.joint_reach_bounds={name:sum(lengths[index+1:])+tool_extent
                                  for name,index in zip(self.names,moving)}
+        self.capsule_reach_bounds={}
+        for i in range(self.first,self.chain.getNrOfSegments()):
+            self.capsule_reach_bounds[self.chain.getSegment(i).getName()]={
+                name:sum(lengths[j+1:i+1]) if j<i else 0. for name,j in zip(self.names,moving)}
+        for i,tool in enumerate(cfg['tool_capsules'][arm]):
+            extent=max(math.sqrt(sum(x*x for x in tool[key])) for key in ('start_m','end_m'))
+            self.capsule_reach_bounds[arm+'_installed_tool_'+str(i)]={
+                name:sum(lengths[j+1:])+extent for name,j in zip(self.names,moving)}
         if not math.isfinite(self.reach_bound) or self.reach_bound<=0:
             raise ClearanceUnavailableError('Invalid URDF motion-radius bound')
 
@@ -193,6 +206,11 @@ class KDLArmCapsules:
         if set(deltas)!=set(self.names):raise ClearanceUnavailableError('Incomplete displacement joint state')
         return sum(_number(abs(deltas[n]),0,2*math.pi,'joint displacement')*self.joint_reach_bounds[n]
                    for n in self.names)
+
+    def capsule_displacement_bounds(self,deltas):
+        self.displacement_bound(deltas)  # Validate all seven joint deltas first.
+        return {cap:sum(abs(deltas[n])*bounds[n] for n in self.names)
+                for cap,bounds in self.capsule_reach_bounds.items()}
 
     def capsules(self,joints,holding=False):
         if set(joints)!=set(self.names):raise ClearanceUnavailableError('Collision joint state is incomplete')
@@ -266,7 +284,12 @@ class InterArmGuard:
             method=getattr(type(model),'displacement_bound',None)
             if callable(method):return method(model,deltas)
             return sum(abs(v) for v in deltas.values())*model.reach_bound
-        peer_padding=displacement(peer_model,{n:self.cfg['max_peer_joint_drift_rad'] for n in peer_joints})
+        def capsule_bounds(model,deltas,capsules):
+            method=getattr(type(model),'capsule_displacement_bounds',None)
+            if callable(method):return method(model,deltas)
+            return {c.name:displacement(model,deltas) for c in capsules}
+        peer_bounds=capsule_bounds(peer_model,{n:self.cfg['max_peer_joint_drift_rad'] for n in peer_joints},peer_capsules)
+        peer_padding=max(peer_bounds.values())
         previous=dict(initial);minimum=math.inf
         configurations=[solution for path in paths if path is not None for solution,_ in path]
         if not configurations:configurations=[previous]
@@ -276,15 +299,17 @@ class InterArmGuard:
             start=dict(previous)
             for index in range(1,count+1):
                 q={n:start[n]+(target[n]-start[n])*index/count for n in start}
-                swept=.5*displacement(model,{n:q[n]-previous[n] for n in q})
                 for endpoint in (previous,q):
                     # A pick may acquire an object halfway through: use its envelope throughout.
-                    distance=check_capsules(model.capsules(endpoint,True),peer_capsules,
-                                            self.cfg['minimum_distance_m'],peer_padding+swept)
+                    active=model.capsules(endpoint,True)
+                    swept=capsule_bounds(model,{n:.5*(q[n]-previous[n]) for n in q},active)
+                    distance=check_capsules(active,peer_capsules,self.cfg['minimum_distance_m'],
+                                            active_padding=swept,peer_padding=peer_bounds)
                     minimum=min(minimum,distance)
                 previous=q
         return {'model':'urdf_chain_capsules','checked':True,'minimum_clearance_m':minimum,
                 'peer_drift_padding_m':peer_padding,'swept_intervals_checked':True,
+                'padding_scope':'per_capsule_descendant_joints',
                 'limitations':'Cross-arm links/tools only; not torso, table or arbitrary scene obstacles'}
 
 
