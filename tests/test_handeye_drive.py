@@ -14,6 +14,29 @@ from cix_harness import handeye_drive as drive
 
 
 class CalibrationDriveTest(unittest.TestCase):
+    def test_waits_for_new_stable_endpoint_messages_after_joint_settle(self):
+        driver=object.__new__(drive.Driver)
+        driver.check_ownership=Mock()
+        now=[100.]
+        pose=lambda x:{'position':NS(x=x,y=0.,z=0.),'orientation':NS(x=0.,y=0.,z=0.,w=1.)}
+        driver.states={'endpoint':(99.9,pose(.008))}
+        def receive():
+            elapsed=now[0]-100
+            if elapsed>.035:
+                driver.states['endpoint']=(now[0],pose(.006 if elapsed<.08 else .001))
+        driver.live=Mock(side_effect=receive)
+        def elapse(s):now[0]+=s
+        with patch.dict('sys.modules',{'baxter_core_msgs.msg':NS(JointCommand=object)}), \
+                patch.object(drive.time,'monotonic',side_effect=lambda:now[0]), \
+                patch.object(drive.time,'sleep',side_effect=elapse):
+            driver.execute([],{},np.eye(4))
+            self.assertGreaterEqual(now[0],100.16)
+            # A repeated once-valid measurement cannot certify a fresh endpoint.
+            driver.live=Mock()
+            with self.assertRaisesRegex(RuntimeError,'Fresh stable endpoint'):
+                driver.execute([],{},np.eye(4))
+        self.assertGreater(driver.check_ownership.call_count,2)
+
     def test_joint_route_can_use_fully_checked_anchor_when_direct_chord_fails(self):
         obj=object.__new__(drive.Driver);obj.anchor_joints={'x':0.,'y':0.}
         obj.record=Mock()

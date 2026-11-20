@@ -18,7 +18,7 @@ from .camera import D455Camera
 from .collision import (ArmCollisionError, ClearanceUnavailableError, InterArmGuard,
                         KDLArmCapsules, PeerStateChangedError, validate_clearance_config)
 from .primitive_service import PrimitiveService
-from .primitives import SKILLS, tcp_from_eef
+from .primitives import tcp_from_eef
 from .rpc import serve
 from .workspace import workspace_metadata
 
@@ -104,6 +104,10 @@ class DualArmBaxter(Baxter):
         if self.dual_owner is None:raise ClearanceUnavailableError('No dual execution owner')
         return self.dual_owner.check_other_arm_path(self.cfg['arm'],paths)
 
+    def check_empty_clear_view_path(self,paths):
+        if self.dual_owner is None:raise ClearanceUnavailableError('No dual execution owner')
+        return self.dual_owner.check_other_arm_path(self.cfg['arm'],paths,empty_clear_view=True)
+
 
 class DualBridge:
     def __init__(self,robots,cfg,shared,guard=None,service_factory=PrimitiveService):
@@ -139,7 +143,7 @@ class DualBridge:
         tcp=tcp_from_eef(state['eef_m'],state['eef_xyzw'],profile)
         recovery={'view_indices':[i for i,v in enumerate(profile.get('observation_tcp_m',[])) if math.dist(tcp,v)>=.02],
                   'motion_remaining':self.shared.remaining}
-        skills=[s for s in SKILLS if (s!='clear_view' or recovery['view_indices'])
+        skills=[s for s in self.services[arm].skills if (s!='clear_view' or recovery['view_indices'])
                 and (s!='home' or profile.get('home_tcp_m') is not None)]
         workspace=workspace_metadata(profile,robot.camera.intrinsics,rs.rs2_project_point_to_pixel)
         return workspace,skills,recovery
@@ -218,15 +222,18 @@ class DualBridge:
                                                     dual_collision_preflight=self.clearance_seconds)
             return result
 
-    def check_other_arm_path(self,arm,paths):
+    def check_other_arm_path(self,arm,paths,*,empty_clear_view=False):
         if arm!=self.selected_arm or self.peer_reference is None:
             raise PeerStateChangedError('Missing inactive-arm observation')
         if self.guard is None:raise ClearanceUnavailableError('Configure full-link radii and installed tool capsules before planning')
         peer='right' if arm=='left' else 'left'
         began=time.monotonic()
         try:
+            if empty_clear_view and self.robots[arm].read_state().get('gripping') is not False:
+                raise PeerStateChangedError('Empty clear-view grasp state changed before planning')
             self.clearance_receipt=self.guard.path_clearance(arm,self.robots[arm].joints(),paths,
-                                                            self.peer_reference,self.robots[peer].read_state())
+                                                            self.peer_reference,self.robots[peer].read_state(),
+                                                            **({'active_holding':False} if empty_clear_view else {}))
         finally:self.clearance_seconds=time.monotonic()-began
         return self.clearance_receipt
 
@@ -238,7 +245,10 @@ class DualBridge:
         peer='right' if arm=='left' else 'left'
         peer_state=self.robots[peer].read_state()
         self.guard.check_peer(self.peer_reference,peer_state)
-        self.guard.current_clearance(arm,self.robots[arm].read_state(),peer_state)
+        active_state=self.robots[arm].read_state()
+        if self.clearance_receipt.get('includes_held_object') is False and active_state.get('gripping') is not False:
+            raise PeerStateChangedError('Empty clear-view grasp state changed during execution')
+        self.guard.current_clearance(arm,active_state,peer_state)
 
     def execute(self,arm,plan_id):
         began=time.monotonic()
@@ -257,6 +267,10 @@ class DualBridge:
                 result.setdefault('timings_s',{})['dual_execute_total']=time.monotonic()-began
                 return result
             finally:
+                if self.executing_arm is not None:
+                    ended=getattr(self.robots[self.executing_arm],'wrist_after_motion',-math.inf)
+                    for robot in self.robots.values():
+                        robot.wrist_after_motion=max(getattr(robot,'wrist_after_motion',-math.inf),ended)
                 self.executing_arm=None;self.peer_reference=None;self.clearance_receipt=None
                 self._invalidate()
 

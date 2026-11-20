@@ -513,9 +513,30 @@ class Driver:
                 if elapsed>=max(dt,.03) and error<.01:break
                 time.sleep(.01)
             previous=goal
-        end=fk_matrix(self.states['endpoint'][1])
-        if np.linalg.norm(end[:3,3]-target[:3,3])>.005 or angle(end[:3,:3].T@target[:3,:3])>math.radians(2):
-            raise RuntimeError('Measured endpoint missed the calibration target')
+        # Joint feedback and endpoint feedback arrive on independent ROS topics.
+        # Require fresh endpoint measurements after the final joint has settled.
+        completed=time.monotonic()
+        previous_stamp=completed
+        stable_since=None
+        stable_pose=None
+        while time.monotonic()-completed<1.0:
+            self.check_ownership()
+            self.live()
+            stamp,measurement=self.states['endpoint']
+            if stamp>previous_stamp:
+                previous_stamp=stamp
+                end=fk_matrix(measurement)
+                inside=(np.linalg.norm(end[:3,3]-target[:3,3])<=.005
+                        and angle(end[:3,:3].T@target[:3,:3])<=math.radians(2))
+                if not inside:
+                    stable_since=None
+                elif (stable_since is None or np.linalg.norm(end[:3,3]-stable_pose[:3,3])>.0015
+                      or angle(end[:3,:3].T@stable_pose[:3,:3])>math.radians(.75)):
+                    stable_since,stable_pose=stamp,end
+                elif stamp-stable_since>=.08:
+                    return
+            time.sleep(.01)
+        raise RuntimeError('Fresh stable endpoint feedback did not reach the calibration target')
 
 
 def main(argv=None):

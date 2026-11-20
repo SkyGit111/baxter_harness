@@ -18,6 +18,13 @@ from .contract import vector
 from .pi05_contract import quaternion
 
 
+class RouteSearchError(ValueError):
+    def __init__(self, skill, failures):
+        self.failures = failures
+        summary = ' | '.join(item['approach_path'] + ': ' + item['reason'] for item in failures)
+        super().__init__(skill + ' candidate routes failed: ' + summary)
+
+
 def fingerprint(value):
     raw=value if isinstance(value,str) else json.dumps(value,sort_keys=True,allow_nan=False,separators=(',',':'))
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
@@ -74,6 +81,10 @@ def scan(config,states,robot_description,grid,destinations,evaluator,*,
             'arms':{}}
     effective=getattr(evaluator,'effective_config',None)
     if effective is not None:report['fingerprints']['effective_evaluator_config_sha256']=fingerprint(effective)
+    archived_scene=getattr(evaluator,'archived_scene',None)
+    if archived_scene is not None:
+        report['archived_moveit']=archived_scene
+        report['limitations'][-1]='Whole-body MoveIt checks sample the archived scene. Finger joints stay at their snapshot positions. Dynamic obstacles, actual grasp contact and the held object mesh are outside this replay.'
     started=time.monotonic()
     for arm in arms:
         destination=vector(destinations[arm],3,'placement target')
@@ -98,6 +109,7 @@ def scan(config,states,robot_description,grid,destinations,evaluator,*,
                             attempt.update(status='candidate',evidence=receipt)
                         except Exception as error:
                             attempt.update(status='rejected',failure_type=type(error).__name__,reason=str(error))
+                            if isinstance(error,RouteSearchError):attempt['approach_failures']=error.failures
                             counts[type(error).__name__]+=1
                         attempt['seconds']=round(time.monotonic()-began,6);attempts.append(attempt)
                     passed=any(a['status']=='candidate' for a in attempts)
@@ -117,7 +129,7 @@ def scan(config,states,robot_description,grid,destinations,evaluator,*,
     return report
 
 
-def snapshot_evaluator(config,states,robot_description):
+def snapshot_evaluator(config,states,robot_description,archived_scene=None):
     """Construct ROS/KDL types from saved data; never create robot interfaces.
 
     Requires ROS Python packages for pose types/interpolation, but no ROS master,
@@ -160,6 +172,8 @@ def snapshot_evaluator(config,states,robot_description):
         peer=states['right' if arm=='left' else 'left'];receipts=[]
         for skill,target in (('pick',point),(placement_skill,destination)):
             service=PrimitiveService(RobotSnapshot(arm,state,profile))
+            failures=[]
+            archived_check=None
             try:
                 # The outer scan already chose a grasp orientation. Match the
                 # online direct-then-staged candidates for that orientation.
@@ -168,11 +182,16 @@ def snapshot_evaluator(config,states,robot_description):
                     try:
                         initial,paths=service._preflight(stages,{'state':state},time.monotonic(),skill=skill)
                         clearance=guard.path_clearance(arm,initial,paths,peer,peer)
+                        if archived_scene is not None:
+                            archived_check=archived_scene.check(profile,stages,paths,initial,skill)
                         break
                     except (IKPreflightError,ArmCollisionError) as error:
-                        last_failure=error
+                        failures.append({'approach_path':candidate.get('approach_path','staged'),
+                                         'type':type(error).__name__,'reason':str(error)})
                 else:
-                    raise last_failure
+                    raise RouteSearchError(skill,failures)
+            except RouteSearchError:
+                raise
             except (ValueError,RuntimeError) as error:
                 raise ValueError('{} failed ({}): {}'.format(skill,type(error).__name__,error)) from error
             heights=[tcp_from_eef(state['eef_m'],state['eef_xyzw'],profile['primitives'])[2]]
@@ -184,6 +203,8 @@ def snapshot_evaluator(config,states,robot_description):
                              'stages':len(stages),'ik_waypoints':sum(len(p) for p in paths if p),
                              'sampled_path_tcp_z_extrema_m':[min(heights),max(heights)],
                              'inter_arm_clearance':clearance})
+            if archived_check is not None:receipts[-1]['archived_moveit']=archived_check
+            if failures:receipts[-1]['rejected_routes']=failures
             for stage,path in zip(stages,paths):
                 if path:
                     joints,target_pose=path[-1];p=target_pose.pose.position;q=target_pose.pose.orientation
@@ -194,8 +215,10 @@ def snapshot_evaluator(config,states,robot_description):
         return {'checked_skills':['pick',placement_skill],'complete_path_checked':True,
                 'hypothetical_grasp_success':True,'operations':receipts,
                 'solver_scope':'Continuous local IK from the recorded posture; finite grasp yaw candidates, not global completeness.',
-                'limitations':'Grasp transitions are simulated, not measured. Head and cross-arm checked; torso/same-arm mesh and scene obstacles not fully checked.'}
+                'limitations':('Grasp transitions are simulated. Whole-body checks use the saved MoveIt geometry and fixed finger positions.' if archived_scene is not None else
+                               'Grasp transitions are simulated, not measured. Head and cross-arm checked; torso/same-arm mesh and scene obstacles not fully checked.')}
     evaluate.effective_config=config
+    if archived_scene is not None:evaluate.archived_scene=archived_scene.metadata
     return evaluate
 
 
@@ -209,12 +232,19 @@ def main(argv=None):
     p.add_argument('--arms',nargs='+',choices=['left','right'],default=['left','right'])
     p.add_argument('--yaw-degrees',nargs='+',type=float,default=[0,90,180,270])
     p.add_argument('--placement-skill',choices=['place','stack'],default='stack')
+    p.add_argument('--moveit-snapshot',type=Path,help='Private archive produced by cix_harness.reachability_scene')
+    p.add_argument('--moveit-checker',type=Path,help='Compiled offline_scene_check binary')
     p.add_argument('--output',required=True,type=Path)
     a=p.parse_args(argv)
     read=lambda path:json.loads(path.read_text(encoding='utf-8-sig'))
     cfg=read(a.config);raw=read(a.states);states=raw.get('arm_states',raw.get('after_arm_states',raw))
     description=a.urdf.read_text(encoding='utf-8-sig')
-    evaluator=snapshot_evaluator(cfg,states,description)
+    if bool(a.moveit_snapshot) != bool(a.moveit_checker):p.error('Supply both --moveit-snapshot and --moveit-checker')
+    archived_scene=None
+    if a.moveit_snapshot:
+        from .reachability_scene import ArchivedMoveItScene
+        archived_scene=ArchivedMoveItScene(a.moveit_snapshot,a.moveit_checker,description,cfg,states)
+    evaluator=snapshot_evaluator(cfg,states,description,archived_scene)
     report=scan(cfg,states,description,read(a.grid),read(a.destinations),evaluator,
                 arms=a.arms,yaw_degrees=a.yaw_degrees,placement_skill=a.placement_skill)
     a.output.parent.mkdir(parents=True,exist_ok=True)

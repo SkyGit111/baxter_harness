@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import threading
 import time
 import uuid
 from contextlib import ExitStack
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from .camera import D455Camera
 from .contract import ACTION_SPEC, action7, vector
+from .planner_images import AUX_WRIST_MAX_AGE_S
 from .rpc import serve
 
 
@@ -127,6 +129,9 @@ class Baxter:
         self.capture_body_joints = isinstance(planning, dict) and planning.get('collision_backend') == 'moveit'
         self.body_joint_sample = None
         self.wrist_state = None
+        self.wrist_condition = threading.Condition()
+        self.wrist_after_motion = -math.inf
+        self.last_aux_wrist = -math.inf
         self.controller_feedback = {}
         self.subscribers = [
             rospy.Subscriber("/robot/joint_states", JointState, self.note_state, callback_args="joints", queue_size=1),
@@ -198,14 +203,14 @@ class Baxter:
             raise RuntimeError("Expected a calibrated electric gripper (type={}, calibrated={}, error={})".format(
                 self.grip.type(), self.grip.calibrated(), self.grip.error()))
 
-    def telemetry_time(self, stamp, key):
+    def telemetry_time(self, stamp, key, max_age=.5):
         # Independent robot/host clocks can differ by a few milliseconds. Never
         # extend freshness into the future, or refresh it with a repeated stamp.
         # Explicit measured robot-minus-host offset, not a relaxed freshness limit.
         age = (self.ros.Time.now() - stamp).to_sec() + self.cfg.get('robot_clock_offset_s',0.0)
         seconds = stamp.to_sec()
         if (not math.isfinite(age) or not math.isfinite(seconds) or
-                not -0.1 <= age < 0.5 or seconds <= self.state_stamps.get(key, -math.inf)):
+                not -0.1 <= age < max_age or seconds <= self.state_stamps.get(key, -math.inf)):
             return None
         self.state_stamps[key] = seconds
         return time.monotonic() - max(0.0, age)
@@ -235,9 +240,13 @@ class Baxter:
             self.effector_state = (received, message)
 
     def note_wrist(self, message):
-        received = self.telemetry_time(message.header.stamp, "wrist")
+        optional = (self.cfg.get('commissioning_scope') in ('supervised_primitive_task','supervised_hybrid_task')
+                    and not self.cfg.get('require_wrist',False))
+        received = self.telemetry_time(message.header.stamp, "wrist", AUX_WRIST_MAX_AGE_S if optional else .5)
         if received is not None:
-            self.wrist_state = (received, message)
+            with self.wrist_condition:
+                self.wrist_state = (received, message)
+                self.wrist_condition.notify_all()
 
     def note_controller_feedback(self,message,key):
         received=self.telemetry_time(message.header.stamp,'controller_'+key)
@@ -287,8 +296,32 @@ class Baxter:
         return state
 
     def observe(self):
+        auxiliary=(self.cfg.get('commissioning_scope')=='supervised_primitive_task' and
+                   not self.cfg.get('require_wrist',False))
+        return self._observe(auxiliary_wrist=auxiliary)
+
+    def observe_for_primitives(self):
+        return self._observe(auxiliary_wrist=not self.cfg.get('require_wrist',False))
+
+    def _eligible_wrist(self, max_age, auxiliary):
+        wrist = getattr(self,'wrist_state',None)
+        if wrist is None or time.monotonic()-wrist[0] >= max_age:
+            return None
+        if wrist[0] <= getattr(self,'wrist_after_motion',-math.inf):
+            return None
+        if auxiliary and wrist[0] <= getattr(self,'last_aux_wrist',-math.inf):
+            return None
+        return wrist
+
+    def _observe(self, auxiliary_wrist):
         began=time.monotonic()
         self.pending = None
+        wrist_limit=AUX_WRIST_MAX_AGE_S if auxiliary_wrist else .5
+        if auxiliary_wrist and self.cfg.get('wrist_camera_topic', True):
+            with self.wrist_condition:
+                # Leave time for the next D455 frame without expiring the wrist image.
+                self.wrist_condition.wait_for(lambda: self._eligible_wrist(wrist_limit-.07, True), timeout=.6)
+        before_camera=time.monotonic()
         image, captured, frame_number = self.camera.capture()
         after_camera=time.monotonic()
         obs_id = uuid.uuid4().hex
@@ -296,8 +329,8 @@ class Baxter:
         angles=dict(zip(state['joint_names'],state['joint_rad']))
         obs = {"id": obs_id, "image": image, "state": state}
         after_state=time.monotonic()
-        wrist = getattr(self, "wrist_state", None)
-        if wrist is not None and time.monotonic() - wrist[0] < 0.5:
+        wrist = self._eligible_wrist(wrist_limit, auxiliary_wrist)
+        if wrist is not None:
             import cv2
             from cv_bridge import CvBridge
             from .contract import image_data
@@ -305,9 +338,13 @@ class Baxter:
             ok, jpeg = cv2.imencode(".jpg", pixels, [cv2.IMWRITE_JPEG_QUALITY, 90])
             if not ok:
                 raise RuntimeError("Cannot encode wrist image")
-            obs["wrist_image"] = image_data(jpeg.tobytes())
-            state["wrist_age_s"] = round(time.monotonic() - wrist[0], 4)
-        elif self.cfg.get("require_wrist", False):
+            encoded=image_data(jpeg.tobytes())
+            age=time.monotonic()-wrist[0]
+            if age < wrist_limit:
+                obs["wrist_image"] = encoded
+                state["wrist_age_s"] = round(age, 4)
+                if auxiliary_wrist:self.last_aux_wrist=wrist[0]
+        if 'wrist_image' not in obs and self.cfg.get("require_wrist", False):
             raise RuntimeError("Fresh real wrist camera image required by Pi05")
         self.pending = (obs_id, captured, angles)
         ended=time.monotonic()
@@ -317,7 +354,7 @@ class Baxter:
             obs['camera_metadata']['wrist']={'source':self.cfg['arm']+'_wrist','arm':self.cfg['arm'],
                                             'frame_number':getattr(wrist[1].header,'seq',None),
                                             'age_s':round(ended-wrist[0],4)}
-        obs['timings_s']={'camera_capture':after_camera-began,'state_read':after_state-after_camera,
+        obs['timings_s']={'wrist_wait':before_camera-began,'camera_capture':after_camera-before_camera,'state_read':after_state-after_camera,
                           'wrist_image':ended-after_state,'baxter_observe_total':ended-began}
         return obs
 
@@ -867,7 +904,11 @@ def build_rpc_methods(robot):
                         robot.pending = None
                 primitives.observation = None
                 primitives.prepared = None
-                return method(*args, **kwargs)
+                try:
+                    return method(*args, **kwargs)
+                finally:
+                    if name in ('env.step','env.step_chunk','env.step_segment'):
+                        robot.wrist_after_motion=time.monotonic()
             return invoke
         methods = {name: (method if name == 'healthz' else bind(name,method))
                    for name,method in methods.items()}

@@ -146,6 +146,8 @@ def validate_profile(p):
         number(p[key],lo,hi,key)
     if 'contact_band_m' in p:
         number(p['contact_band_m'],.01,p['approach_m'],'contact band')
+    if 'clear_view_initial_lift_m' in p:
+        number(p['clear_view_initial_lift_m'],.03,.30,'clear-view initial lift')
     minimum_floor=min(table_height(x,y,p) for x,y in workspace_polygon(p))+p['table_clearance_m']
     if not minimum_floor <= p['transit_z_m'] <= high[2]:
         raise ValueError('Transit height outside workspace')
@@ -271,9 +273,13 @@ def plan(skill,state,p,target=None,view_index=0):
         view=vector(views[view_index],3,'observation TCP')
         if math.dist(current,view)<.02:raise ValueError('Already at observation position')
         check_tcp(view,p,held_bottom_m=p['held_bottom_below_tcp_m'] if holding else 0.)
-        z=max(current[2],view[2],transit_height([current,view],p,holding))
+        transit=transit_height([current,view],p,holding)
+        z=max(current[2],view[2],transit)
+        rise=z
+        if 'clear_view_initial_lift_m' in p:
+            rise=max(current[2],transit,min(z,current[2]+p['clear_view_initial_lift_m']))
         # Lift before translating. Preserve tool orientation and never operate the gripper.
-        move([current[0],current[1],z],state['eef_xyzw'])
+        move([current[0],current[1],rise],state['eef_xyzw'])
         move([view[0],view[1],z],state['eef_xyzw'])
         move(view,state['eef_xyzw'])
         if holding:stages.append({'kind':'verify_grasp','held':True})

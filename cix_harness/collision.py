@@ -145,6 +145,41 @@ class Capsule:
     start: tuple
     end: tuple
     radius: float
+    cylinder_padding: float = None
+
+
+def cylinder_separation(cylinder, other):
+    """Conservative plane-separation bound for a padded finite cylinder and capsule."""
+    axis=_sub(cylinder.end,cylinder.start)
+    length=math.sqrt(_dot(axis,axis))
+    if length<=0:return -math.inf
+    axis=tuple(v/length for v in axis)
+    radius=cylinder.radius-cylinder.cylinder_padding
+    edge=_sub(other.end,other.start)
+    low,high=0.,1.
+    best=-math.inf
+    # Closest point of the other segment to the unpadded cylinder supplies a
+    # candidate normal. Every evaluated support-plane gap is a rigorous lower
+    # bound irrespective of optimizer convergence.
+    for _ in range(18):
+        t=(low+high)*.5
+        point=_at(other.start,edge,t)
+        local=_sub(point,cylinder.start)
+        height=_dot(local,axis)
+        radial=tuple(x-height*u for x,u in zip(local,axis))
+        norm=math.sqrt(_dot(radial,radial))
+        scale=min(1.,radius/norm) if norm else 1.
+        delta=tuple((height-max(0.,min(length,height)))*u+(1.-scale)*r for u,r in zip(axis,radial))
+        dist=math.sqrt(_dot(delta,delta))
+        if dist<1e-12:break
+        n=tuple(x/dist for x in delta)
+        c=max(-1.,min(1.,_dot(axis,n)))
+        support=max(_dot(cylinder.start,n),_dot(cylinder.end,n))+radius*math.sqrt(max(0.,1.-c*c))
+        gap=min(_dot(other.start,n),_dot(other.end,n))-other.radius-support-cylinder.cylinder_padding
+        best=max(best,gap-1e-9)
+        if _dot(edge,delta)>0:high=t
+        else:low=t
+    return best
 
 
 def check_capsules(active,peer,minimum_distance,padding=0.,active_padding=None,peer_padding=None):
@@ -156,8 +191,12 @@ def check_capsules(active,peer,minimum_distance,padding=0.,active_padding=None,p
     minimum=math.inf
     for a in active:
         for b in peer:
-            separation=segment_distance(a.start,a.end,b.start,b.end)-a.radius-b.radius-padding
-            separation-=(active_padding or {}).get(a.name,0.)+(peer_padding or {}).get(b.name,0.)
+            allowance=padding+(active_padding or {}).get(a.name,0.)+(peer_padding or {}).get(b.name,0.)
+            separation=segment_distance(a.start,a.end,b.start,b.end)-a.radius-b.radius-allowance
+            if separation<minimum_distance and a.cylinder_padding is not None:
+                separation=max(separation,cylinder_separation(a,b)-allowance)
+            if separation<minimum_distance and b.cylinder_padding is not None:
+                separation=max(separation,cylinder_separation(b,a)-allowance)
             if not math.isfinite(separation):raise ClearanceUnavailableError('Nonfinite capsule geometry')
             minimum=min(minimum,separation)
             if separation<minimum_distance:
@@ -276,7 +315,9 @@ class KDLArmCapsules:
                 ends=[local*k.Vector(0,0,z) for z in (-length/2,length/2)]
                 extent=max(float(v.Norm()) for v in ends)
                 name=link.name+'__collision_'+str(index)
-                bounds[name]={joint:sum(offsets[moving[joint]+1:])+extent if joint in moving else 0.
+                # A rotated finite cylinder's radial surface also moves. The
+                # enclosing capsule instead has spherical ends invariant to roll.
+                bounds[name]={joint:sum(offsets[moving[joint]+1:])+extent+shape.radius if joint in moving else 0.
                               for joint in self.names}
                 specs.append((name,k.ChainFkSolverPos_recursive(chain),list(moving),ends,radius))
                 covered.add(link.name)
@@ -320,7 +361,7 @@ class KDLArmCapsules:
                 if fk.JntToCart(body_q,frame)<0:raise ClearanceUnavailableError('Collision body FK failed')
                 world=[frame*v for v in ends]
                 capsules.append(Capsule(name,tuple(float(world[0][i]) for i in range(3)),
-                                        tuple(float(world[1][i]) for i in range(3)),radius))
+                                        tuple(float(world[1][i]) for i in range(3)),radius,self.cfg['urdf_padding_m']))
         for index,tool in enumerate(self.cfg['tool_capsules'][self.arm]):
             ends=[]
             for key in ('start_m','end_m'):
@@ -369,7 +410,7 @@ class InterArmGuard:
                               self.models[peer].capsules(state_joints(peer_state),peer_state['gripping']),
                               self.cfg['minimum_distance_m'])
 
-    def path_clearance(self,arm,initial,paths,peer_reference,peer_current):
+    def path_clearance(self,arm,initial,paths,peer_reference,peer_current,*,active_holding=True):
         peer='right' if arm=='left' else 'left'
         self.check_peer(peer_reference,peer_current)
         # Drift is bounded about the observation, not about a later shifted pose.
@@ -406,7 +447,7 @@ class InterArmGuard:
                 # interpolant whose joints do not all have the same phase.
                 for endpoint in (centre,):
                     # A pick may acquire an object halfway through: use its envelope throughout.
-                    active=model.capsules(endpoint,True)
+                    active=model.capsules(endpoint,active_holding)
                     swept=capsule_bounds(model,{n:.5*(q[n]-previous[n]) for n in q},active)
                     distance=check_capsules(active,peer_capsules,self.cfg['minimum_distance_m'],
                                             active_padding=swept,peer_padding=peer_bounds)
@@ -416,6 +457,7 @@ class InterArmGuard:
                         if gap is not None:head_minimum=gap if head_minimum is None else min(head_minimum,gap)
                 previous=q
         return {'model':self.cfg.get('body_geometry','urdf_chain_capsules'),'checked':True,'minimum_clearance_m':minimum,
+                'includes_held_object':active_holding,
                 'peer_drift_padding_m':peer_padding,'swept_intervals_checked':True,
                 'padding_scope':'per_capsule_descendant_joints','interpolation_envelope':'joint_interval_boxes',
                 'head_checked':head_minimum is not None,'minimum_head_clearance_m':head_minimum,

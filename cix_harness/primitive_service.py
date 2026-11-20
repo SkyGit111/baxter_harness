@@ -56,6 +56,11 @@ class PrimitiveService:
         options=robot.cfg.get('planning',{})
         if not isinstance(options,dict) or options.get('trajectory_mode','legacy') not in ('legacy','continuous'):
             raise ValueError('Unsupported primitive trajectory mode')
+        allowed=options.get('primitive_skills',list(SKILLS))
+        if (not isinstance(allowed,list) or not allowed or any(s not in SKILLS for s in allowed)
+                or len(allowed)!=len(set(allowed))):
+            raise ValueError('Expected distinct supported primitive_skills')
+        self.skills=tuple(allowed)
         backend, required_world = collision_options(options)
         self.moveit = MoveItGuard(robot, required_world) if backend == 'moveit' else None
         robot.primitive_moveit_guard = self.moveit
@@ -69,7 +74,11 @@ class PrimitiveService:
             with _measure(timings,'robot_observe_total'):
                 self.prepared=None
                 self.observation=None
-                obs=self.robot.observe()
+                observe=self.robot.observe
+                if (self.robot.cfg.get('commissioning_scope')=='supervised_hybrid_task'
+                        and callable(getattr(type(self.robot),'observe_for_primitives',None))):
+                    observe=self.robot.observe_for_primitives
+                obs=observe()
             # Preserve lower-level camera/state timings if the robot publishes them.
             timings={**obs.get('timings_s',{}),**timings}
             with _measure(timings,'observation_metadata'):
@@ -92,7 +101,7 @@ class PrimitiveService:
         views=self.profile.get('observation_tcp_m',[])
         obs['recovery']={'view_indices':[i for i,v in enumerate(views) if math.dist(tcp,v)>=.02],
                          'motion_remaining':self.robot.motion_remaining}
-        obs['primitive_skills']=[s for s in SKILLS
+        obs['primitive_skills']=[s for s in self.skills
                                  if (s!='clear_view' or obs['recovery']['view_indices'])
                                  and (s!='home' or self.profile.get('home_tcp_m') is not None)]
         import pyrealsense2 as rs
@@ -123,6 +132,8 @@ class PrimitiveService:
     def _prepare(self,obs_id,skill,uv=None,target_base_m=None,view_index=0,timings=None):
         from .contract import vector
         self.prepared=None
+        if skill not in self.skills:
+            raise ValueError('Primitive is outside the configured skill scope: '+str(skill))
         observation,self.observation=self.observation,None
         if observation is None or observation[0]['id']!=obs_id:raise ValueError('Observation consumed or superseded')
         obs,began,depth=observation
@@ -136,6 +147,8 @@ class PrimitiveService:
             target=(ground_pixel(uv,depth,r.camera.intrinsics,p) if uv is not None else target_base_m)
             if target is not None:target=vector(target,3,'base target')
         peer_check=getattr(type(r),'check_other_arm_path',None)
+        if skill=='clear_view' and obs['state'].get('gripping') is False:
+            peer_check=getattr(type(r),'check_empty_clear_view_path',peer_check)
         attempts=[];last_error=None;moveit_receipt=None
         for yaw,candidate in candidate_profiles(p,obs['state'],skill,r.cfg.get('planning',{})):
             attempt_started=time.monotonic()
@@ -387,6 +400,9 @@ class PrimitiveService:
                         'completed_stages':receipts,'failed_stage':failed_stage,'gripping':False,
                         'motion_remaining':r.motion_remaining}
             raise
+        finally:
+            if actuation_attempted:
+                r.wrist_after_motion=time.monotonic()
         return {'plan_id':token,'skill':skill,'applied':True,'status':'completed','completed_stages':receipts,
                 'gripping':bool(r.grip.gripping()),'motion_remaining':r.motion_remaining}
 

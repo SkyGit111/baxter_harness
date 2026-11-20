@@ -97,9 +97,9 @@ class PreflightTests(unittest.TestCase):
     def test_source_selection_excludes_secrets_images_weights_and_site_data(self):
         for bad in ('.local/chatgpt-session.json','runs/run/events.jsonl','models/model.safetensors',
                     'config/baxter.local.json','config/site.json','deploy/wheels/file.py',
-                    'docs/scene.jpg','../outside.py','.env','deploy/auth.json'):
+                    'docs/scene.jpg','../outside.py','.env','deploy/auth.json','scripts/unrelated.cpp'):
             self.assertFalse(bundle.allowed_source(bad),bad)
-        for good in ('cix_harness/chatgpt_auth.py','config/baxter-hybrid.example.json','scripts/build_deploy_bundle.py',
+        for good in ('cix_harness/chatgpt_auth.py','config/baxter-hybrid.example.json','scripts/build_deploy_bundle.py','scripts/offline_scene_check.cpp',
                      'third_party/RPent-LICENSE','README.md','deploy/Dockerfile.vlm','deploy/Dockerfile.vla',
                      'tests/fixtures/white-pixel.png'):
             self.assertTrue(bundle.allowed_source(good),good)

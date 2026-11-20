@@ -424,8 +424,18 @@ class CollisionModelTests(unittest.TestCase):
         self.assertIn('left_installed_tool_0',bodies)
         deltas={n:0. for n in model.names};deltas['left_j1']=.1
         padding=model.capsule_displacement_bounds(deltas)
-        self.assertAlmostEqual(padding[shoulder.name],.015)
+        # Finite-cylinder support can rotate with the joint. Bound the
+        # outermost radial surface as well as the endpoints of its axis.
+        self.assertAlmostEqual(padding[shoulder.name],(.15+.06)*.1)
         self.assertEqual(set(padding),set(bodies))
+
+    def test_certified_finite_end_face_keeps_real_padding_and_separation(self):
+        arm=[Capsule('forearm',(0,0,-.05),(0,0,.05),.08,.02)]
+        peer=lambda z:[Capsule('mount',(0,0,z),(0,0,z),.02)]
+        self.assertAlmostEqual(check_capsules(arm,peer(.15),.04),.06)
+        with self.assertRaises(ArmCollisionError):check_capsules(arm,peer(.125),.04)
+        with self.assertRaises(ArmCollisionError):
+            check_capsules(arm,peer(.15),.04,peer_padding={'mount':.021})
 
     def test_urdf_mode_rejects_uncovered_main_link_or_unsupported_shape(self):
         cfg=build_collision_candidate(synthetic_urdf());cfg.update(body_geometry='urdf_cylinders',urdf_padding_m=.02)

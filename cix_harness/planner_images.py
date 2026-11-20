@@ -49,7 +49,10 @@ def _age(value):
     return float(value) if type(value) in (int,float) and math.isfinite(value) and value >= 0 else None
 
 
-def select_images(obs, mode='scene_wrist', max_wrist_age_s=.75):
+AUX_WRIST_MAX_AGE_S = .75
+
+
+def select_images(obs, mode='scene_wrist', max_wrist_age_s=AUX_WRIST_MAX_AGE_S):
     if mode not in ('scene','scene_wrist'): raise ValueError('Unknown API image mode')
     if type(max_wrist_age_s) not in (int,float) or not .1 <= max_wrist_age_s <= 2.:
         raise ValueError('Wrist freshness limit must be 0.1-2 seconds')

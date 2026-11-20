@@ -56,7 +56,7 @@ class ArmTasks(unittest.TestCase):
             self.assertEqual([a[0] for a in executed],['left','right'])
             self.assertNotEqual(executed[0][1],executed[1][1])
             import json
-            snapshot=json.loads((Path(folder)/'task-state.json').read_text())
+            snapshot=json.loads((Path(folder)/'task-state.json').read_text(encoding='utf-8'))
             self.assertTrue(snapshot['task_verified'])
             self.assertEqual([s['arm'] for s in snapshot['verified']],['left','right'])
             timings=[f for name,f in log.events if name=='component_timing' and f['component']=='robot_rpc']

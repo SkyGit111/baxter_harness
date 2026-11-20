@@ -177,6 +177,18 @@ class RecoveryRunner(unittest.TestCase):
 
 
 class RecoveryProtocol(unittest.TestCase):
+    def test_clearance_only_scope_rejects_pick_without_computing_a_motor_plan(self):
+        r=Mock()
+        r.cfg=dict(profile(),planning={'primitive_skills':['clear_view']})
+        service=PrimitiveService(r)
+        self.assertEqual(service.skills,('clear_view',))
+        service.prepared=('stale',)
+        with self.assertRaisesRegex(ValueError,'configured skill scope'):
+            service.prepare('o','pick',target_base_m=[.6,.2,.1])
+        self.assertIsNone(service.prepared)
+        r.continuous_ik.solve.assert_not_called()
+        r.grip.command_position.assert_not_called()
+
     def make_service(self):
         r=Mock();r.cfg=profile();r.cfg['max_observation_age_s']=3;r.motion_remaining=64
         r.joints.return_value={'j':0.}

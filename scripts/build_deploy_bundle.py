@@ -33,7 +33,7 @@ def allowed_source(name):
     if len(path.parts) == 1:return name in {'README.md', '.gitignore', '.gitattributes', '.dockerignore'}
     if path.parts[0] not in SOURCE_DIRS:return False
     if name == SYNTHETIC_FIXTURE:return True
-    if name in ('deploy/Dockerfile.vla', 'deploy/Dockerfile.vlm'):return True
+    if name in ('deploy/Dockerfile.vla', 'deploy/Dockerfile.vlm', 'scripts/offline_scene_check.cpp'):return True
     if path.parts[0] == 'config' and not base.endswith('.example.json'):return False
     return path.suffix.lower() in SOURCE_EXTENSIONS or (path.parts[0] == 'third_party' and 'license' in base)
 

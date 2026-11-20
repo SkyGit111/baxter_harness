@@ -1,7 +1,7 @@
 import copy
 import math
 import unittest
-from cix_harness.reachability import scan,yaw_orientation
+from cix_harness.reachability import RouteSearchError,scan,yaw_orientation
 
 
 class ReachabilityTests(unittest.TestCase):
@@ -51,6 +51,26 @@ class ReachabilityTests(unittest.TestCase):
             q=yaw_orientation([1,0,0,0],angle)
             xyz=rotate(q,[0,0,1])
             for a,b in zip(xyz,[0,0,-1]):self.assertAlmostEqual(a,b)
+
+    def test_direct_and_staged_route_rejections_are_both_visible(self):
+        failures=[{'approach_path':'direct_hover','type':'ArmCollisionError','reason':'right_hand_tag_mount / table'},
+                  {'approach_path':'staged','type':'IKPreflightError','reason':'joint limit'}]
+        def reject(*args):raise RouteSearchError('pick',failures)
+        report=self.run_scan(reject,arms=['right'],yaw_degrees=[0])
+        result=report['arms']['right']['samples'][0]['attempts'][0]
+        self.assertEqual(result['approach_failures'],failures)
+        self.assertIn('right_hand_tag_mount / table',result['reason'])
+
+    def test_short_checker_reply_cannot_pass_a_configuration(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from cix_harness.reachability_scene import ArchivedMoveItScene,JOINTS
+        validator=ArchivedMoveItScene.__new__(ArchivedMoveItScene)
+        validator.command=['local-offline-checker']
+        rows=[dict.fromkeys(JOINTS,0.)]*2
+        with patch('subprocess.run',return_value=SimpleNamespace(returncode=0,stdout='BAXTER_FCL clear\n',stderr='')):
+            with self.assertRaisesRegex(RuntimeError,'Incomplete'):
+                validator._validity(rows)
 
     def test_changes_in_geometry_or_start_pose_invalidate_fingerprint(self):
         before=self.run_scan(self.accept)['fingerprints']
