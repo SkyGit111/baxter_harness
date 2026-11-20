@@ -4,6 +4,7 @@ import json
 from .contract import instruction, vector
 from .primitives import SKILLS, number
 from .rpc import HttpRpcClient, local_json
+from . import ring_recheck
 
 SCHEMA={'type':'object','properties':{
  'decision':{'type':'string','enum':['act','done','blocked']},
@@ -173,9 +174,12 @@ def run(args,log,robot=None,planner=decide,recovery_allowed=None):
     max_grasp_retries=getattr(args,'max_grasp_retries',1)
     peer_recovery=PeerMotionRecovery()
     log('start',route='primitives',goal=instruction(args.task),mode='live' if args.execute else 'preview')
+    def observe():
+        obs=robot.call('primitive.observe');log.camera(obs,'primitive');return obs
+
     # A preflight rejection spends recovery budget, but no motion/skill turn.
     for _ in range(args.max_turns+max_recoveries+1):
-        obs=robot.call('primitive.observe');log.camera(obs,'primitive')
+        obs=observe()
         problem=peer_recovery.observation_error(obs,log)
         if problem:log('finish',status=problem);return 2
         views=[i for i in obs.get('recovery',{}).get('view_indices',[]) if i not in used_views]
@@ -212,7 +216,9 @@ def run(args,log,robot=None,planner=decide,recovery_allowed=None):
         if actions>=args.max_turns:log('finish',status='turn_budget_exhausted');return 2
         options={'kwargs':{'view_index':view_index}} if view_index is not None else {}
         if view_index is not None:used_views.add(view_index)
-        prepared=robot.call('primitive.prepare',(obs['id'],decision['skill'],decision['uv']),timeout_s=60,**options)
+        prepared,obs,decision,spent=ring_recheck.prepare(robot,log,obs,decision,options,observe,
+            max_recoveries-recoveries,recovery_allowed)
+        recoveries+=spent
         log('primitive_plan',**prepared)
         problem=peer_recovery.plan_error(prepared,obs,log)
         if problem:log('finish',status=problem);return 2

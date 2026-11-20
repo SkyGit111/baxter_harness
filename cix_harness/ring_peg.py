@@ -102,6 +102,36 @@ def color(row):
     return value
 
 
+def surveyed_contact(settings, ring, axis, finger_depth, desired):
+    """Use a paired surface/ring survey only while its original footprint is observable."""
+    survey=settings['local_pick_support']
+    if (survey['ring_id']!=ring['id'] or ring.get('local_support_reference_verified') is not True or
+            not ring.get('local_support_reference_evidence',{}).get('verified')):
+        raise RingGeometryError('Local fingertip support survey needs a new unobstructed observation')
+    evidence=ring['local_support_reference_evidence']
+    if list(evidence.get('survey_frame_ids',[]))!=list(survey['frame_ids']) or len(set(survey['frame_ids']))<4:
+        raise RingGeometryError('Fingertip surface and observation come from different surveys')
+    direction=vector(survey['jaw_axis_base_xy'],2,'surveyed finger direction')
+    length=math.hypot(*direction)*math.hypot(*axis[:2])
+    if length<.95 or abs(sum(a*b for a,b in zip(axis,direction)))<length*math.cos(math.radians(2)):
+        raise RingGeometryError('Candidate finger direction leaves the surveyed sweep')
+    shift=number(evidence['current_surface_shift_m'],-.003,.003,'live surface shift')
+    # Both the tabletop and its target share the local camera-to-base error.
+    # A fresh higher tabletop raises the minimum. A low reading never lowers it.
+    upper=measured(survey,'swept_table_upper_z_m')+max(0.,shift)
+    nominal_top=measured(survey,'ring_top_z_m')+shift
+    plausible_top=measured(survey,'ring_top_upper_z_m')+shift
+    if not nominal_top<=plausible_top<=nominal_top+.011:
+        raise RingGeometryError('Invalid measured ring-top range')
+    low=upper+finger_depth+settings.get('tcp_table_error_m',0.)+.0005
+    contact=max(nominal_top-desired,low)
+    if contact>=plausible_top:raise RingGeometryError('No fingertip contact depth above the local tabletop')
+    return contact,{'mode':'reobserved_multiframe_support','table_upper_z_m':upper,
+        'lowest_allowed_tcp_z_m':low,'surveyed_ring_top_z_m':nominal_top,'highest_plausible_ring_top_z_m':plausible_top,
+        'live_surface_shift_m':shift,'live_optical_inset_m':ring['center_base_m'][2]-contact,
+        'surveyed_nominal_inset_m':nominal_top-contact,'empty_grasp_possible':contact>=nominal_top}
+
+
 def pick_geometry(profile,scene,ring,orientation):
     s=profile['ring_peg'];center=measured(ring,'center_base_m',3);rim=measured(ring,'rim_grasp_base_m',3)
     inner,outer=dimension(ring);margin=s['horizontal_uncertainty_m']+max(fit_error(ring,'inner_boundary_p90_m'),fit_error(ring,'outer_boundary_p90_m'))
@@ -126,19 +156,27 @@ def pick_geometry(profile,scene,ring,orientation):
     # Keep the lowest open fingertip above the support. Failure to guarantee
     # a bite at the high end of the pose error is assessed by the grasp sensor.
     top=(center[2] if mode=='outer' else rim[2]);finger_depth=s['fingertip_below_tcp_m']+abs(axis[2])*span
-    if ring.get('local_table_upper_z_m') is not None:
+    survey_evidence=None
+    if s.get('local_pick_support') is not None:
+        if mode!='outer':raise RingGeometryError('Surveyed finger sweep requires an outer-wall grasp')
+        contact_z,survey_evidence=surveyed_contact(s,ring,axis,finger_depth,desired)
+        inset=survey_evidence['surveyed_nominal_inset_m']
+    elif ring.get('local_table_upper_z_m') is not None:
         upper=measured(ring,'local_table_upper_z_m');mid=measured(ring,'local_table_z_m')
         if mid>upper or type(ring.get('local_table_depth_count')) is not int or ring['local_table_depth_count']<=0:
             raise RingGeometryError('Invalid measured local tabletop interval')
         available=top-upper-finger_depth-s.get('tcp_table_error_m',0.)
     else:available=thickness*normal[2]-finger_depth-vertical
-    inset=min(desired,available-.0005)
-    if inset<=0:raise RingGeometryError('No fingertip contact depth above the local tabletop')
-    contact=[*grasp_xy,top-inset]
+    if survey_evidence is None:
+        inset=min(desired,available-.0005)
+        if inset<=0:raise RingGeometryError('No fingertip contact depth above the local tabletop')
+        contact_z=top-inset
+    contact=[*grasp_xy,contact_z]
     return contact,{'ring_id':ring['id'],'color':color(ring),'inner_radius_m':inner,'outer_radius_m':outer,
                     'rim_radius_m':radial,'grasp_mode':mode,'open_finger_center_radii_m':[near,far],
                     'requested_grasp_inset_m':desired,'effective_grasp_inset_m':inset,'vertical_uncertainty_m':vertical,
-                    'local_table_upper_z_m':ring.get('local_table_upper_z_m'),'tcp_table_error_m':s.get('tcp_table_error_m',0.)}
+                    'local_table_upper_z_m':survey_evidence['table_upper_z_m'] if survey_evidence else ring.get('local_table_upper_z_m'),
+                    'support_survey':survey_evidence,'tcp_table_error_m':s.get('tcp_table_error_m',0.)}
 
 
 def release_geometry(profile,scene,state,ring,peg):
@@ -179,7 +217,8 @@ def release_geometry(profile,scene,state,ring,peg):
         'alignment_sensor':'wrist' if wrist else 'D455','hole_to_tip_xy_m':offset,'matching_parts_verified':matched,
         'centering_goal_m':min(.001,inner*normal[2]*.25,max(.00035,optical_error*.5)),
         'attempt_max_offset_m':min(.002,inner*normal[2]*.45),
-        'stack_count_before':peg.get('stack_count'),'finger_bottom_z_m':tcp[2]-s['fingertip_below_tcp_m']}
+        'stack_count_before':peg.get('stack_count'),'stack_depth_delta_before_m':peg.get('stack_depth_delta_m'),
+        'stack_delta_from_frame':peg.get('stack_delta_from_frame'),'finger_bottom_z_m':tcp[2]-s['fingertip_below_tcp_m']}
     return contact,evidence
 
 
@@ -246,10 +285,17 @@ def verified(action,scene,state):
         rings=[r for r in scene.get('rings',[]) if r.get('id')==scene.get('held_ring_id') and r.get('location')=='held']
         if len(rings)==1 and rings[0].get('color')==action['color']:return 'pick'
     if action['skill']=='place' and state.get('gripping') is False:
+        if any(r.get('id')==action['ring_id'] and r.get('location')=='loose' for r in scene.get('rings',[])):return None
         matches=[p for p in scene.get('pegs',[]) if p.get('id')==action['peg_id'] and p.get('color')==action['color']]
         if len(matches)!=1:return None
         peg=matches[0];before=action.get('stack_count_before');after=peg.get('stack_count')
         if type(before) is int and before>=1 and type(after) is int and after==before+1:return 'place'
+        start_delta=action.get('stack_depth_delta_before_m');end_delta=peg.get('stack_depth_delta_m')
+        if (peg.get('stack_rise_supported') is True and action.get('stack_delta_from_frame') is not None and
+                action['stack_delta_from_frame']==peg.get('stack_delta_from_frame') and
+                type(start_delta) in (float,int) and type(end_delta) in (float,int)):
+            difference=end_delta-start_delta;thick=action['thickness_m']
+            if .55*thick<=difference<=1.45*thick:return 'place'
         if after is None or before is None:
             # A measured support rise must exclude unchanged height and two added rings.
             thick=action.get('thickness_m');err=action.get('vertical_uncertainty_m')

@@ -9,6 +9,7 @@ from .primitives import SKILLS
 from .primitive_runner import PeerMotionRecovery,finish_execution_failure,log_execution_receipt
 from .task_plan import VLA_SKILLS
 from .rpc import HttpRpcClient
+from . import ring_recheck
 from .rollout import predict, rollout, validate_motion_model
 
 
@@ -178,7 +179,9 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
             view_index = views[0]; used_views.add(view_index)
             log('recovery', kind='clear_view', view_index=view_index, attempt=recoveries)
         kwargs = {'kwargs': {'view_index': view_index}} if view_index is not None else {}
-        prepared = robot.call('primitive.prepare', (obs['id'], skill, decision.get('uv')), timeout_s=60, **kwargs)
+        prepared,obs,decision,spent=ring_recheck.prepare(robot,log,obs,decision,kwargs,lambda:observe(health)[0],
+            max_recoveries-recoveries,executive.recovery_allowed)
+        recoveries+=spent
         log('primitive_plan', **prepared)
         problem = peer_recovery.plan_error(prepared, obs, log)
         if problem: return finish(problem)

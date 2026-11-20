@@ -143,6 +143,15 @@ class RingTask(unittest.TestCase):
         self.assertEqual(ring_peg.verified(e,scene,state),'place');scene['obs_id']='before'
         self.assertIsNone(ring_peg.verified(e,scene,state))
 
+    def test_stack_depth_difference_requires_a_matching_paired_reference_and_no_loose_ring(self):
+        p,scene,state,ring,peg=example();ring['location']='held';state['gripping']=True
+        peg.update(stack_count=None,stack_delta_from_frame=12,stack_depth_delta_m=-.001)
+        _,e=ring_peg.release_geometry(p,scene,state,ring,peg);e.update(skill='place',obs_id='old')
+        state['gripping']=False;peg.update(stack_depth_delta_m=.009,stack_rise_supported=True)
+        self.assertEqual(ring_peg.verified(e,scene,state),'place');ring['location']='loose'
+        self.assertIsNone(ring_peg.verified(e,scene,state));ring['location']='unknown';peg['stack_delta_from_frame']=13
+        self.assertIsNone(ring_peg.verified(e,scene,state))
+
     def test_manually_matched_toy_uses_centered_gravity_attempt_then_recognizes_visible_miss(self):
         p,scene,state,ring,peg=example();p['ring_peg']['matching_parts_verified']=True
         ring.update(location='held',center_base_m=[.74,.27,.106],inner_radius_m=.0041);peg['radius_m']=.00445

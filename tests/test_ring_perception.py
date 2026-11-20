@@ -1,7 +1,9 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
+from cix_harness.ring_support_reference import check_reference, make_reference
 
 try:
     import cv2
@@ -65,3 +67,41 @@ class RingPerceptionTest(unittest.TestCase):
         self.image[self.mask]=(12,22,230);self.depth[self.mask]=.982
         spec['roi_px']=[3,4,24,31]
         self.assertEqual(self.observation()['rings'],[])
+
+    def test_a_single_round_depth_patch_cannot_replace_unseen_registered_post(self):
+        self.settings['rings']=[]
+        self.settings['pegs']=[{'id':'blue_peg','bracket_reference':{'tip_px':[40,56]}}]
+        confused={'tip_uv_px':[48,56],'tip_base_m':[.03,.04,.09],'depth_inliers':19}
+        registered={'id':'blue_peg','tip_uv_px':[40,56],
+                    'tip_position_interval_base_m':[[.03,.04,.085],[.03,.04,.095]],
+                    'current_tip_depth_measured':False}
+        with patch('cix_harness.ring_perception._detect',return_value=[confused]), \
+                patch('cix_harness.ring_perception._registered_peg',return_value=None):
+            self.assertEqual(self.observation()['pegs'],[])
+        with patch('cix_harness.ring_perception._detect',return_value=[confused]), \
+                patch('cix_harness.ring_perception._registered_peg',return_value=registered):
+            peg,=self.observation()['pegs']
+            self.assertFalse(peg['current_tip_depth_measured'])
+            confused['tip_uv_px']=[40,56]
+            peg,=self.observation()['pegs']
+            self.assertTrue(peg['current_tip_depth_measured'])
+            self.assertEqual(peg['current_tip_depth_inliers'],19)
+
+    def test_finger_approach_reference_requires_current_location_and_unchanged_clear_surface(self):
+        color=np.full((16,18,3),30,np.uint8)
+        depth=np.ones((16,18),float)
+        ring={'center_uv_px':[9,8],'center_base_m':[.01,-.02,.01]}
+        geom=SimpleNamespace(depth=depth,n=np.array([0.,0.,1.]),
+                             rays=lambda px:np.tile([0.,0.,-1.],(len(px),1)))
+        ref=make_reference([color]*5,[depth]*5,[0,0],np.ones(depth.shape,bool),ring,range(5))
+        self.assertTrue(check_reference(geom,color,ring,ref)['verified'])
+        color[2:6,2:6]=[60,80,10]
+        self.assertFalse(check_reference(geom,color,ring,ref)['verified'])
+        color[:]=30
+        depth[2:6,2:6]=.992
+        self.assertFalse(check_reference(geom,color,ring,ref)['verified'])
+        depth[:]=1.
+        moved=dict(ring,center_uv_px=[14,8])
+        self.assertFalse(check_reference(geom,color,moved,ref)['verified'])
+        depth[:]=.996
+        self.assertFalse(check_reference(geom,color,ring,ref)['verified'])

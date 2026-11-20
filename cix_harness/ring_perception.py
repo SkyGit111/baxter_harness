@@ -41,6 +41,7 @@ class _Geometry:
 
     def rays(self,pixels):
         points=np.asarray(pixels,dtype=float).reshape(-1,2)
+        if not len(points):return np.empty((0,3),dtype=float)
         if callable(getattr(self.intrinsics,'rays',None)):
             rays=self.intrinsics.rays(points)
         else:
@@ -185,7 +186,7 @@ def _registered_peg(spec,board,bgr,geom):
     transform=lambda p:cv2.perspectiveTransform(np.array([[p]],np.float32),warp)[0,0]
     pred=transform(ref['patch_center_px']);tip=transform(ref['tip_px']);support=transform(ref['support_px'])
     patch=np.asarray(ref['appearance_bgr'],dtype=np.uint8);h,w=patch.shape[:2]
-    if patch.ndim!=3 or patch.shape[-1]!=3 or min(w,h)<7 or min(w,h)%2==0 or max(w,h)>65:return None
+    if patch.ndim!=3 or patch.shape[-1]!=3 or min(w,h)<7 or w%2==0 or h%2==0 or max(w,h)>65:return None
     if float(np.max(patch.reshape(-1,3).std(axis=0)))<5:return None
     x,y=np.rint(pred).astype(int);sx,sy=x-w//2-3,y-h//2-3
     crop=bgr[sy:sy+h+6,sx:sx+w+6]
@@ -320,9 +321,25 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
     for kind in ('ring','peg'):
         for spec in settings.get(kind+'s',[]):
             found=_detect(spec,kind,hsv,geometry)
-            if kind=='peg' and len(found)!=1:
+            if kind=='peg' and spec.get('bracket_reference'):
                 registered=_registered_peg(spec,board,bgr,geometry)
-                if registered is not None:found=[registered]
+                if registered is None:
+                    found=[]
+                else:
+                    # A round patch in the peg ROI can be a ring or a gripper.
+                    # The board and tip appearance establish which physical post this is.
+                    interval=np.asarray(registered['tip_position_interval_base_m'])
+                    center=interval.mean(axis=0)
+                    allowance=np.linalg.norm(interval[1]-interval[0])/2+.004
+                    matched=[row for row in found
+                             if np.linalg.norm(np.asarray(row['tip_uv_px'])-registered['tip_uv_px'])<=2.
+                             and np.linalg.norm(np.asarray(row['tip_base_m'])-center)<=allowance]
+                    if len(matched)==1:
+                        row=matched[0]
+                        registered.update(current_tip_depth_measured=True,
+                                          current_tip_depth_base_m=row['tip_base_m'],
+                                          current_tip_depth_inliers=row['depth_inliers'])
+                    found=[registered]
             if kind=='ring' and tcp is not None and spec.get('loose_candidate'):
                 projected=geometry.project(tcp)
                 if projected is not None:
@@ -372,6 +389,12 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
             if -.005<ring['top_height_above_table_m']<.04:
                 ring['location']='loose'
                 _local_table(ring,bgr,geometry)
+                spec=next(s for s in settings['rings'] if s['id']==ring['id'])
+                if spec.get('local_support_reference'):
+                    from .ring_support_reference import check_reference
+                    evidence=check_reference(geometry,bgr,ring,spec['local_support_reference'])
+                    ring['local_support_reference_verified']=evidence['verified']
+                    ring['local_support_reference_evidence']=evidence
     if tcp is not None:
         held=[]
         for r in scene['rings']:

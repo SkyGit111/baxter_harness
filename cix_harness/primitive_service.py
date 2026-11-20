@@ -249,12 +249,18 @@ class PrimitiveService:
                         moveit_receipt = self.moveit.check(initial, segments)
             except (IKPreflightError,ArmCollisionError,MoveItCollisionError,ring_peg.RingGeometryError) as error:
                 attempts.append({'yaw_rad':yaw,'approach_path':route,'status':'rejected','reason':str(error),'seconds':time.monotonic()-attempt_started})
+                attempts[-1]['failure_type']=type(error).__name__
                 last_error=error
                 continue
             attempts.append({'yaw_rad':yaw,'approach_path':route,'status':'ready','seconds':time.monotonic()-attempt_started})
             break
         else:
             r.audit('primitive_candidates_rejected',obs_id=obs_id,skill=skill,candidates=attempts)
+            if (skill=='pick' and ring_objects is not None and isinstance(last_error,ring_peg.RingGeometryError)
+                    and all(x.get('failure_type')=='RingGeometryError' for x in attempts)):
+                return {'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,'recoverable':True,
+                        'failure_code':'ring_geometry','message':str(last_error),'selected_ring_id':ring['id'],
+                        'geometry_independent_of_uv':True,'planning_candidates':attempts}
             if last_error is not None:
                 raise last_error
             return {'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,'recoverable':False,

@@ -381,7 +381,10 @@ class TaskExecutive:
             self.feedback = {'failure_code': fields['reason']}
             return
         if not self.current or self.dispatch != self.current['id']: return
-        if name == 'code_result':
+        if name=='ring_pick_relocalized' and self.current['skill']=='pick':
+            self.last_action_obs=fields['obs_id']
+            self.last_target={'obs_id':fields['obs_id'],'uv':fields['uv'],'target':self.current['target']}
+        elif name == 'code_result':
             if fields.get('status')=='failed':self.failed(fields.get('failure_code','code_error'))
             else:
                 self.code_result=fields.get('result');self.current['status']='awaiting_verification';self.dispatch=None
