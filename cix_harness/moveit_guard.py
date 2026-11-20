@@ -4,6 +4,7 @@ import io
 import math
 import time
 
+from .contract import vector
 from .moveit_probe import joint_names
 from .trajectory import JointTrajectory, motion_limits
 
@@ -28,7 +29,41 @@ def options(planning):
     if (not isinstance(required, list) or any(not isinstance(v, str) or not v.strip() for v in required)
             or len(set(required)) != len(required) or (required and backend != 'moveit')):
         raise ValueError('Invalid moveit_required_world_objects')
+    configured = planning.get('moveit_scene_boxes', [])
+    if not isinstance(configured,list) or (configured and backend!='moveit'):
+        raise ValueError('Configured scene boxes require the MoveIt backend')
+    seen=set()
+    for box in configured:
+        if (not isinstance(box,dict) or not isinstance(box.get('id'),str) or not box['id'].strip()
+                or box['id'] in seen or box.get('frame') not in ('base','left_gripper','right_gripper')
+                or not isinstance(box.get('source'),str) or not box['source'].strip()):
+            raise ValueError('Scene box requires a unique ID, a supported frame and measurement source')
+        seen.add(box['id'])
+        vector(box.get('xyz'),3,'collision box centre')
+        orientation=vector(box.get('xyzw'),4,'collision box orientation')
+        if abs(math.sqrt(sum(v*v for v in orientation))-1)>.0001 or min(vector(box.get('size_m'),3,'collision box size'))<=0:
+            raise ValueError('Invalid collision box dimensions or rotation')
     return backend, sorted(required)
+
+
+def scene_box(box):
+    from geometry_msgs.msg import Pose
+    from moveit_msgs.msg import AttachedCollisionObject
+    from shape_msgs.msg import SolidPrimitive
+    entry=AttachedCollisionObject()
+    entry.link_name=entry.object.header.frame_id=box['frame']
+    entry.object.id=box['id']
+    centre=Pose()
+    centre.position.x,centre.position.y,centre.position.z=box['xyz']
+    centre.orientation.x,centre.orientation.y,centre.orientation.z,centre.orientation.w=box['xyzw']
+    entry.object.primitives=[SolidPrimitive(type=SolidPrimitive.BOX,dimensions=box['size_m'])]
+    entry.object.primitive_poses=[centre]
+    entry.touch_links=[entry.link_name]
+    if entry.link_name!='base':
+        arm=entry.link_name.split('_')[0]
+        entry.touch_links.extend([arm+'_gripper_base',arm+'_hand',arm+'_wrist'])
+        entry.touch_links.extend(arm[0]+'_gripper_'+side+'_finger'+tip for side in ('l','r') for tip in ('','_tip'))
+    return entry
 
 
 def segment_samples(initial, path, cfg, phase):
@@ -95,11 +130,23 @@ class MoveItGuard:
             world[obj.id] = {'frame': obj.header.frame_id, 'shape_count': shapes,
                              'geometry_sha256': message_digest(obj),
                              'primitive_dimensions': [list(p.dimensions) for p in obj.primitives]}
+        state = scene.robot_state
+        state.is_diff = False
+        configured=self.robot.cfg.get('planning',{}).get('moveit_scene_boxes',[])
+        occupied=set(world)|{item.object.id for item in state.attached_collision_objects}
+        for box in configured:
+            if box['id'] in occupied:
+                raise RuntimeError('Configured MoveIt geometry shadows a live object: '+box['id'])
+            entry=scene_box(box)
+            state.attached_collision_objects.append(entry)
+            occupied.add(box['id'])
+            if box['frame']=='base':
+                world[box['id']]={'frame':'base','shape_count':1,'geometry_sha256':message_digest(entry.object),
+                                  'primitive_dimensions':[list(box['size_m'])],'source':box['source'],
+                                  'scope':'request_fixed_to_base'}
         missing = set(self.required_world) - world.keys()
         if missing:
             raise RuntimeError('MoveIt world lacks required collision geometry: ' + ', '.join(sorted(missing)))
-        state = scene.robot_state
-        state.is_diff = False
         attachments = {}
         for entry in state.attached_collision_objects:
             # Attachment pose is expressed in its link frame, independent of the
@@ -110,6 +157,7 @@ class MoveItGuard:
         return state, {'world_objects': world, 'required_world_objects_present': list(self.required_world),
                        'allowed_collision_matrix_sha256': message_digest(scene.allowed_collision_matrix),
                        'attached_objects': attachments,
+                       'configured_box_sources':{box['id']:box['source'] for box in configured},
                        'world_geometry_physically_verified_by_this_check': False}
 
     def peer(self):

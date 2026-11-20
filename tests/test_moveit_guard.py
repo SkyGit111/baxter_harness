@@ -103,3 +103,39 @@ class MoveItPrimitivePath(unittest.TestCase):
                   {'collision_backend':'moveit','moveit_required_world_objects':['','table']}):
             with self.assertRaises(ValueError):
                 options(p)
+
+    def test_survey_box_requires_size_source_and_rigid_frame(self):
+        box={'id':'mounted_board','frame':'right_gripper','xyz':[0,.01,0],'xyzw':[0,0,0,1],
+             'size_m':[.11,.11,.008],'source':'on-site measurement'}
+        self.assertEqual(options({'collision_backend':'moveit','moveit_scene_boxes':[box]}),('moveit',[]))
+        for change in ({'source':''},{'frame':'camera'},{'size_m':[.1,.1,0]},{'xyzw':[0,0,0,2]}):
+            with self.assertRaises(ValueError):
+                options({'collision_backend':'moveit','moveit_scene_boxes':[dict(box,**change)]})
+        with self.assertRaises(ValueError):
+            options({'collision_backend':'moveit','moveit_scene_boxes':[box,box]})
+        with self.assertRaises(ValueError):
+            options({'moveit_scene_boxes':[box]})
+
+    def test_request_local_table_and_peer_board_enter_whole_robot_state(self):
+        from cix_harness.moveit_guard import MoveItGuard
+        self.guard.ros=NS(Time=lambda sec:sec)
+        state=NS(joint_state=NS(name=list(self.full),position=list(self.full.values())),attached_collision_objects=[])
+        live=NS(robot_model_name='baxter',robot_state=state,world=NS(collision_objects=[]),allowed_collision_matrix=object())
+        self.guard.scene_service=Mock(return_value=NS(scene=live))
+        self.guard.required_world=['surface']
+        self.r.cfg['planning']['moveit_scene_boxes']=[
+            dict(id=k,frame=f,source='measurement',size_m=[.1,.1,.01])
+            for k,f in [('surface','base'),('installed_board','right_gripper')]]
+        c=NS(SCENE_SETTINGS=1,ROBOT_STATE=2,ROBOT_STATE_ATTACHED_OBJECTS=4,WORLD_OBJECT_GEOMETRY=8,
+             ALLOWED_COLLISION_MATRIX=16)
+        def entry(box):
+            return NS(object=NS(header=NS(stamp=0),id=box['id']),link_name=box['frame'],touch_links=[box['frame']])
+        with patch.dict('sys.modules',{'moveit_msgs.msg':NS(PlanningSceneComponents=c),
+                                       'moveit_msgs.srv':NS(GetPlanningSceneRequest=lambda:NS(components=NS()))}), \
+                patch('cix_harness.moveit_guard.scene_box',side_effect=entry), \
+                patch('cix_harness.moveit_guard.message_digest',return_value='digest'):
+            checked,receipt=MoveItGuard._scene(self.guard)
+        self.assertEqual([(a.object.id,a.link_name) for a in checked.attached_collision_objects],
+                         [('surface','base'),('installed_board','right_gripper')])
+        self.assertEqual(receipt['world_objects']['surface']['scope'],'request_fixed_to_base')
+        self.assertEqual(receipt['attached_objects']['installed_board']['link'],'right_gripper')
