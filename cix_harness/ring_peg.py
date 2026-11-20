@@ -22,6 +22,9 @@ class RingAlignmentNeeded(RingGeometryError):
 
 
 def validate_settings(settings):
+    if 'transport' in settings:
+        from .ring_transport import validate
+        validate(settings['transport'])
     for name,low,high in [('ring_thickness_m',.001,.10),('horizontal_uncertainty_m',.0001,.10),
                           ('vertical_uncertainty_m',.0001,.10),('jaw_open_half_span_m',.002,.15),
                           ('finger_half_width_m',.0005,.05),('fingertip_below_tcp_m',0,.15),
@@ -35,6 +38,18 @@ def validate_settings(settings):
     if 'relative_xy_uncertainty_m' in settings:
         number(settings['relative_xy_uncertainty_m'],.0001,.1,'simultaneous hole/peg alignment uncertainty')
     number(settings.get('tcp_table_error_m',0.),0.,.05,'residual TCP-to-local-table error')
+    if 'local_pick_support' in settings:
+        s=settings['local_pick_support']
+        if not isinstance(s,dict) or s.get('ring_id')!=settings.get('source_ring_id') or not s.get('ring_id'):
+            raise ValueError('Fingertip survey must identify the configured source ring')
+        frames=s.get('frame_ids')
+        if not isinstance(frames,list) or any(type(n) is not int or n<0 for n in frames) or len(set(frames))<4:
+            raise ValueError('Fingertip survey requires at least four distinct frames')
+        if abs(math.hypot(*vector(s['jaw_axis_base_xy'],2,'surveyed jaw axis'))-1.)>.001:
+            raise ValueError('Expected a unit surveyed jaw axis')
+        number(s['swept_table_upper_z_m'],-2.,2.,'surveyed swept tabletop upper height')
+        nominal=number(s['ring_top_z_m'],-2.,2.,'surveyed ring top')
+        number(s['ring_top_upper_z_m'],nominal,nominal+.011,'empirical upper ring-top height')
     if type(settings.get('servo_iterations',3)) is not int or not 0<=settings.get('servo_iterations',3)<=6:
         raise ValueError('Invalid ring servo iteration limit')
     if 'wrist_alignment' in settings:
@@ -112,6 +127,13 @@ def surveyed_contact(settings, ring, axis, finger_depth, desired):
     if list(evidence.get('survey_frame_ids',[]))!=list(survey['frame_ids']) or len(set(survey['frame_ids']))<4:
         raise RingGeometryError('Fingertip surface and observation come from different surveys')
     direction=vector(survey['jaw_axis_base_xy'],2,'surveyed finger direction')
+    if 'jaw_axis_base_xy' not in evidence:raise RingGeometryError('Missing observed finger sweep direction')
+    observed=vector(evidence['jaw_axis_base_xy'],2,'observed finger sweep direction')
+    if math.hypot(*observed)<.99 or abs(sum(a*b for a,b in zip(observed,direction)))<.999:
+        raise RingGeometryError('Observed finger sweep does not match the surface survey')
+    offset=survey.get('grasp_offset_base_xy_m',[0.,0.])
+    if math.dist(offset,evidence.get('grasp_offset_base_xy_m',[0.,0.]))>.0001:
+        raise RingGeometryError('Observed grasp offset does not match the surveyed finger sweep')
     length=math.hypot(*direction)*math.hypot(*axis[:2])
     if length<.95 or abs(sum(a*b for a,b in zip(axis,direction)))<length*math.cos(math.radians(2)):
         raise RingGeometryError('Candidate finger direction leaves the surveyed sweep')
@@ -123,11 +145,17 @@ def surveyed_contact(settings, ring, axis, finger_depth, desired):
     plausible_top=measured(survey,'ring_top_upper_z_m')+shift
     if not nominal_top<=plausible_top<=nominal_top+.011:
         raise RingGeometryError('Invalid measured ring-top range')
-    low=upper+finger_depth+settings.get('tcp_table_error_m',0.)+.0005
+    tracking=settings.get('tcp_table_error_m',0.)
+    low=upper+finger_depth+tracking+.0005
     contact=max(nominal_top-desired,low)
-    if contact>=plausible_top:raise RingGeometryError('No fingertip contact depth above the local tabletop')
-    return contact,{'mode':'reobserved_multiframe_support','table_upper_z_m':upper,
+    # The floor covers the lower fingertip even with the measured downward
+    # tracking error. Assess a possible grasp at the *higher* fingertip. A
+    # nominal TCP above the ring can still give a clean, verifiable side grip.
+    highest_tip_at_lowest_endpoint=contact-float(settings['fingertip_below_tcp_m'])+abs(axis[2])*settings['jaw_open_half_span_m']-tracking
+    if highest_tip_at_lowest_endpoint>=plausible_top:raise RingGeometryError('No fingertip contact depth above the local tabletop')
+    return contact,{'mode':'reobserved_multiframe_support','table_upper_z_m':upper,'grasp_offset_base_xy_m':offset,
         'lowest_allowed_tcp_z_m':low,'surveyed_ring_top_z_m':nominal_top,'highest_plausible_ring_top_z_m':plausible_top,
+        'highest_fingertip_at_lowest_endpoint_m':highest_tip_at_lowest_endpoint,
         'live_surface_shift_m':shift,'live_optical_inset_m':ring['center_base_m'][2]-contact,
         'surveyed_nominal_inset_m':nominal_top-contact,'empty_grasp_possible':contact>=nominal_top}
 
@@ -148,6 +176,16 @@ def pick_geometry(profile,scene,ring,orientation):
     outer_fits=outer*normal[2]>margin and math.hypot(axis[0],axis[1])*span-finger-margin>outer
     if mode in ('auto','outer') and outer_fits:
         grasp_xy=center[:2];mode='outer';near=far=span*math.hypot(*axis[:2])
+        survey=s.get('local_pick_support',{})
+        if 'grasp_offset_base_xy_m' in survey:
+            offset=vector(survey['grasp_offset_base_xy_m'],2,'surveyed tangential grip displacement')
+            along=sum(v*a for v,a in zip(offset,axis))/math.hypot(*axis[:2])
+            # Both opposing pads must contact the projected outer wall even with
+            # a displaced centre. Only the tangential offset preserves open width.
+            if abs(along)>.0002 or math.hypot(*offset)>=outer*normal[2] or max(0.,math.hypot(*offset)+margin-finger)>=outer*normal[2]:
+                raise RingGeometryError('Offset finger sweep cannot grip opposing ring walls')
+            grasp_xy=[a+b for a,b in zip(grasp_xy,offset)]
+            near,far=sorted(math.hypot(offset[0]+sign*span*axis[0],offset[1]+sign*span*axis[1]) for sign in (-1,1))
     elif (mode in ('auto','rim') and inner+margin<radial<outer*normal[2]-margin and
           near+finger+margin<inner*normal[2] and far-finger-margin>outer):
         grasp_xy=rim[:2];mode='rim'
@@ -280,10 +318,13 @@ def correction_suffix(profile,state,offset,remaining):
 def verified(action,scene,state):
     """The colour marker present before a drop cannot verify that a second ring was added."""
     if not action or scene.get('obs_id')==action['obs_id']:return None
+    if (action['skill']=='move_to' and scene.get('held_transport',{}).get('at_hover') is True and
+        scene['held_transport'].get('peg_id')==action.get('peg_id') and scene.get('held_ring_id')==action.get('ring_id') and
+        state.get('gripping') is True):return 'move_to'
     if action['skill']=='pick':
         if state.get('gripping') is not True:return None
         rings=[r for r in scene.get('rings',[]) if r.get('id')==scene.get('held_ring_id') and r.get('location')=='held']
-        if len(rings)==1 and rings[0].get('color')==action['color']:return 'pick'
+        if len(rings)==1 and rings[0].get('color')==action['color'] and rings[0]['id']==action['ring_id']:return 'pick'
     if action['skill']=='place' and state.get('gripping') is False:
         if any(r.get('id')==action['ring_id'] and r.get('location')=='loose' for r in scene.get('rings',[])):return None
         matches=[p for p in scene.get('pegs',[]) if p.get('id')==action['peg_id'] and p.get('color')==action['color']]

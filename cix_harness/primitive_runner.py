@@ -42,7 +42,7 @@ def decide(port,model,goal,obs,history):
       {'type':'text','text':json.dumps({'goal':goal,'state':state,
         'available_skills':obs.get('primitive_skills',[s for s in SKILLS if s!='clear_view']),
         'recovery':obs.get('recovery',{}),'recent':history[-3:],
-        **({'ring_scene':obs['ring_scene'],'ring_task':'Pick loose rings only. Select the matching marked peg by its tip. Verify using verified_skill.'}
+        **({'ring_scene':obs['ring_scene'],'ring_task':'Pick loose rings only. Select the matching marked peg by its tip. When held_transport is configured and the task requires placement, use move_to on that tip until at_hover, then place. Verify using verified_skill.'}
            if 'ring_scene' in obs else {})},ensure_ascii=False,separators=(',',':'))},
       {'type':'image_url','image_url':{'url':obs['image']}}]}],
       'response_format':{'type':'json_schema','json_schema':{'name':'primitive_decision','strict':True,'schema':SCHEMA}}}

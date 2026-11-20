@@ -87,7 +87,9 @@ class PrimitiveService:
         robot.primitive_moveit_guard = self.moveit
         self.profile=validate_profile(robot.cfg['primitives'])
         if 'ring_peg' in self.profile:
-            self.skills=tuple(s for s in self.skills if s in ('pick','place','clear_view','retreat','home'))
+            allowed_ring={'pick','place','clear_view','retreat','home'}
+            if 'transport' in self.profile['ring_peg']:allowed_ring.add('move_to')
+            self.skills=tuple(s for s in self.skills if s in allowed_ring)
         self.ring_planned=None
         self.ring_last_action=None
         self.observation=None
@@ -124,8 +126,14 @@ class PrimitiveService:
         self.observation=(obs,time.monotonic(),depth.copy())
         if 'ring_peg' in self.profile:
             obs['ring_scene']=self._ring_scene(obs['state'],obs['id'])
-            obs['ring_scene']['verified_skill']=ring_peg.verified(self.ring_last_action,obs['ring_scene'],obs['state'])
             obs['ring_scene']['missed_ring']=ring_peg.missed_ring(self.ring_last_action,obs['ring_scene'],obs['state'])
+            if 'transport' in self.profile['ring_peg']:
+                from .ring_transport import at_hover
+                scene=obs['ring_scene']
+                peg=next((row for row in scene.get('pegs',[]) if row['id']==self.profile['ring_peg'].get('destination_peg_id')),None)
+                scene['held_transport']={'skill':'move_to','peg_id':self.profile['ring_peg'].get('destination_peg_id'),
+                    'at_hover':bool(peg and peg.get('tip_base_m') and obs['state'].get('gripping') and at_hover(self.profile,obs['state'],peg))}
+            obs['ring_scene']['verified_skill']=ring_peg.verified(self.ring_last_action,obs['ring_scene'],obs['state'])
         tcp=tcp_from_eef(obs['state']['eef_m'],obs['state']['eef_xyzw'],self.profile)
         views=self.profile.get('observation_tcp_m',[])
         obs['recovery']={'view_indices':[i for i,v in enumerate(views) if math.dist(tcp,v)>=.02],
@@ -136,18 +144,32 @@ class PrimitiveService:
         import pyrealsense2 as rs
         obs['workspace']=workspace_metadata(self.profile,self.robot.camera.intrinsics,rs.rs2_project_point_to_pixel)
 
-    def _ring_scene(self,state,obs_id):
+    def _ring_scene(self,state,obs_id,captured=None,settled_since=None):
         from .ring_perception import observe_ring_scene
         c=self.robot.camera
         measured=observe_ring_scene(c.last_color,c.last_depth,c.intrinsics,self.profile,
                                     self.profile['ring_peg']['perception'],state)
+        if (state.get('gripping') is True and not measured.get('held_ring_id')
+                and 'wrist_alignment' in self.profile['ring_peg'] and hasattr(self.robot,'wrist_condition')):
+            from .ring_wrist_held import held_ring
+            if settled_since is None:settled_since=getattr(self.robot,'wrist_after_motion',-math.inf)
+            try:
+                pixels,meta=self._fresh_ring_wrist(state,time.monotonic() if captured is None else captured,settled_since)
+            except ring_peg.RingGeometryError as error:
+                measured['wrist_held_rejection']=str(error)
+            else:
+                ring=held_ring(pixels,state,self.profile,measured,self.ring_last_action)
+                measured['wrist_held_observation']=meta
+                if ring is not None:
+                    ident=ring['id']
+                    measured['rings']=[v for v in measured['rings'] if v['id']!=ident]+[ring]
+                    measured['missing']=[v for v in measured['missing'] if v['id']!=ident]
+                    measured['held_ring_id']=ident
         return dict(measured,obs_id=obs_id,frame_number=c.last_number,resolution=[c.intrinsics.width,c.intrinsics.height])
 
-    def _ring_wrist_alignment(self,scene,state,peg_id,captured,settled_since):
+    def _fresh_ring_wrist(self,state,captured,settled_since):
         from cv_bridge import CvBridge
-        from .ring_wrist import measure
         robot=self.robot;profile=self.profile
-        ring,peg=ring_peg.resolve(profile,scene,state,'place',release_peg_id=peg_id)
         settings=profile['ring_peg']['wrist_alignment'];max_age=settings.get('max_frame_age_s',1.25)
         def current():
             sample=robot.wrist_state
@@ -163,10 +185,15 @@ class PrimitiveService:
                 raise ring_peg.RingGeometryError('No fresh post-motion wrist frame for alignment')
             received,message=robot.wrist_state
         pixels=CvBridge().imgmsg_to_cv2(message,desired_encoding='bgr8')
-        result=measure(pixels,state,ring,peg,settings)
-        return dict(result,frame_number=int(message.header.seq),ros_stamp_s=float(message.header.stamp.to_sec()),
+        return pixels,dict(frame_number=int(message.header.seq),ros_stamp_s=float(message.header.stamp.to_sec()),
                     source_age_s=float(robot.ros.Time.now().to_sec()-message.header.stamp.to_sec()),
                     arrival_age_s=time.monotonic()-received,frame_id=message.header.frame_id)
+
+    def _ring_wrist_alignment(self,scene,state,peg_id,captured,settled_since):
+        from .ring_wrist import measure
+        ring,peg=ring_peg.resolve(self.profile,scene,state,'place',release_peg_id=peg_id)
+        pixels,meta=self._fresh_ring_wrist(state,captured,settled_since)
+        return dict(measure(pixels,state,ring,peg,self.profile['ring_peg']['wrist_alignment']),**meta)
 
     def prepare(self,obs_id,skill,uv=None,target_base_m=None,view_index=0):
         started=time.monotonic()
@@ -207,11 +234,11 @@ class PrimitiveService:
         if timings is None:timings={}
         ring_objects=None;ring_detail=None
         with _measure(timings,'grounding'):
-            if 'ring_peg' in p and skill in ('pick','place'):
+            if 'ring_peg' in p and skill in ('pick','place','move_to'):
                 if uv is None or target_base_m is not None:raise ring_peg.RingGeometryError('Select the ring or peg in the current D455 observation')
                 scene=obs['ring_scene']
                 if scene['obs_id']!=obs_id:raise ring_peg.RingGeometryError('Ring geometry belongs to another observation')
-                ring_objects=ring_peg.resolve(p,scene,obs['state'],skill,uv)
+                ring_objects=ring_peg.resolve(p,scene,obs['state'],'place' if skill=='move_to' else skill,uv)
                 ring,peg=ring_objects
                 target=ring['rim_grasp_base_m'] if skill=='pick' else peg['tip_base_m']
             else:target=(ground_pixel(uv,depth,r.camera.intrinsics,p) if uv is not None else target_base_m)
@@ -226,10 +253,22 @@ class PrimitiveService:
                 with _measure(timings,'skill_plan'):
                     if ring_objects is None:
                         stages=plan(skill,obs['state'],candidate,target,view_index)
+                    elif skill=='move_to':
+                        from . import ring_transport
+                        if ring_transport.at_hover(candidate,obs['state'],peg):
+                            raise ring_peg.RingGeometryError('Held ring already at matching peg hover; inspect for place')
+                        stages=ring_transport.stages(candidate,obs['state'],peg)
+                        contact=ring_transport.hover(candidate,peg)
+                        ring_detail={'ring_id':ring['id'],'peg_id':peg['id'],'color':ring_peg.color(ring),'held_transfer':True,
+                                     'inner_radius_m':ring.get('inner_radius_m'),'outer_radius_m':ring.get('outer_radius_m')}
                     else:
                         if skill=='pick':
                             contact,ring_detail=ring_peg.pick_geometry(candidate,scene,ring,candidate['tool_orientation_xyzw'])
-                        else:contact,ring_detail=ring_peg.release_geometry(candidate,scene,obs['state'],ring,peg)
+                        else:
+                            if 'transport' in candidate['ring_peg']:
+                                from .ring_transport import release_profile
+                                candidate=release_profile(candidate,obs['state'],peg)
+                            contact,ring_detail=ring_peg.release_geometry(candidate,scene,obs['state'],ring,peg)
                         stages=plan(skill,obs['state'],candidate,target,view_index,ring_contact_tcp=contact)
                 operations=sum(s['kind'] in ('move','gripper') for s in stages)
                 if r.motion_remaining is None or r.motion_remaining<operations:
@@ -337,6 +376,16 @@ class PrimitiveService:
                 try:solution=r.continuous_ik.solve(point,seed,observed)
                 except IKUnreachableError as error:raise IKPreflightError(str(error)) from error
                 path.append((solution,point));seed=solution;observed=pose
+            if skill=='move_to' and holding and p.get('ring_peg',{}).get('transport'):
+                from .moveit_guard import segment_samples
+                from .ring_transport import check_payload
+                boxes=r.cfg['planning'].get('moveit_scene_boxes',[])
+                if not boxes:raise ring_peg.RingGeometryError('Missing measured scene boxes for held ring route')
+                phase=stage_phase(stages,stage_index,skill)
+                for joint_state in segment_samples(curve_initial,path,r.cfg,phase):
+                    pose=r.continuous_ik.forward(joint_state);pos=pose['position'];ori=pose['orientation']
+                    tcp=tcp_from_eef([pos.x,pos.y,pos.z],[ori.x,ori.y,ori.z,ori.w],p)
+                    check_payload(tcp,boxes,p['ring_peg']['transport']['payload_radius_m'])
             if r.cfg.get('planning',{}).get('trajectory_mode')=='continuous':
                 phase=stage_phase(stages,stage_index,skill)
                 meta=self._check_curve(curve_initial,path,holding,departing,phase)
@@ -449,7 +498,7 @@ class PrimitiveService:
                         with _measure(stage_timings,'ring_release_check',timings):
                             if not self.ring_planned or self.ring_planned[0]!=token:raise RuntimeError('Matching ring plan required')
                             _,captured,frame=r.camera.capture();measured_state=r.read_state()
-                            scene=self._ring_scene(measured_state,'release-'+str(frame))
+                            scene=self._ring_scene(measured_state,'release-'+str(frame),captured,settled_since)
                             try:
                                 if 'wrist_alignment' in p['ring_peg']:
                                     try:

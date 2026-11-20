@@ -208,7 +208,8 @@ class TaskExecutive:
 
     def can_verify(self, obs):
         if self.current and self.current.get('arm',obs.get('state',{}).get('arm'))!=obs.get('state',{}).get('arm'):return False
-        if ('ring_scene' in obs and self.current and self.current['skill'] in ('pick','place') and
+        if ('ring_scene' in obs and self.current and (self.current['skill'] in ('pick','place') or
+                (self.current['skill']=='move_to' and 'held_transport' in obs['ring_scene'])) and
                 obs['ring_scene'].get('verified_skill')!=self.current['skill']):return False
         if self.backend=='code':return self.code_completed and obs['id']!=self.last_action_obs
         if self.mode != 'live' or not self.current: return False

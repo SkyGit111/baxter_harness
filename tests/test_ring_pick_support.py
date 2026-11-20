@@ -16,7 +16,8 @@ class SurveyedFingertipContact(unittest.TestCase):
         }
         self.ring.update(local_table_z_m=.030, local_table_upper_z_m=.051, local_table_depth_count=500,
                          local_support_reference_verified=True, local_support_reference_evidence={
-                             'verified': True, 'survey_frame_ids': [2, 3, 4, 5, 6], 'current_surface_shift_m': 0.})
+                             'verified': True, 'survey_frame_ids': [2, 3, 4, 5, 6], 'current_surface_shift_m': 0.,
+                             'jaw_axis_base_xy': [1., 0.]})
 
     def contact(self, quat=None):
         return pick_geometry(self.profile, self.scene, self.ring, quat or self.state['eef_xyzw'])
@@ -43,6 +44,13 @@ class SurveyedFingertipContact(unittest.TestCase):
             self.contact()
 
     def test_even_highest_measured_ring_top_below_safe_fingers(self):
-        self.profile['ring_peg']['local_pick_support']['swept_table_upper_z_m'] = .040
+        self.profile['ring_peg']['local_pick_support']['swept_table_upper_z_m'] = .041
         with self.assertRaisesRegex(RingGeometryError, 'No fingertip contact depth'):
             self.contact()
+
+    def test_contact_upper_band_may_yield_a_clean_miss_without_lowering_the_table_floor(self):
+        self.profile['ring_peg']['local_pick_support']['swept_table_upper_z_m'] = .0395
+        contact, evidence = self.contact()
+        self.assertGreater(contact[2], .041)
+        self.assertGreaterEqual(evidence['support_survey']['highest_fingertip_at_lowest_endpoint_m'], .040)
+        self.assertTrue(evidence['support_survey']['empty_grasp_possible'])

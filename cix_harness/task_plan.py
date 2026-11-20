@@ -98,6 +98,8 @@ def workspace_context(obs, context):
     if 'ring_scene' in obs:
         result['ring_scene']=copy.deepcopy(obs['ring_scene'])
         result['ring_task']='Pick only a loose ring. Use its current center or rim landmark for identity. Place on the peg marked by the same colour using its tip landmark. Do not move the original peg markers. Check verified_skill on a fresh observation.'
+        if 'held_transport' in obs['ring_scene']:
+            result['ring_task']+=' For a placement goal, insert move_to at the matching peg tip between pick and place. It carries the ring to a hover without opening. If already held, start there. Once held_transport.at_hover is true, inspect and place.'
     return result
 
 

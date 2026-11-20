@@ -1,3 +1,4 @@
+import math
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -105,3 +106,44 @@ class RingPerceptionTest(unittest.TestCase):
         self.assertFalse(check_reference(geom,color,moved,ref)['verified'])
         depth[:]=.996
         self.assertFalse(check_reference(geom,color,ring,ref)['verified'])
+
+    def test_wrist_reobserves_held_annulus_when_main_view_is_occluded(self):
+        from cix_harness.ring_wrist_held import held_ring
+        from cix_harness.ring_peg import verified
+        color=np.full((160,160,3),35,np.uint8)
+        cv2.circle(color,(80,80),45,(20,45,235),-1)
+        cv2.circle(color,(80,80),11,(40,40,40),-1)
+        cfg={'resolution':[160,160],'K':[[400.,0.,80.],[0.,400.,80.],[0.,0.,1.]],'D':[0.]*5,
+             'eef_T_optical':{'xyz':[0.,0.,-.14],'xyzw':[0.,0.,0.,1.]},
+             'ring_hsv_ranges':{'red':[[[0,70,40],[10,255,255]]]},
+             'surveyed_ring_sizes':{'r':{'inner_radius_m':.004,'outer_radius_m':.016,'outer_radius_uncertainty_m':.001}}}
+        profile={'table_plane':{'normal':[0.,0.,1.],'offset':0.},'tcp_offset_tool_m':[0.,0.,0.],
+                 'ring_peg':{'source_ring_id':'r','wrist_alignment':cfg,'perception':{
+                     'rings':[{'id':'r','color':'red','loose_candidate':True}]}}}
+        state={'gripping':True,'eef_m':[0.,0.,.10],'eef_xyzw':[1.,0.,0.,0.]}
+        scene={'rings':[],'obs_id':'new'}
+        row=held_ring(color,state,profile,scene)
+        self.assertEqual(row['location'],'held')
+        self.assertLess(math.dist(row['center_base_m'],state['eef_m']),.01)
+        scene.update(held_ring_id='r',rings=[row])
+        self.assertEqual(verified({'obs_id':'old','skill':'pick','ring_id':'r','color':'red'},scene,state),'pick')
+        self.assertIsNone(held_ring(color,dict(state,gripping=False),profile,scene))
+        self.assertIsNone(held_ring(color,state,profile,{'rings':[{'id':'r','location':'loose'}]}))
+        from cix_harness.primitive_service import PrimitiveService
+        service=PrimitiveService.__new__(PrimitiveService)
+        camera=SimpleNamespace(last_color=color,last_depth=self.depth,last_number=20,
+                               intrinsics=SimpleNamespace(width=160,height=160))
+        service.robot=SimpleNamespace(camera=camera,wrist_condition=None)
+        service.profile=profile
+        service.ring_last_action=None
+        missing=[{'id':'r','kind':'ring','detected_candidates':0},
+                 {'id':'another','kind':'ring','detected_candidates':0}]
+        with patch('cix_harness.ring_perception.observe_ring_scene',
+                   return_value={'rings':[],'held_ring_id':None,'missing':missing}), \
+                patch.object(service,'_fresh_ring_wrist',return_value=(color,{'frame_number':34})):
+            observed=service._ring_scene(state,'after')
+        self.assertEqual(observed['held_ring_id'],'r')
+        self.assertEqual(observed['missing'],[missing[1]])
+        self.assertEqual(observed['wrist_held_observation']['frame_number'],34)
+        cv2.circle(color,(80,80),12,(20,45,235),-1)
+        self.assertIsNone(held_ring(color,state,profile,scene))

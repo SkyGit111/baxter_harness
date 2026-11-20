@@ -108,11 +108,12 @@ class PreflightTests(unittest.TestCase):
         (self.root/'cix_harness').mkdir();(self.root/'cix_harness'/'one.py').write_text('private unstaged content\n')
         (self.root/'cix_harness'/'untracked.py').write_text('x=2\n')
         rows = b'100644 aaaaa 0\tcix_harness/one.py\0' + b'100644 bbbbb 0\t.local/chatgpt-session.json\0'
-        with patch.object(bundle.subprocess,'run',side_effect=[NS(stdout=rows),NS(stdout=b'indexed=1\n')]) as git:
+        with patch.object(bundle.subprocess,'run',side_effect=[NS(stdout=rows),NS(stdout=b'aaaaa blob 10\nindexed=1\n\n')]) as git:
             selected=bundle.tracked_sources(self.root)
         self.assertEqual(set(selected),{'cix_harness/one.py'})
         self.assertEqual(selected['cix_harness/one.py'],b'indexed=1\n')
-        self.assertEqual(git.call_args_list[1].args[0][-3:],['cat-file','blob','aaaaa'])
+        self.assertEqual(git.call_args_list[1].args[0][-2:],['cat-file','--batch'])
+        self.assertEqual(git.call_args_list[1].kwargs['input'],b'aaaaa\n')
 
     def test_site_bundle_is_separate_and_rejects_credential_keys(self):
         path=self.root/'baxter.local.json';path.write_text(json.dumps({'primitives':{'calibrated':False}}))

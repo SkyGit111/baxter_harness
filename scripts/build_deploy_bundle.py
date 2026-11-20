@@ -5,6 +5,7 @@ must first be reviewed and staged; this command never stages or commits files.
 """
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -56,7 +57,7 @@ def validate_source(name, raw):
 
 def tracked_sources(root):
     output = subprocess.run(['git', '-C', str(root), 'ls-files', '--stage', '-z'], check=True, capture_output=True).stdout
-    result = {}
+    entries = []
     for entry in output.decode('utf-8').split('\0'):
         if not entry:continue
         metadata, name = entry.split('\t', 1)
@@ -64,10 +65,18 @@ def tracked_sources(root):
         if stage != '0':raise ValueError('Resolve Git index conflicts before bundling')
         if not allowed_source(name):continue
         if mode not in ('100644', '100755'):raise ValueError('Source selection includes a symlink or submodule')
-        # Read the exact blob named by the index snapshot, not current disk bytes.
-        raw = subprocess.run(['git', '-C', str(root), 'cat-file', 'blob', digest], check=True, capture_output=True).stdout
-        result[name] = validate_source(name, raw)
-    if not result:raise ValueError('No tracked source files selected')
+        entries.append((name,digest))
+    if not entries:raise ValueError('No tracked source files selected')
+    # One Git process reads the exact indexed objects, including binary fixtures.
+    request=''.join(digest+'\n' for _,digest in entries).encode('ascii')
+    batch=subprocess.run(['git','-C',str(root),'cat-file','--batch'],input=request,check=True,capture_output=True)
+    objects=io.BytesIO(batch.stdout);result={}
+    for name,digest in entries:
+        oid,kind,length=objects.readline().decode('ascii').split()
+        if oid!=digest or kind!='blob':raise ValueError('Unexpected indexed Git object: '+name)
+        size=int(length);raw=objects.read(size)
+        if len(raw)!=size or objects.read(1)!=b'\n':raise ValueError('Incomplete indexed Git blob: '+name)
+        result[name]=validate_source(name,raw)
     return result
 
 
