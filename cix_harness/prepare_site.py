@@ -28,9 +28,13 @@ def build_candidate_profiles(template,geometry,tcp_fits=None,*,transit_speed=Non
         raise ValueError('TCP fits must be keyed by left/right arm')
     if grasp_symmetry not in (None, 'square', 'fixed'):
         raise ValueError('Choose square or fixed grasp symmetry')
+    paired=template.get('arms')
+    if paired is not None and (not isinstance(paired,dict) or set(paired)!={'left','right'} or
+                               any(paired[arm].get('arm')!=arm for arm in ('left','right'))):
+        raise ValueError('Expected distinct left and right template profiles')
     output={}
     for arm in ('left','right'):
-        cfg=copy.deepcopy(template);p=cfg['primitives']
+        cfg=copy.deepcopy(paired[arm] if paired is not None else template);p=cfg['primitives']
         cfg.update(arm=arm,commissioned=False,commissioning_scope='supervised_primitive_task')
         # Apply to the new, uncommissioned profiles only. Reusing a measured
         # template must not silently increase any existing stage speed.
@@ -65,7 +69,7 @@ def build_candidate_profiles(template,geometry,tcp_fits=None,*,transit_speed=Non
         p.update(calibrated=False,table_plane={'normal':list(plane['normal']),'offset':plane['offset']},
                  table_polygon_base_xy=copy.deepcopy(polygon),camera_to_base_xyzw=list(q),
                  camera_to_base_translation_m=list(translation),observation_tcp_m=[])
-        if arm=='right':
+        if arm=='right' and paired is None:
             p['tcp_offset_tool_m']=[0.,0.,.0155]
             p['tool_orientation_xyzw']=[1.,0.,0.,0.]
         fit=tcp_fits.get(arm)
@@ -104,7 +108,8 @@ def build_candidate_profiles(template,geometry,tcp_fits=None,*,transit_speed=Non
             'status':'offline_candidate_not_commissioned','arm':arm,
             'table_boundary_verified':False,'table_plane_verified':False,'tcp_verified':False,
             'ik_paths_verified':False,'inter_arm_clearance_verified':False,
-            'tcp_source':'prior left axial estimate' if arm=='left' else 'rough right axial estimate 15.5 mm; full XYZ pending',
+            'tcp_source':('same-arm prior from dual template; current independent check pending' if paired is not None else
+                          'prior left axial estimate' if arm=='left' else 'rough right axial estimate 15.5 mm; full XYZ pending'),
             'home_source':'convex interior candidate; not an observed or IK-validated parking pose',
             'suggested_home_tcp_m':suggested_home,
             'survey_source':str(geometry.get('source','supplied offline geometry')),
@@ -143,12 +148,14 @@ def main(argv=None):
     args=parser.parse_args(argv)
     fits={arm:json.loads(path.read_text(encoding='utf-8')) for arm in ('left','right')
           if (path:=getattr(args,arm+'_tcp_fit')) is not None}
-    profiles=build_candidate_profiles(json.loads(args.template.read_text(encoding='utf-8')),
+    template=json.loads(args.template.read_text(encoding='utf-8'))
+    profiles=build_candidate_profiles(template,
                                       json.loads(args.geometry.read_text(encoding='utf-8')),fits,
                                       transit_speed=args.transit_speed_rad_s,contact_speed=args.contact_speed_rad_s,
                                       grasp_symmetry=args.grasp_symmetry)
     from .dual_bridge import build_dual_candidate
-    dual=build_dual_candidate(profiles['left'],profiles['right'],args.motion_budget,args.lease_seconds)
+    dual=build_dual_candidate(profiles['left'],profiles['right'],args.motion_budget,args.lease_seconds,
+                              template.get('inter_arm_clearance'))
     args.output_dir.mkdir(parents=True,exist_ok=True)
     for arm,cfg in dual['arms'].items():
         path=args.output_dir/(arm+'-fulltable.local.json')

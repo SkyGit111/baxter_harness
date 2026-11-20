@@ -191,6 +191,18 @@ class CandidateProfiles(unittest.TestCase):
             self.assertGreater(cfg['primitives']['tcp_workspace_max_m'][1]-cfg['primitives']['tcp_workspace_min_m'][1],1.)
         self.assertNotEqual(out['left']['primitives']['tool_orientation_xyzw'],out['right']['primitives']['tool_orientation_xyzw'])
         self.assertEqual(out['right']['primitives']['tcp_offset_tool_m'],[0,0,.0155])
+        # A previously tuned dual installation must retain each arm's specific
+        # tool geometry and speed when the camera survey is replaced.
+        dual=copy.deepcopy(out)
+        dual['right']['primitives']['tcp_offset_tool_m']=[-.004,-.006,.018]
+        dual['right']['joint_speed_rad_s']=.02
+        dual['right']['joint_speed_by_phase_rad_s']={'contact':.015}
+        rebuilt=build_candidate_profiles({'arms':dual},geometry)
+        self.assertEqual(rebuilt['right']['primitives']['tcp_offset_tool_m'],[-.004,-.006,.018])
+        self.assertEqual(rebuilt['right']['joint_speed_rad_s'],.02)
+        self.assertFalse(rebuilt['right']['primitives']['calibrated'])
+        with self.assertRaisesRegex(ValueError,'distinct left and right'):
+            build_candidate_profiles({'arms':{'left':dual['right'],'right':dual['left']}},geometry)
         out['left']['primitives']['table_plane']['offset']=2
         self.assertEqual(out['right']['primitives']['table_plane']['offset'],.25)
         # A new field profile built from an old measured cap keeps that cap
