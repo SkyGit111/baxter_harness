@@ -123,7 +123,8 @@ class Baxter:
         # The SDK caches the last pose and joints even after their publishers stop.
         self.state_times = {}
         self.state_stamps = {}
-        self.capture_body_joints = cfg.get('planning', {}).get('collision_backend') == 'moveit'
+        planning = cfg.get('planning')
+        self.capture_body_joints = isinstance(planning, dict) and planning.get('collision_backend') == 'moveit'
         self.body_joint_sample = None
         self.wrist_state = None
         self.controller_feedback = {}

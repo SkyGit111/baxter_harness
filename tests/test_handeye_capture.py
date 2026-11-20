@@ -11,9 +11,34 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from cix_harness.handeye_capture import EndpointReader, capture, gate_pose, pose_difference, refine_tag_edges, stationary, tag_from_depth
+from cix_harness.handeye_capture import load_volume_checkpoint, volume_capture_plan
 
 
 class HandeyeCapture(unittest.TestCase):
+    def test_volume_resume_preserves_frozen_groups_camera_and_observation_ids(self):
+        with TemporaryDirectory() as folder:
+            root=Path(folder)
+            pose={'xyz':[0.,0.,0.], 'xyzw':[0.,0.,0.,1.]}
+            rows=[{'id':str(i),'cell':[i%3,0,0],'base_T_effector':dict(pose,xyz=[i*.04,0,0]),
+                   'split':'holdout' if i%5==0 else 'train'} for i in range(30)]
+            plan=root/'plan.json'
+            plan.write_text(json.dumps({'poses':rows}))
+            poses,digest,counts=volume_capture_plan(plan)
+            self.assertEqual(counts,{'train':24,'holdout':6})
+            manifest={'volume_plan_sha256':digest,'camera_serial':'abc'}
+            (root/'manifest.json').write_text(json.dumps(manifest))
+            holdout=[{'drive_pose_id':'0','drive_target_base_T_effector':np.eye(4).tolist(),'frame_id':'pose-001',
+                      'volume_plan_sha256':digest,'volume_split':'holdout','volume_cell':[0,0,0]}]
+            for suffix in ('.jpg','.npz'):(root/('pose-001'+suffix)).touch()
+            (root/'train.json').write_text('[]')
+            (root/'holdout.json').write_text(json.dumps(holdout))
+            self.assertEqual(load_volume_checkpoint(root,manifest,poses)['holdout'],holdout)
+            with self.assertRaisesRegex(ValueError,'changed'):
+                load_volume_checkpoint(root,dict(manifest,camera_serial='other'),poses)
+            (root/'train.json').write_text(json.dumps(holdout))
+            with self.assertRaisesRegex(ValueError,'Inconsistent'):
+                load_volume_checkpoint(root,manifest,poses)
+
     def scene(self, roll=0.):
         fx,fy,px,py=230.,235.,100.,80.
         tilt=.30

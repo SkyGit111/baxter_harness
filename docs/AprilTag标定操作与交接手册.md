@@ -519,10 +519,23 @@ python3 -m cix_harness.handeye_drive --tool-radius-m "$R" --clearance-m "$D_TOOL
 
 预检通过后，使采集程序使用一个全新的目录 `RUN` 和 `--pose-gate "$RUN/request.json"`，采集数量与驱动的 `--count` 对应。待空的 `train.json` 与 `holdout.json` 出现，使用相同参数启动驱动，添加 `--drive --capture-dir "$RUN"`，并将 `--output` 改为新的执行日志。驱动等待当前目标 ID 对应的静止观测写入才前进。停止或掉线后用新观测检查现场。
 
-若手臂伸展导致原地侧倾不可行，可在上述预检和随后执行的命令中都添加 `--wrist-lattice --count 8`，采集端对应 `--train 5 --holdout 3`。驱动沿抓手朝向组合轴向转动和较小的侧倾，允许 TCP 在初始点周围 16 mm 内补偿，下移最多 3 mm。日志中的 `wrist_lattice` 记录通过端点检查的个数、可区分姿态数和拒绝统计。它选择两两至少相隔 15° 的姿态，对每条实际执行的关节插值重新做碰撞、限位和净空检查。姿态数量、训练转轴激励及独立留出误差分别决定这组数据能否用于求解。
+若仅需诊断固定夹具、标签识别和采样门控，可在上述预检和随后执行的命令中都添加 `--wrist-lattice --count 8`，采集端对应 `--train 5 --holdout 3`。其 TCP 局部移动至多 16 mm，正式标定另行采集覆盖空间的 30 个姿态。
+
+### 正式标定的工作体积与独立留出
+
+先用当天实测的可见可达范围填入 `bounds.json`。其中 `frame` 为 `base`，`units` 为 `m`，`lower`、`upper` 是标志物中心在机器人基坐标系中的三轴边界。`reference.json` 给出标签正对相机时实测的 `base_T_effector` 及工具上的标记安装偏移 `effector_T_tag`。也可用 `effector_tag_center_m` 填入在末端坐标系中量得的标签中心三元向量。这个偏移用于将目标标签位置换算为腕姿。
+
+```bash
+python3 -m cix_harness.handeye_volume plan --bounds bounds.json --reference reference.json --output volume-plan.json
+```
+
+程序将标志物工作体积分为 3×2×2 个区域，每区预设两处训练位置，另在交错的六个区域各预留一个独立位置。每个位置指定右手朝向。先预检全部路径、关节和场景，再用同一份计划在采集端运行 `--volume-plan volume-plan.json --train 24 --holdout 6`。运行中的 `drive_pose_id` 应等于计划对应的 ID。采集文件保留原始图像、对齐深度、实测腕姿和相机坐标系里的标签位姿。
+
+验收使用实测标志物中心。训练位置三轴跨度下限为 180、160、100 mm，独立留出为 100、70、45 mm。每对实测标签中心相距至少 25 mm。报告含每个标记的实际分区、三轴跨度、深度点云的三个主轴宽度、腕姿跨度和归一化图像中心范围；同时检查每个训练区的两处视角、整体转动轴多样性和留出误差。空间范围不足时，可结合失败的轴或区域重新设计后续采集批次。正式外参导出要求捕获清单保存相同计划的 SHA-256。
 
 ```bash
 python3 -m cix_harness.handeye --fit "$RUN/train.json" --holdout "$RUN/holdout.json" \
+  --volume-plan volume-plan.json --manifest "$RUN/manifest.json" \
   --max-mm "$TASK_MM" --max-deg "$TASK_DEG" --output "$RUN/handeye.json" \
   --optical-frame "$COLOR_OPTICAL_FRAME" --extrinsics-output "$RUN/extrinsics.json"
 ```

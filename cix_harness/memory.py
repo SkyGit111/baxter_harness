@@ -14,7 +14,7 @@ def geometry_fingerprint(cfg):
     geometry['primitives'] = {k: v for k, v in cfg.get('primitives', {}).items()
                               if k not in ('calibrated', 'notes')}
     planning = cfg.get('planning', {})
-    if planning.get('collision_backend') == 'moveit':
+    if isinstance(planning, dict) and planning.get('collision_backend') == 'moveit':
         geometry['moveit_required_world_objects'] = sorted(planning.get('moveit_required_world_objects', []))
     return hashlib.sha256(json.dumps(geometry, sort_keys=True, allow_nan=False).encode()).hexdigest()[:24]
 

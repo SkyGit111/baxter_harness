@@ -156,7 +156,9 @@ def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('fit','holdout','output'):p.add_argument('--'+name,required=True,type=Path)
     p.add_argument('--camera',type=Path,help='Check an existing easy_handeye eye-on-base YAML, or a base_T_camera pose JSON')
-    p.add_argument('--extrinsics-output',type=Path,help='Write a table_survey candidate only when the rigid-pose check passes')
+    p.add_argument('--extrinsics-output',type=Path,help='Export the candidate after rigid-pose and formal spatial checks pass')
+    p.add_argument('--volume-plan',type=Path,help='Frozen marker-volume plan with at least 24 training and 6 holdout positions')
+    p.add_argument('--manifest',type=Path,help='Capture manifest including the plan hash and actual color intrinsics')
     p.add_argument('--optical-frame',help='D455 aligned color CameraInfo frame for the exported transform')
     p.add_argument('--max-mm',required=True,type=float)
     p.add_argument('--max-deg',required=True,type=float)
@@ -165,6 +167,10 @@ def main(argv=None):
     args=p.parse_args(argv)
     if args.extrinsics_output and (not args.optical_frame or args.optical_frame.strip('/')=='base'):
         p.error('--extrinsics-output requires the observed --optical-frame')
+    if args.extrinsics_output and not args.volume_plan:
+        p.error('--extrinsics-output requires a preassigned --volume-plan and its capture manifest')
+    if args.volume_plan and args.holdout_includes_fit:
+        p.error('Volume captures store separate explicitly assigned fit and holdout records')
     camera=None
     if args.camera:
         raw=load(args.camera)
@@ -183,7 +189,8 @@ def main(argv=None):
             camera={'xyz':raw['camera_to_base_translation_m'],'xyzw':raw['camera_to_base_xyzw']}
         else:
             camera=raw.get('base_T_camera',raw)
-    fit, holdout = pose_arrays(load(args.fit)), pose_arrays(load(args.holdout))
+    fit_data,holdout_data=load(args.fit),load(args.holdout)
+    fit,holdout=pose_arrays(fit_data),pose_arrays(holdout_data)
     if args.holdout_includes_fit:
         if len(holdout)<=len(fit) or not all(np.allclose(a,b,rtol=0.,atol=1e-10) for a,b in zip(fit,holdout)):
             p.error('Cumulative snapshot must start with the complete, identical fit set and include new poses')
@@ -191,19 +198,32 @@ def main(argv=None):
     report=solve(fit,holdout,args.max_mm,args.max_deg,camera,args.min_excitation_deg)
     inputs={'fit':args.fit,'holdout':args.holdout}
     if args.camera:inputs['camera']=args.camera
+    if args.volume_plan:
+        from .handeye_volume import audit_volume
+        manifest_path=args.manifest or args.fit.with_name('manifest.json')
+        manifest=load(manifest_path)
+        coverage=audit_volume(load(args.volume_plan),fit_data,holdout_data,report['base_T_camera'],manifest)
+        plan_digest=hashlib.sha256(args.volume_plan.read_bytes()).hexdigest()
+        if manifest.get('volume_plan_sha256')!=plan_digest:
+            coverage['failures'].append('Capture manifest does not attest to the supplied volume plan hash')
+            coverage['passed']=False
+        report['workspace_coverage']=coverage
+        inputs.update(volume_plan=args.volume_plan,capture_manifest=manifest_path)
+    passed=report['consistency_passed'] and report.get('workspace_coverage',{}).get('passed',True)
+    report['accepted']=passed
     report['input_sha256']={key:hashlib.sha256(path.read_bytes()).hexdigest() for key,path in inputs.items()}
     with args.output.open('x',encoding='utf8') as stream:
         json.dump(report,stream,ensure_ascii=False,indent=2,allow_nan=False)
-    if report['consistency_passed'] and args.extrinsics_output:
+    if passed and args.extrinsics_output:
         pose=report['base_T_camera']
         survey={'from_frame':args.optical_frame,'to_frame':'base','units':'m',
                 'translation_m':pose['xyz'],'xyzw':pose['xyzw'],'source':args.output.name,
                 'input_sha256':report['input_sha256'],'commissioned':False}
         with args.extrinsics_output.open('x',encoding='utf8') as stream:
             json.dump(survey,stream,ensure_ascii=False,indent=2,allow_nan=False)
-    print(json.dumps({'consistency_passed':report['consistency_passed'],
+    print(json.dumps({'consistency_passed':report['consistency_passed'],'accepted':passed,
                       'holdout_max_mm':report['holdout']['max_mm'],'holdout_max_deg':report['holdout']['max_deg']}))
-    return 0 if report['consistency_passed'] else 2
+    return 0 if passed else 2
 
 
 if __name__=='__main__':raise SystemExit(main())

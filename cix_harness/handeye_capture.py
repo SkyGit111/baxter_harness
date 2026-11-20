@@ -1,6 +1,7 @@
 """Capture stationary eye-on-base samples from a D455 and Baxter's right endpoint (read-only)."""
 import argparse
 from collections import deque
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -307,13 +308,61 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def volume_capture_plan(path):
+    from .handeye import transform
+    raw = path.read_bytes()
+    poses = {}
+    for entry in json.loads(raw)['poses']:
+        key = entry['id']
+        if not isinstance(key, str) or not key or key in poses or entry['split'] not in ('train','holdout'):
+            raise ValueError('Invalid or duplicate volume pose ID or split')
+        poses[key] = (entry['split'], transform(entry['base_T_effector']), entry['cell'])
+    counts = {s: sum(v[0] == s for v in poses.values()) for s in ('train','holdout')}
+    if counts['train'] < 24 or counts['holdout'] < 6:
+        raise ValueError('Formal capture requires at least 24 training and six held-out locations')
+    return poses, hashlib.sha256(raw).hexdigest(), counts
+
+
+def load_volume_checkpoint(out, manifest, poses):
+    old = json.loads((out/'manifest.json').read_text(encoding='utf8'))
+    if any(old.get(k) != v for k,v in manifest.items()):
+        raise ValueError('Capture plan, camera, stream calibration or ruler reference changed')
+    sets = {s: json.loads((out/(s+'.json')).read_text(encoding='utf8')) for s in ('train','holdout')}
+    accepted = set()
+    frames = set()
+    for split, group in sets.items():
+        for sample in group:
+            key = sample['drive_pose_id']
+            frame = sample['frame_id']
+            if (key in accepted or key not in poses or poses[key][0] != split or frame in frames
+                    or sample.get('volume_plan_sha256') != manifest['volume_plan_sha256']
+                    or sample.get('volume_split') != split or sample.get('volume_cell') != poses[key][2]
+                    or not frame.startswith('pose-') or not frame[5:].isdigit()
+                    or not np.allclose(poses[key][1], sample['drive_target_base_T_effector'], rtol=0, atol=1e-7)
+                    or not all((out/(frame+ext)).is_file() for ext in ('.jpg','.npz'))):
+                raise ValueError('Inconsistent or missing previously recorded volume sample')
+            accepted.add(key)
+            frames.add(frame)
+    return sets
+
+
 def capture(args):
     import cv2
     import pyrealsense2 as rs
     import rospy
 
     out=args.output_dir
-    out.mkdir(parents=True,exist_ok=False)
+    poses = {}
+    resume = getattr(args, 'resume', False)
+    if getattr(args, 'volume_plan', None):
+        poses, volume_hash, counts = volume_capture_plan(args.volume_plan)
+        if args.pose_gate is None or (args.train,args.holdout) != (counts['train'],counts['holdout']):
+            raise ValueError('Volume capture needs a pose gate and counts matching the frozen plan')
+    if resume:
+        if not poses or not out.is_dir():
+            raise ValueError('Resume requires an existing capture and its original volume plan')
+    else:
+        out.mkdir(parents=True,exist_ok=False)
     rospy.init_node('baxter_right_handeye_capture',anonymous=True,disable_signals=True)
     robot=EndpointReader(rospy)
     aruco=cv2.aruco
@@ -343,13 +392,25 @@ def capture(args):
                   'native_depth_to_color':{'rs_rotation_column_major':extr.rotation,'translation_m':extr.translation},
                   'corner_method':'decoded corner order, outward subpixel edge profiles, Huber line intersections',
                   'distortion':str(intr.model),'depth_scale_m':scale,'ruler_width_m':args.width_m,'ruler_height_m':args.height_m}
-        write_json(out/'manifest.json',manifest)
-        sets={'train':[],'holdout':[]}
-        for name in sets:write_json(out/(name+'.json'),[])
+        if poses:
+            manifest['volume_plan_sha256'] = volume_hash
+        if resume:
+            sets = load_volume_checkpoint(out,manifest,poses)
+            manifest = json.loads((out/'manifest.json').read_text(encoding='utf8'))
+        else:
+            write_json(out/'manifest.json',manifest)
+            sets={'train':[],'holdout':[]}
+            for name in sets:write_json(out/(name+'.json'),[])
         align=rs.align(rs.stream.color)
+        aligned_verified=False
         ray=lambda pixel:rs.rs2_deproject_pixel_to_point(intr,pixel,1.)
         began=time.monotonic(); last_notice=began-5; previous_frame=-1
-        window=deque(); reason='Waiting for tag'; accepted=[]; accepted_ids=set()
+        prior = sorted(sets['train']+sets['holdout'],key=lambda s:s['frame_id'])
+        window=deque(); reason='Waiting for tag'
+        accepted=[s['base_T_effector'] for s in prior]
+        accepted_ids={s['drive_pose_id'] for s in prior}
+        next_frame=max((int(path.stem[5:]) for path in out.glob('pose-*.*') if path.stem[5:].isdigit()), default=0)+1
+        if len(accepted)==args.train+args.holdout:return 0
         while time.monotonic()-began<args.duration_s and not rospy.is_shutdown():
             try:
                 frame_set=pipe.wait_for_frames(1000)
@@ -365,12 +426,16 @@ def capture(args):
                 if not color or not depth or color.get_frame_number()<=previous_frame:
                     raise ValueError('Missing or repeated camera frame')
                 previous_frame=color.get_frame_number()
-                if 'aligned_depth_intrinsics' not in manifest:
+                if not aligned_verified:
                     aligned_intr=depth.profile.as_video_stream_profile().get_intrinsics()
-                    manifest['aligned_depth_intrinsics']=intrinsics_data(aligned_intr)
-                    write_json(out/'manifest.json',manifest)
+                    actual_intrinsics=intrinsics_data(aligned_intr)
+                    if resume and 'aligned_depth_intrinsics' in manifest and manifest['aligned_depth_intrinsics']!=actual_intrinsics:
+                        raise RuntimeError('Aligned depth calibration changed since the recorded capture')
                     if any(abs(getattr(aligned_intr,k)-getattr(intr,k))>.01 for k in ('fx','fy','ppx','ppy','width','height')):
                         raise RuntimeError('SDK aligned-depth intrinsics disagree with the color stream')
+                    manifest['aligned_depth_intrinsics']=actual_intrinsics
+                    write_json(out/'manifest.json',manifest)
+                    aligned_verified=True
                 # The two RealSense streams use the same capture device. Compare
                 # their sensor stamps only when their domains agree.
                 if color.get_frame_timestamp_domain()!=depth.get_frame_timestamp_domain() or abs(color.get_timestamp()-depth.get_timestamp())>60:
@@ -394,6 +459,10 @@ def capture(args):
                     if info['joint_limit_violations']:
                         raise ValueError('Drive gate cannot acknowledge out-of-model right joints: '+str(info['joint_limit_violations']))
                     name,goal=gate_pose(args.pose_gate,info['base_T_effector'])
+                    if poses and (name not in poses or not np.allclose(goal,poses[name][1], rtol=0, atol=1e-7)):
+                        raise ValueError('Requested ID/target differs from the frozen volume plan')
+                    if poses:
+                        info.update(volume_plan_sha256=volume_hash,volume_cell=poses[name][2],volume_split=poses[name][0])
                     if name in accepted_ids:
                         raise ValueError('Pose ID already recorded: '+name)
                     info.update(drive_pose_id=name,drive_target_base_T_effector=goal.tolist())
@@ -417,8 +486,9 @@ def capture(args):
                 else:
                     n=len(accepted)+1
                     hold_due=n*args.holdout//(args.train+args.holdout)>len(sets['holdout'])
-                    split='holdout' if hold_due else 'train'
-                    evidence='pose-{:03}'.format(n)
+                    split=poses[info['drive_pose_id']][0] if poses else ('holdout' if hold_due else 'train')
+                    evidence='pose-{:03}'.format(next_frame)
+                    next_frame+=1
                     if not cv2.imwrite(str(out/(evidence+'.jpg')),bgr):raise OSError('Could not save color frame')
                     np.savez_compressed(out/(evidence+'.npz'),aligned_z16=z16)
                     record=dict(info,arm='right',tag_family='tag36h11',tag_id=0,camera_serial=args.serial,
@@ -457,6 +527,8 @@ def main(argv=None):
     p.add_argument('--train',type=int,default=12)
     p.add_argument('--holdout',type=int,default=4)
     p.add_argument('--pose-gate',type=Path,help='Require the measured endpoint to match an external pose ID/target throughout the window')
+    p.add_argument('--volume-plan',type=Path,help='Immutable spatial plan assigning each target and its train/holdout group by ID')
+    p.add_argument('--resume',action='store_true',help='Continue the same spatial plan using the same camera calibration and recorded files')
     p.add_argument('--width-m',type=float,help='Ruler measurement of black outer border along decoded x')
     p.add_argument('--height-m',type=float,help='Ruler measurement of black outer border along decoded y')
     args=p.parse_args(argv)
