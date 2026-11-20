@@ -94,7 +94,7 @@ def held_ring(bgr,state,profile,scene,prior=None):
             # For release height/slope calculations use the steepest credible face.
             # A single circular silhouette often admits two distinct face normals.
             worst=min(possible,key=lambda p:p[1][2]);normal=worst[1]
-            depth_scale_uncertainty=abs(size_uncertainty/outer*worst[3])
+            depth_scale_uncertainty=float(abs(size_uncertainty/outer*worst[3]))
             objects.append({'id':ident,'kind':'ring','color':spec['color'],'location':'held','peg_id':None,
                 'center_base_m':center.tolist(),'normal_base':normal.tolist(),'inner_radius_m':inner,'outer_radius_m':outer,
                 'inner_boundary_p90_m':size_uncertainty,'outer_boundary_p90_m':worst[2],

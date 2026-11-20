@@ -124,6 +124,8 @@ class RingPerceptionTest(unittest.TestCase):
         scene={'rings':[],'obs_id':'new'}
         row=held_ring(color,state,profile,scene)
         self.assertEqual(row['location'],'held')
+        from cix_harness.ring_peg import fit_error
+        self.assertGreater(fit_error(row,'depth_plane_p90_m'),0.)
         self.assertLess(math.dist(row['center_base_m'],state['eef_m']),.01)
         scene.update(held_ring_id='r',rings=[row])
         self.assertEqual(verified({'obs_id':'old','skill':'pick','ring_id':'r','color':'red'},scene,state),'pick')

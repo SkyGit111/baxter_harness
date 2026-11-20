@@ -1,5 +1,6 @@
 """Ground a loose annulus and its same-colour peg using one measured RGB-D scene."""
 import math
+from numbers import Real
 
 from .contract import vector
 from .pi05_contract import rotate
@@ -77,7 +78,9 @@ def validate_settings(settings):
 def measured(item,key,n=None):
     try:
         if n:return vector(item[key],n,key)
-        return number(item[key],-2,2,key)
+        value=item[key]
+        if isinstance(value,Real) and not isinstance(value,bool):value=float(value)
+        return number(value,-2,2,key)
     except (ValueError,TypeError,KeyError) as exc:raise RingGeometryError('Missing measured '+key) from exc
 
 
@@ -228,18 +231,27 @@ def pick_geometry(profile,scene,ring,orientation):
                     'support_survey':survey_evidence,'tcp_table_error_m':s.get('tcp_table_error_m',0.)}
 
 
-def _guided_heights(s,ring,peg,tcp_z,bottom_offset):
+def _tip_height_error(settings,peg):
+    tip=measured(peg,'tip_base_m',3)[2];base_error=settings['vertical_uncertainty_m']
+    bracket=peg.get('tip_position_interval_base_m')
+    if bracket is None:
+        error=base_error+fit_error(peg,'depth_plane_p90_m')
+        return error,tip-error,tip+error
+    if not isinstance(bracket,list) or len(bracket)!=2:raise RingGeometryError('Invalid observed peg tip bracket')
+    try:low,high=sorted(vector(v,3,'peg tip bound')[2] for v in bracket)
+    except ValueError as error:raise RingGeometryError('Invalid metric peg tip bounds') from error
+    if not low<=tip<=high:raise RingGeometryError('Observed peg tip outside its reported height interval')
+    # A cap estimated from a measured height interval can have no D455 plane.
+    # Any available fit and bracket both describe this same tip measurement.
+    residual=fit_error(peg,'depth_plane_p90_m') if peg.get('depth_plane_p90_m') is not None else 0.
+    return max(base_error,tip-low,high-tip,residual),low,high
+
+
+def _guided_heights(s,ring,peg,tcp_z,bottom_offset,*,tip_uncertainty=None):
     """Propagate ring-size error only through the ring bottom, never through a physical fingertip."""
     guide=s['guided_release'];tip=peg['tip_base_m'][2];support=peg['support_z_m']
     rod_height=tip-support;lo,hi=guide['exposed_height_range_m']
-    core_error=s['vertical_uncertainty_m']+fit_error(peg,'depth_plane_p90_m')
-    tip_low,tip_high=tip-core_error,tip+core_error
-    if 'tip_position_interval_base_m' in peg:
-        bracket=peg['tip_position_interval_base_m']
-        if not isinstance(bracket,list) or len(bracket)!=2:raise RingGeometryError('Invalid observed peg tip bracket')
-        tip_low,tip_high=sorted(vector(v,3,'peg tip bound')[2] for v in bracket)
-        if not tip_low<=tip<=tip_high:raise RingGeometryError('Observed peg tip outside its reported height interval')
-        core_error=max(core_error,tip-tip_low,tip_high-tip)
+    core_error,tip_low,tip_high=tip_uncertainty or _tip_height_error(s,peg)
     support_error=fit_error(peg,'depth_support_spread_m')
     physical_range=[tip_low-support-support_error,tip_high-support+support_error]
     if physical_range[1]<lo or physical_range[0]>hi:
@@ -272,7 +284,8 @@ def release_geometry(profile,scene,state,ring,peg):
     support=measured(peg,'support_z_m');center=measured(ring,'center_base_m',3)
     if rod<=0 or support>=tip[2]:raise RingGeometryError('Unverified free peg above the current ring stack')
     tcp=tcp_from_eef(state['eef_m'],state['eef_xyzw'],profile)
-    vertical=s['vertical_uncertainty_m']+fit_error(ring,'depth_plane_p90_m')+fit_error(peg,'depth_plane_p90_m')
+    tip_uncertainty=_tip_height_error(s,peg)
+    vertical=tip_uncertainty[0]+fit_error(ring,'depth_plane_p90_m')
     wrist=scene.get('wrist_alignment');thick=s['ring_thickness_m']
     if wrist is not None:
         inner=measured(wrist,'inner_radius_m');rod=measured(wrist,'peg_radius_m');optical_error=measured(wrist,'uncertainty_m')
@@ -283,7 +296,7 @@ def release_geometry(profile,scene,state,ring,peg):
     slope=math.hypot(axis[0],axis[1])/axis[2]; tilt=math.hypot(normal[0],normal[1]);down=outer*tilt+thick
     center_z_above_tcp=center[2]-tcp[2];guide=None
     if 'guided_release' in s:
-        guide=_guided_heights(s,ring,peg,tcp[2],center_z_above_tcp-down)
+        guide=_guided_heights(s,ring,peg,tcp[2],center_z_above_tcp-down,tip_uncertainty=tip_uncertainty)
         tip_gap=guide['free_drop_m'];vertical=guide['ring_tip_error_m']
     else:
         tip_gap=max(s['release_gap_m']+vertical,s['fingertip_below_tcp_m']+center_z_above_tcp-down+vertical+s['release_gap_m'])

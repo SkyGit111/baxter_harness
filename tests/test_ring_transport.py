@@ -126,6 +126,19 @@ class HeldRingTransport(unittest.TestCase):
         self.assertEqual(suffix[0]['tcp_m'][:2],self.state['eef_m'][:2])
         self.assertLess(suffix[0]['tcp_m'][2],self.state['eef_m'][2])
 
+    def test_registered_cap_with_no_depth_plane_uses_its_z_interval_once(self):
+        import numpy as np
+        s=self.profile['ring_peg'];s['vertical_uncertainty_m']=.0056
+        self.assertAlmostEqual(ring_peg.measured({'depth_plane_p90_m':np.float32(.00766)},'depth_plane_p90_m'),.00766)
+        with self.assertRaises(ring_peg.RingGeometryError):ring_peg.measured({'depth_plane_p90_m':True},'depth_plane_p90_m')
+        peg=dict(self.peg,tip_base_m=[.74,.27,-.05329],depth_plane_p90_m=None,
+                 tip_position_interval_base_m=[[.738,.271,-.05830],[.742,.269,-.04828]])
+        self.assertEqual(ring_peg._tip_height_error(s,peg),(.0056,-.05830,-.04828))
+        peg['depth_plane_p90_m']=.0065
+        self.assertAlmostEqual(ring_peg._tip_height_error(s,peg)[0],.0065)
+        peg['depth_plane_p90_m']=None;del peg['tip_position_interval_base_m']
+        with self.assertRaises(ring_peg.RingGeometryError):ring_peg._tip_height_error(s,peg)
+
 
 if __name__=='__main__':
     unittest.main()
