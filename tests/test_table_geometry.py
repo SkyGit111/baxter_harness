@@ -182,6 +182,10 @@ class CandidateProfiles(unittest.TestCase):
         self.assertEqual(template,original)
         for arm,cfg in out.items():
             self.assertEqual(cfg['arm'],arm);self.assertFalse(cfg['commissioned']);self.assertFalse(cfg['primitives']['calibrated'])
+            self.assertEqual(cfg['planning']['trajectory_mode'],'continuous')
+            self.assertEqual(cfg['planning']['grasp_yaw_offsets_rad'],[0.,math.pi/2,-math.pi/2,math.pi])
+            self.assertEqual(cfg['primitives']['approach_path'],'direct_hover')
+            self.assertAlmostEqual(cfg['primitives']['contact_band_m'],.04)
             self.assertFalse(cfg['site_candidate']['tcp_verified']);validate_profile(cfg['primitives'])
             self.assertIsNone(cfg['primitives']['home_tcp_m']);self.assertEqual(cfg['primitives']['observation_tcp_m'],[])
             self.assertGreater(cfg['primitives']['tcp_workspace_max_m'][1]-cfg['primitives']['tcp_workspace_min_m'][1],1.)
@@ -189,6 +193,24 @@ class CandidateProfiles(unittest.TestCase):
         self.assertEqual(out['right']['primitives']['tcp_offset_tool_m'],[0,0,.0155])
         out['left']['primitives']['table_plane']['offset']=2
         self.assertEqual(out['right']['primitives']['table_plane']['offset'],.25)
+        # A new field profile built from an old measured cap keeps that cap
+        # until the operator specifies a new transit speed. Contact is independent.
+        template.update(joint_speed_rad_s=.02,joint_speed_by_phase_rad_s={'contact':.012})
+        preserved=build_candidate_profiles(template,geometry)['left']
+        self.assertEqual(preserved['joint_speed_rad_s'],.02)
+        self.assertEqual(preserved['joint_speed_by_phase_rad_s']['contact'],.012)
+        tuned=build_candidate_profiles(template,geometry,transit_speed=.08)['right']
+        self.assertEqual(tuned['joint_speed_by_phase_rad_s']['transit'],.08)
+        self.assertEqual(tuned['joint_speed_by_phase_rad_s']['lift'],.012)
+        self.assertEqual(tuned['joint_speed_by_phase_rad_s']['lift_clear'],.08)
+        template['joint_speed_by_phase_rad_s']['lift']=.016
+        loaded=build_candidate_profiles(template,geometry,transit_speed=.08)['right']
+        self.assertEqual(loaded['joint_speed_by_phase_rad_s']['lift_clear'],.016)
+        self.assertFalse(tuned['commissioned'])
+        self.assertEqual(build_candidate_profiles(template,geometry,grasp_symmetry='fixed')['left']
+                         ['planning']['grasp_yaw_offsets_rad'],[0.])
+        with self.assertRaises(ValueError):
+            build_candidate_profiles(template,geometry,transit_speed=.08,contact_speed=.12)
 
     def test_full_xyz_fit_applied_with_provenance_but_never_autoenabled(self):
         template=json.loads(Path('config/baxter-primitives.example.json').read_text())

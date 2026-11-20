@@ -5,6 +5,13 @@ from .pi05_contract import multiply,quaternion
 
 
 def candidate_profiles(profile,state,skill,options):
+    for yaw,candidate in _grasp_orientations(profile,state,skill,options):
+        yield yaw,candidate
+        if skill in ('pick','place','stack','move_to') and candidate.get('approach_path')=='direct_hover':
+            yield yaw,dict(candidate,approach_path='staged')
+
+
+def _grasp_orientations(profile,state,skill,options):
     if skill not in ('pick','move_to') or state.get('gripping'):
         yield 0.,profile
         return
@@ -26,6 +33,7 @@ def candidate_profiles(profile,state,skill,options):
 def stage_phase(stages,index,skill):
     stage=stages[index]
     if stage['kind']!='move':return stage['kind']
+    if 'motion_phase' in stage:return stage['motion_phase']
     earlier=stages[:index]
     closed=any(s.get('kind')=='gripper' and s.get('open') is False for s in earlier)
     opened=any(s.get('kind')=='gripper' and s.get('open') is True for s in earlier)

@@ -123,9 +123,10 @@ def snapshot_evaluator(config,states,robot_description):
     Requires ROS Python packages for pose types/interpolation, but no ROS master,
     subscribers, publishers or services. URDF and states come from explicit files.
     """
-    from .collision import KDLArmCapsules,InterArmGuard
+    from .collision import KDLArmCapsules,InterArmGuard,ArmCollisionError
     from .kinematics import ContinuousIK
-    from .primitive_service import PrimitiveService
+    from .primitive_service import PrimitiveService,IKPreflightError
+    from .planning import candidate_profiles
     from .primitives import plan,check_tcp,tcp_from_eef
     from genpy import Time
     config=copy.deepcopy(config)
@@ -160,9 +161,18 @@ def snapshot_evaluator(config,states,robot_description):
         for skill,target in (('pick',point),(placement_skill,destination)):
             service=PrimitiveService(RobotSnapshot(arm,state,profile))
             try:
-                stages=plan(skill,state,profile['primitives'],target)
-                initial,paths=service._preflight(stages,{'state':state},time.monotonic(),skill=skill)
-                clearance=guard.path_clearance(arm,initial,paths,peer,peer)
+                # The outer scan already chose a grasp orientation. Match the
+                # online direct-then-staged candidates for that orientation.
+                for _,candidate in candidate_profiles(profile['primitives'],state,skill,{}):
+                    stages=plan(skill,state,candidate,target)
+                    try:
+                        initial,paths=service._preflight(stages,{'state':state},time.monotonic(),skill=skill)
+                        clearance=guard.path_clearance(arm,initial,paths,peer,peer)
+                        break
+                    except (IKPreflightError,ArmCollisionError) as error:
+                        last_failure=error
+                else:
+                    raise last_failure
             except (ValueError,RuntimeError) as error:
                 raise ValueError('{} failed ({}): {}'.format(skill,type(error).__name__,error)) from error
             heights=[tcp_from_eef(state['eef_m'],state['eef_xyzw'],profile['primitives'])[2]]
@@ -170,7 +180,8 @@ def snapshot_evaluator(config,states,robot_description):
                 for _,point_pose in path or []:
                     p,q=point_pose.pose.position,point_pose.pose.orientation
                     heights.append(tcp_from_eef([p.x,p.y,p.z],[q.x,q.y,q.z,q.w],profile['primitives'])[2])
-            receipts.append({'skill':skill,'stages':len(stages),'ik_waypoints':sum(len(p) for p in paths if p),
+            receipts.append({'skill':skill,'approach_path':candidate.get('approach_path','staged'),
+                             'stages':len(stages),'ik_waypoints':sum(len(p) for p in paths if p),
                              'sampled_path_tcp_z_extrema_m':[min(heights),max(heights)],
                              'inter_arm_clearance':clearance})
             for stage,path in zip(stages,paths):

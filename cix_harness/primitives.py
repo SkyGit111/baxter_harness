@@ -136,12 +136,16 @@ def validate_profile(p):
     high=vector(p['tcp_workspace_max_m'],3,'workspace maximum')
     if any(a>=b for a,b in zip(low,high)): raise ValueError('Unordered workspace')
     validate_table_geometry(p)
+    if p.get('approach_path','staged') not in ('staged','direct_hover'):
+        raise ValueError('Unknown primitive approach path')
     for key,lo,hi in [('table_z_m',-2,2),('table_clearance_m',0,.1),('transit_z_m',-1,2),
                       ('approach_m',.02,.3),('lift_m',.025,.3),('grasp_inset_m',0,.1),
                       ('release_clearance_m',0,.05),('held_bottom_below_tcp_m',0,.3),
                       ('max_leg_m',.01,.5),('perception_max_age_s',1,60)]:
         if key=='table_z_m' and key not in p and p.get('table_plane') is not None:continue
         number(p[key],lo,hi,key)
+    if 'contact_band_m' in p:
+        number(p['contact_band_m'],.01,p['approach_m'],'contact band')
     minimum_floor=min(table_height(x,y,p) for x,y in workspace_polygon(p))+p['table_clearance_m']
     if not minimum_floor <= p['transit_z_m'] <= high[2]:
         raise ValueError('Transit height outside workspace')
@@ -194,7 +198,8 @@ def plan(skill,state,p,target=None,view_index=0):
     if skill=='open' and holding: raise ValueError('Use place/stack to release a held object onto a support')
     if skill in ('place','stack') and not holding: raise ValueError('Placement requires a held object')
     stages=[];last=current;last_q=quaternion(state['eef_xyzw']);planned_holding=holding
-    def move(xyz,q=None):
+    direct=p.get('approach_path')=='direct_hover'
+    def move(xyz,q=None,phase=None):
         nonlocal last,last_q
         q=quaternion(q or orientation)
         xyz=check_tcp(xyz,p,held_bottom_m=p['held_bottom_below_tcp_m'] if planned_holding else 0.)
@@ -202,12 +207,17 @@ def plan(skill,state,p,target=None,view_index=0):
         # This bound includes TCP rotation about a nonzero tool offset. Each
         # generated segment remains within the EEF travel budget, not just XY.
         bound=math.dist(last,xyz)+math.sqrt(sum(v*v for v in p['tcp_offset_tool_m']))*angle
+        if direct and math.dist(last,xyz)<1e-9 and angle<1e-7:
+            return
         count=max(1,math.ceil(bound/p['max_leg_m']))
         start=list(last);start_q=list(last_q)
         for i in range(1,count+1):
             f=i/count;point=list(xyz) if i==count else [a+f*(b-a) for a,b in zip(start,xyz)]
             check_tcp(point,p,held_bottom_m=p['held_bottom_below_tcp_m'] if planned_holding else 0.)
-            stages.append({'kind':'move','tcp_m':point,'xyzw':q if i==count else _slerp(start_q,q,f)})
+            stage={'kind':'move','tcp_m':point,'xyzw':q if i==count else _slerp(start_q,q,f)}
+            if phase is not None:
+                stage['motion_phase']=phase
+            stages.append(stage)
         last=list(xyz);last_q=list(q)
     def grip(opened):
         nonlocal planned_holding
@@ -220,19 +230,40 @@ def plan(skill,state,p,target=None,view_index=0):
         # Validate only the selected contact target as a recoverable perception
         # rejection. Generated hover/retreat waypoints retain hard validation.
         point=check_tcp(point,p,selected_target=True)
-        z=max(current[2],point[2]+p['approach_m'],transit_height([current,point],p,holding))
-        move([current[0],current[1],z],state['eef_xyzw'])
-        move([current[0],current[1],z])
-        move([point[0],point[1],z])
+        z=max(point[2]+p['approach_m'],transit_height([current,point],p,holding))
+        if direct:
+            # Start all lateral motion above the transit plane. When already
+            # higher, approach the hover point and turn in the same checked leg.
+            if current[2]<z:
+                move([current[0],current[1],z],state['eef_xyzw'],'clearance')
+            move([point[0],point[1],z],phase='transit')
+        else:
+            z=max(current[2],z)
+            move([current[0],current[1],z],state['eef_xyzw'])
+            move([current[0],current[1],z])
+            move([point[0],point[1],z])
         if skill=='pick':grip(True)
-        move(point)
+        band=p.get('contact_band_m')
+        # The first lift leg must fully clear the held object's bottom.
+        band_z=(max(point[2]+band,table_height(*point[:2],p)+p['table_clearance_m']+
+                    p['held_bottom_below_tcp_m']) if band is not None else z)
+        split=direct and skill in ('pick','place','stack') and z-band_z>=.02
+        if split:
+            move([*point[:2],band_z],phase='transit')
+        contact_phase='placement' if skill in ('place','stack') else 'approach'
+        move(point,phase=contact_phase if direct else None)
         if skill=='pick':
             grip(False);stages.append({'kind':'verify_grasp','held':True})
-            move([point[0],point[1],max(point[2]+p['lift_m'],z)])
+            if split:
+                move([*point[:2],band_z],phase='contact')
+            lift_phase='lift_clear' if split else 'lift'
+            move([point[0],point[1],max(point[2]+p['lift_m'],z)],phase=lift_phase if direct else None)
             stages.append({'kind':'verify_grasp','held':True})
         elif skill in ('place','stack'):
             grip(True);stages.append({'kind':'verify_grasp','held':False})
-            move([point[0],point[1],z])
+            if split:
+                move([*point[:2],band_z],phase='contact')
+            move([point[0],point[1],z],phase='retreat' if direct else None)
     elif skill=='clear_view':
         views=p.get('observation_tcp_m',[])
         if type(view_index) is not int or not 0<=view_index<len(views):

@@ -46,7 +46,8 @@ class Journal:
         (self.folder / name).write_bytes(image_bytes(obs["image"]))
         if "wrist_image" in obs:
             (self.folder / (name.rsplit('.', 1)[0] + '-wrist.jpg')).write_bytes(image_bytes(obs['wrist_image']))
-        self("observation", file=name, obs_id=obs["id"], state=obs.get("state", {}))
+        self("observation", file=name, role=role, obs_id=obs["id"], state=obs.get("state", {}),
+             camera_metadata=obs.get('camera_metadata', {}))
 
 
 def check_models(args, log=None):

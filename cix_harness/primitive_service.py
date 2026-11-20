@@ -134,28 +134,35 @@ class PrimitiveService:
         attempts=[];last_error=None
         for yaw,candidate in candidate_profiles(p,obs['state'],skill,r.cfg.get('planning',{})):
             attempt_started=time.monotonic()
+            route=candidate.get('approach_path','staged')
+            motion_schedule=[]
             try:
                 with _measure(timings,'skill_plan'):
                     stages=plan(skill,obs['state'],candidate,target,view_index)
                 operations=sum(s['kind'] in ('move','gripper') for s in stages)
                 if r.motion_remaining is None or r.motion_remaining<operations:
-                    return {'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,
-                            'failure_code':'stage_budget','message':'Insufficient primitive stage budget',
-                            'required_stages':operations,'motion_remaining':r.motion_remaining,'recoverable':False}
+                    attempts.append({'yaw_rad':yaw,'approach_path':route,'status':'rejected',
+                                     'reason':'stage_budget','required_stages':operations})
+                    continue
                 with _measure(timings,'ik_preflight'):
-                    initial,paths=self._preflight(stages,obs,began,skill=skill)
+                    initial,paths=self._preflight(stages,obs,began,skill=skill,motion_schedule=motion_schedule)
                 if callable(peer_check):
                     with _measure(timings,'other_arm_preflight'):
                         if peer_check(r,paths) is False:raise ValueError('Other arm path check rejected the plan')
             except (IKPreflightError,ArmCollisionError) as error:
-                attempts.append({'yaw_rad':yaw,'status':'rejected','reason':str(error),'seconds':time.monotonic()-attempt_started})
+                attempts.append({'yaw_rad':yaw,'approach_path':route,'status':'rejected','reason':str(error),'seconds':time.monotonic()-attempt_started})
                 last_error=error
                 continue
-            attempts.append({'yaw_rad':yaw,'status':'ready','seconds':time.monotonic()-attempt_started})
+            attempts.append({'yaw_rad':yaw,'approach_path':route,'status':'ready','seconds':time.monotonic()-attempt_started})
             break
         else:
             r.audit('primitive_candidates_rejected',obs_id=obs_id,skill=skill,candidates=attempts)
-            raise last_error
+            if last_error is not None:
+                raise last_error
+            return {'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,'recoverable':False,
+                    'failure_code':'stage_budget','message':'Insufficient primitive stage budget',
+                    'required_stages':min(item['required_stages'] for item in attempts),
+                    'motion_remaining':r.motion_remaining,'planning_candidates':attempts}
         if time.monotonic()-began>p['perception_max_age_s']:raise SceneChangedError('Scene expired during path preflight')
         final=r.joints()
         if set(final)!=set(initial) or max(abs(final[k]-initial[k]) for k in initial)>.015:
@@ -165,9 +172,11 @@ class PrimitiveService:
         return {'status':'ready','plan_id':token,'obs_id':obs_id,'skill':skill,'target_base_m':target,'stages':stages,
                 'applied':False,'ik_preflight':True,'required_stages':operations,
                 'expires_in_s':r.cfg['max_observation_age_s'],'planning_candidates':attempts,
+                'selected_approach_path':route,'motion_schedule':motion_schedule,
+                'nominal_motion_seconds':sum(s['nominal_duration_s'] for s in motion_schedule) if motion_schedule else None,
                 'selected_yaw_rad':yaw,'trajectory_mode':r.cfg.get('planning',{}).get('trajectory_mode','legacy')}
 
-    def _preflight(self,stages,obs,began,skill=None):
+    def _preflight(self,stages,obs,began,skill=None,motion_schedule=None):
         from geometry_msgs.msg import PoseStamped
         from tf import transformations as tf
         from .primitives import tcp_from_eef
@@ -195,11 +204,19 @@ class PrimitiveService:
             distance=math.dist(a,dest)
             if distance>p['max_leg_m']+1e-9:raise ValueError('Primitive leg exceeds configured travel')
             angle=2*math.acos(min(1,abs(sum(x*y for x,y in zip(qa,qb)))))
+            # On a combined transfer the physical TCP must follow the checked
+            # line above the table, even as the offset tool turns about the EEF.
+            tcp_start=None
+            if stage.get('motion_phase')=='transit':
+                tcp_start=tcp_from_eef(a,qa,p)
+                distance=math.dist(tcp_start,stage['tcp_m'])+math.dist(p['tcp_offset_tool_m'],[0.,0.,0.])*angle
             count=max(1,math.ceil(distance/.01),math.ceil(angle/.015));path=[]
             for i in range(1,count+1):
                 f=i/count;point=PoseStamped();point.header.frame_id='base';point.header.stamp=r.ros.Time.now()
                 xyz=[x+f*(y-x) for x,y in zip(a,dest)]
                 q=list(map(float,tf.quaternion_slerp(qa,qb,f)))
+                if tcp_start is not None:
+                    xyz=eef_from_tcp([x+f*(y-x) for x,y in zip(tcp_start,stage['tcp_m'])],q,p)
                 r.inside(xyz)
                 point.pose.position.x,point.pose.position.y,point.pose.position.z=xyz
                 point.pose.orientation.x,point.pose.orientation.y,point.pose.orientation.z,point.pose.orientation.w=q
@@ -213,7 +230,13 @@ class PrimitiveService:
                 except IKUnreachableError as error:raise IKPreflightError(str(error)) from error
                 path.append((solution,point));seed=solution;observed=pose
             if r.cfg.get('planning',{}).get('trajectory_mode')=='continuous':
-                self._check_curve(curve_initial,path,holding,departing,stage_phase(stages,stage_index,skill))
+                phase=stage_phase(stages,stage_index,skill)
+                meta=self._check_curve(curve_initial,path,holding,departing,phase)
+                if motion_schedule is not None:
+                    motion_schedule.append({'stage_index':stage_index,'phase':phase,
+                                            'nominal_duration_s':meta['nominal_duration_s'],
+                                            'joint_speed_limit_rad_s':meta['joint_speed_limit_rad_s'],
+                                            'ik_waypoints':len(path)})
             paths.append(path)
         if time.monotonic()-began>p['perception_max_age_s']:raise SceneChangedError('Scene expired during full IK preflight')
         if max(abs(r.joints()[k]-initial[k]) for k in initial)>.015:raise SceneChangedError('Arm moved during IK preflight')

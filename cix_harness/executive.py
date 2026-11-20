@@ -3,7 +3,7 @@ import copy
 import math
 import time
 
-from .task_plan import EXPECTED, VLA_SKILLS, compact_state, validate_plan, validate_check
+from .task_plan import EXPECTED, VLA_SKILLS, compact_state, validate_plan, validate_check, workspace_context
 from .primitives import SKILLS
 from .task_monitor import TaskMonitor
 
@@ -129,6 +129,15 @@ class TaskExecutive:
     def call_planner(self, method, obs, context):
         if self.calls >= self.max_calls: raise RuntimeError('Task planner call budget exhausted')
         self.calls += 1
+        if method == 'check':
+            # One observation can be checked twice, before and after verifying a step.
+            # Store the input before inference, including calls that never return.
+            metadata = workspace_context(obs, {})
+            for key in ('camera_metadata', 'backend_skills'):
+                if key in obs:
+                    metadata[key] = obs[key]
+            self.log('checkpoint_input', obs_id=obs['id'], context=copy.deepcopy(context),
+                     observation_metadata=metadata)
         began=time.monotonic();okay=False
         try:
             reply = getattr(self.planner, method)(obs, context);okay=True

@@ -8,6 +8,22 @@ from cix_harness.trajectory import JointTrajectory,check_controller_feedback,Con
 
 
 class TrajectoryTest(unittest.TestCase):
+    def test_isolated_short_ik_bend_does_not_slow_entire_leg(self):
+        points = [{'a': i * .001, 'b': .0007 if i == 120 else 0.} for i in range(1, 301)]
+        trajectory = JointTrajectory({'a': 0., 'b': 0.}, points, .12, .06)
+        self.assertLess(trajectory.duration, 8.)  # Old global time dilation scheduled 142.87 s.
+        self.assertAlmostEqual(trajectory.sample(trajectory.knots[120])['b'], .0007)
+        self.assertEqual(trajectory.sample(trajectory.duration), points[-1])
+        route = [dict(a=0., b=0.)] + points
+        self.assertEqual(list(trajectory.sampled_positions(.005)), route)
+        dt = .0005
+        for i in range(1, 300):
+            t = trajectory.knots[i]  # Includes both sides of the short reversal.
+            previous,current,following = [trajectory.sample(t+offset) for offset in (-dt, 0., dt)]
+            for name in current:
+                self.assertLessEqual(abs(following[name]-previous[name])/(2*dt), .12001)
+                self.assertLessEqual(abs(following[name]-2*current[name]+previous[name])/dt**2, .06001)
+
     def test_dense_straight_path_passes_internal_points_without_stopping(self):
         path=JointTrajectory({'j':0.},[{'j':i/1000} for i in range(1,301)],.03,.06)
         self.assertLess(path.duration,15.)  # Old per-knot 0.15 s floor costs 45 s.
@@ -51,6 +67,16 @@ class TrajectoryTest(unittest.TestCase):
         self.assertEqual(motion_limits(cfg,'transit'),(.06,.12))
         cfg['joint_speed_by_phase_rad_s']['contact']=.08
         with self.assertRaises(ValueError):motion_limits(cfg,'contact')
+
+    def test_clear_lift_speed_respects_existing_loaded_limit(self):
+        phases={'contact':.02,'transit':.08}
+        cfg={'joint_speed_rad_s':.12,'joint_speed_by_phase_rad_s':phases}
+        self.assertEqual(motion_limits(cfg,'lift')[0],.02)
+        self.assertEqual(motion_limits(cfg,'lift_clear')[0],.08)
+        phases['lift']=.04
+        self.assertEqual(motion_limits(cfg,'lift_clear')[0],.04)
+        phases['lift_clear']=.06
+        self.assertEqual(motion_limits(cfg,'lift_clear')[0],.06)
 
     def test_factory_head_avoidance_is_reported_before_tracking_failure(self):
         state={'avoidance':(1.,{'other_arm':False,'objects':['collision_head_link_1']}),'collision':(1.,False)}

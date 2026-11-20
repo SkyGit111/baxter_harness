@@ -39,7 +39,8 @@ class CallChain:
             if event=='task_step_dispatch':self.context.pop('plan_id',None)
         if event=='primitive_plan' and item.get('plan_id'):self.context['plan_id']=item['plan_id']
         keys=('t','seq','event','call_id','component','method','duration_s','succeeded',
-              'phase','seconds','total_seconds','status','failure_code','reason','plan_id')
+              'phase','seconds','total_seconds','auth_seconds','first_output_text_delta_seconds',
+              'status','failure_code','reason','plan_id','nominal_motion_seconds','selected_approach_path')
         if event in ('task_started','task_plan','task_step_dispatch','rpc_started','component_timing',
                      'planner_api','primitive_plan','primitive_result','recovery','task_step_executed',
                      'task_step_failed','finish','stop','task_finished'):

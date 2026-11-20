@@ -8,9 +8,11 @@ from pathlib import Path
 from .contract import vector
 from .pi05_contract import quaternion
 from .primitives import table_height, validate_profile, workspace_polygon
+from .trajectory import motion_limits
 
 
-def build_candidate_profiles(template,geometry,tcp_fits=None):
+def build_candidate_profiles(template,geometry,tcp_fits=None,*,transit_speed=None,contact_speed=None,
+                             grasp_symmetry=None):
     """Return independent left/right primitive configs with all enable flags false.
 
     Geometry is an offline survey artifact, not proof of calibration or collision
@@ -24,10 +26,42 @@ def build_candidate_profiles(template,geometry,tcp_fits=None):
     tcp_fits={} if tcp_fits is None else tcp_fits
     if not isinstance(tcp_fits,dict) or any(arm not in ('left','right') for arm in tcp_fits):
         raise ValueError('TCP fits must be keyed by left/right arm')
+    if grasp_symmetry not in (None, 'square', 'fixed'):
+        raise ValueError('Choose square or fixed grasp symmetry')
     output={}
     for arm in ('left','right'):
         cfg=copy.deepcopy(template);p=cfg['primitives']
         cfg.update(arm=arm,commissioned=False,commissioning_scope='supervised_primitive_task')
+        # Apply to the new, uncommissioned profiles only. Reusing a measured
+        # template must not silently increase any existing stage speed.
+        original_speed,_ = motion_limits(cfg)
+        phases = cfg.setdefault('joint_speed_by_phase_rad_s', {})
+        limit = original_speed if transit_speed is None else transit_speed
+        if not math.isfinite(limit) or not .01 <= limit <= .12:
+            raise ValueError('Transit speed must be in [.01, .12] rad/s')
+        if transit_speed is not None:
+            for phase in ('orientation','transit','clearance','retreat'):
+                phases[phase] = transit_speed
+        cfg['joint_speed_rad_s'] = limit
+        if contact_speed is None:
+            contact_speed_for_arm = min(phases.get('contact', .03), original_speed, limit)
+        else:
+            contact_speed_for_arm = contact_speed
+        phases['contact'] = contact_speed_for_arm
+        # Pick uses this phase only after a verified straight departure leg.
+        # Carry any explicit loaded-motion cap across from older templates.
+        phases['lift_clear'] = min(limit, phases.get('lift_clear', phases.get('lift', phases.get('transit', limit))))
+        phases['lift'] = min(phases.get('lift', contact_speed_for_arm), contact_speed_for_arm)
+        motion_limits(cfg)
+        planning = cfg.setdefault('planning', {})
+        planning['trajectory_mode'] = 'continuous'
+        square_yaws = [0., math.pi / 2, -math.pi / 2, math.pi]
+        if grasp_symmetry is None:
+            planning.setdefault('grasp_yaw_offsets_rad', square_yaws)
+        else:
+            planning['grasp_yaw_offsets_rad'] = square_yaws if grasp_symmetry == 'square' else [0.]
+        p['approach_path'] = 'direct_hover'
+        p['contact_band_m'] = min(.04, p['approach_m'])
         p.update(calibrated=False,table_plane={'normal':list(plane['normal']),'offset':plane['offset']},
                  table_polygon_base_xy=copy.deepcopy(polygon),camera_to_base_xyzw=list(q),
                  camera_to_base_translation_m=list(translation),observation_tcp_m=[])
@@ -100,11 +134,19 @@ def main(argv=None):
     parser.add_argument('--right-tcp-fit',type=Path)
     parser.add_argument('--motion-budget',type=int,default=64)
     parser.add_argument('--lease-seconds',type=float,default=600)
+    parser.add_argument('--transit-speed-rad-s',type=float,
+                        help='Free-motion speed for the new candidate. Default preserves template limits.')
+    parser.add_argument('--contact-speed-rad-s',type=float,
+                        help='Final contact speed. Default preserves the template contact cap, or uses up to 0.03 rad/s.')
+    parser.add_argument('--grasp-symmetry',choices=('square','fixed'),
+                        help='Square tests four quarter-turn yaws for cube tasks. Fixed keeps the configured tool orientation. Default uses the template yaw candidates, or square if absent.')
     args=parser.parse_args(argv)
     fits={arm:json.loads(path.read_text(encoding='utf-8')) for arm in ('left','right')
           if (path:=getattr(args,arm+'_tcp_fit')) is not None}
     profiles=build_candidate_profiles(json.loads(args.template.read_text(encoding='utf-8')),
-                                      json.loads(args.geometry.read_text(encoding='utf-8')),fits)
+                                      json.loads(args.geometry.read_text(encoding='utf-8')),fits,
+                                      transit_speed=args.transit_speed_rad_s,contact_speed=args.contact_speed_rad_s,
+                                      grasp_symmetry=args.grasp_symmetry)
     from .dual_bridge import build_dual_candidate
     dual=build_dual_candidate(profiles['left'],profiles['right'],args.motion_budget,args.lease_seconds)
     args.output_dir.mkdir(parents=True,exist_ok=True)
