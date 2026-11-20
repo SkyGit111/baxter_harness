@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-from cix_harness.moveit_guard import options, segment_samples
+from cix_harness.moveit_guard import MoveItCollisionError, options, segment_samples
 from cix_harness.moveit_probe import joint_names
 from cix_harness.primitive_service import PrimitiveService
 from cix_harness.trajectory import JointTrajectory, motion_limits
@@ -50,6 +50,19 @@ class MoveItPrimitivePath(unittest.TestCase):
         self.assertTrue(all(q['left_s1'] == .33 and q['head_pan'] == .12 and q['finger'] == -.9
                             for q in self.seen))
         self.assertEqual(self.guard._scene.call_count, 2)
+
+    def test_execution_reference_belongs_to_last_successfully_checked_segment(self):
+        segments=[(0,'transit',self.knots)]
+        self.guard.check(self.start,segments,executing=True)
+        self.full=dict(self.full,left_s1=.342)
+        self.guard.check(self.start,segments,executing=True)
+        checked=self.guard.execution_reference
+        self.assertEqual(checked['left_s1'],.342)
+        self.full=dict(self.full,left_s1=.354)
+        self.guard._valid=Mock(return_value=NS(valid=False,contacts=[]))
+        with self.assertRaisesRegex(MoveItCollisionError,'rejected stage'):
+            self.guard.check(self.start,segments,executing=True)
+        self.assertIs(self.guard.execution_reference,checked)
 
     def test_continuous_points_are_from_actual_cubic_executor(self):
         self.r.cfg['planning']['trajectory_mode'] = 'continuous'

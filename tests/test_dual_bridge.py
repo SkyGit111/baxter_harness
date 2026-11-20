@@ -233,9 +233,53 @@ class DualBridgeTests(unittest.TestCase):
             bridge=self.bridge(True);prepared=self.plan(bridge,'left');right=bridge.robots['right']
             if change=='joint':right.angles[right.names[0]]+=.02
             else:right.grip.gripping.return_value=True
-            with self.assertRaises(PeerStateChangedError):bridge.execute('left',prepared['plan_id'])
+            if change=='joint':
+                result=bridge.execute('left',prepared['plan_id'])
+                self.assertFalse(result['applied'])
+                self.assertEqual(result['confirmed_commands'],0)
+                self.assertEqual(result['failure_type'],'PeerJointMovedError')
+                self.assertEqual(result['failed_stage']['command_state'],'not_dispatched')
+                self.assertEqual(result['failed_stage']['phase'],'dispatch_validation')
+                self.assertIsNone(bridge.services['left'].prepared)
+            else:
+                with self.assertRaises(PeerStateChangedError):bridge.execute('left',prepared['plan_id'])
             for robot in bridge.robots.values():robot.grip.command_position.assert_not_called()
             self.assertEqual(bridge.shared.remaining,12)
+
+    def test_running_reference_advances_only_after_the_new_segment_and_peer_are_checked(self):
+        bridge=self.bridge(True)
+        self.plan(bridge,'left')
+        bridge.executing_arm='left'
+        right=bridge.robots['right']
+        delta=bridge.guard.cfg['max_peer_joint_drift_rad']*.65
+        right.angles[right.names[0]]+=delta
+        bridge.check_other_arm_path('left',[None])
+        accepted=bridge.peer_reference
+        self.assertAlmostEqual(accepted['joint_rad'][0],delta)
+        right.angles[right.names[0]]+=delta
+        bridge.check_running_arm('left')
+        changed=right.read_state()
+        changed['joint_rad'][0]+=5*delta
+        with patch.object(right,'read_state',side_effect=[right.read_state(),changed]):
+            with self.assertRaises(PeerStateChangedError):
+                bridge.check_other_arm_path('left',[None])
+        self.assertIs(bridge.peer_reference,accepted)
+
+    def test_peer_move_during_execute_validation_returns_a_consumed_zero_command_plan(self):
+        bridge=self.bridge(True)
+        planned=self.plan(bridge,'left')
+        right=bridge.robots['right']
+        stable=right.read_state()
+        changed=dict(stable,joint_rad=[.04]+stable['joint_rad'][1:])
+        with patch.object(right,'read_state',side_effect=[stable,changed,changed]):
+            receipt=bridge.execute('left',planned['plan_id'])
+        self.assertEqual(receipt['failed_stage']['phase'],'dispatch_validation')
+        self.assertFalse(receipt['outcome_uncertain'])
+        self.assertFalse(receipt['stop_attempted'])
+        self.assertEqual(receipt['confirmed_commands'],0)
+        self.assertIsNone(bridge.services['left'].prepared)
+        self.assertEqual(bridge.shared.remaining,12)
+        bridge.robots['left'].grip.command_position.assert_not_called()
 
     def test_peer_change_during_motion_stops_active_arm_and_never_drives_peer(self):
         bridge=self.bridge(True);left=bridge.robots['left'];right=bridge.robots['right']
@@ -245,7 +289,7 @@ class DualBridgeTests(unittest.TestCase):
             left.ready()
         left.move_segment=Mock(side_effect=interrupted)
         receipt=bridge.execute('left',prepared['plan_id'])
-        self.assertEqual(receipt['failure_type'],'PeerStateChangedError')
+        self.assertEqual(receipt['failure_type'],'PeerJointMovedError')
         self.assertTrue(receipt['outcome_uncertain']);self.assertFalse(receipt['retryable'])
         self.assertEqual(receipt['selected_arm'],'left');self.assertEqual(receipt['status'],'failed')
         left.limb.set_joint_positions.assert_called_once();left.grip.stop.assert_called_once()

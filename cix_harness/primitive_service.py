@@ -7,7 +7,7 @@ from .kinematics import IKUnreachableError
 from .primitives import SKILLS, TargetDepthError, TargetWorkspaceError, validate_profile, plan, ground_pixel, eef_from_tcp, tcp_from_eef, check_tcp
 from .workspace import workspace_metadata
 from .planning import candidate_profiles,stage_phase
-from .collision import ArmCollisionError
+from .collision import ArmCollisionError, PeerJointMovedError
 from .moveit_guard import MoveItGuard, MoveItCollisionError, options as collision_options
 
 
@@ -55,6 +55,18 @@ def _peer_path_check(robot,skill,holding):
     if skill=='clear_view' and holding is False:
         return getattr(type(robot),'check_empty_clear_view_path',check)
     return check
+
+
+def undispatched_peer_failure(plan_id,prepared,error,remaining,duration):
+    if prepared is None or prepared[0]!=plan_id:
+        raise ValueError('Plan consumed or superseded; never replay')
+    return {'plan_id':plan_id,'skill':prepared[6],'status':'failed','failure_code':'execution_failed',
+            'failure_type':type(error).__name__,'message':str(error),'applied':False,
+            'completed_stages':[],'completed_stage_count':0,'confirmed_commands':0,
+            'failed_stage':{'stage_index':0,'phase':'dispatch_validation','status':'failed',
+                            'duration_s':duration,'command_state':'not_dispatched'},
+            'outcome_uncertain':False,'recoverable':False,'retryable':False,'stop_attempted':False,
+            'stopped':None,'stop_error':None,'gripping':None,'motion_remaining':remaining}
 
 
 class PrimitiveService:
@@ -310,8 +322,13 @@ class PrimitiveService:
         return result
 
     def _execute(self,plan_id,timings,started):
-        with _measure(timings,'execution_validation'):
-            prepared=self._validate_execution(plan_id)
+        candidate=self.prepared
+        try:
+            with _measure(timings,'execution_validation'):
+                prepared=self._validate_execution(plan_id)
+        except PeerJointMovedError as error:
+            return undispatched_peer_failure(plan_id,candidate,error,self.robot.motion_remaining,
+                                             timings['execution_validation'])
         token,created,initial,stages,paths,operations,skill,holding=prepared;r=self.robot;p=self.profile
         r.motion_remaining-=operations;receipts=[];grasp_verified=False
         r.audit('primitive_dispatch',plan_id=token,skill=skill,stages=stages,timings_s=dict(timings))

@@ -183,9 +183,8 @@ class MoveItGuard:
         began = time.monotonic()
         if set(initial) != self.active:
             raise RuntimeError('MoveIt requires all seven selected arm joints')
-        reference = self.execution_reference or self.peer()
-        if executing:
-            self.execution_reference = reference
+        reference = (self.check_inactive(self.execution_reference) if self.execution_reference is not None
+                     else self.peer())
         try:
             if self.ros is None:
                 self._connect()
@@ -211,6 +210,10 @@ class MoveItGuard:
             _, final_scene = self._scene()
             if final_scene != evidence:
                 raise RuntimeError('MoveIt scene geometry or allowed collision matrix changed during validation')
+            if executing:
+                # Monitor from the pose whose full geometry just cleared this
+                # segment. Never move the anchor when a check fails.
+                self.execution_reference = reference
         except MoveItCollisionError:
             raise
         except Exception:

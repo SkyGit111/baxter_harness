@@ -6,7 +6,7 @@ silently enables additional robot RPCs.
 """
 from .contract import ACTION_SPEC
 from .primitives import SKILLS
-from .primitive_runner import finish_execution_failure,log_execution_receipt
+from .primitive_runner import PeerMotionRecovery,finish_execution_failure,log_execution_receipt
 from .task_plan import VLA_SKILLS
 from .rpc import HttpRpcClient
 from .rollout import predict, rollout, validate_motion_model
@@ -66,6 +66,7 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
     recoveries = 0; empty_grasps = 0; turns = 0; used_views = set(); retract_pending = False
     max_recoveries = getattr(args, 'max_recoveries', 3)
     max_grasp_retries = getattr(args, 'max_grasp_retries', 1)
+    peer_recovery = PeerMotionRecovery()
 
     def finish(status, evidence=''):
         log('finish', status=status, evidence=evidence)
@@ -98,6 +99,8 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
             raise RuntimeError('Robot profile changed during the task; reinitialize the task')
         if args.execute and health.get('armed') is not True: raise RuntimeError('Robot became read-only')
         obs, available = observe(health)
+        problem = peer_recovery.observation_error(obs, log)
+        if problem: return finish(problem)
         views = [i for i in obs.get('recovery', {}).get('view_indices', []) if i not in used_views]
         view_index = None; recovering = retract_pending
         if retract_pending:
@@ -177,6 +180,8 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
         kwargs = {'kwargs': {'view_index': view_index}} if view_index is not None else {}
         prepared = robot.call('primitive.prepare', (obs['id'], skill, decision.get('uv')), timeout_s=60, **kwargs)
         log('primitive_plan', **prepared)
+        problem = peer_recovery.plan_error(prepared, obs, log)
+        if problem: return finish(problem)
         if prepared.get('status') == 'rejected':
             if prepared.get('recoverable') is not True or prepared.get('applied') is not False:
                 return finish(prepared.get('failure_code', 'preflight_rejected'))
@@ -186,7 +191,12 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
         if not args.execute: return finish('preview')
         # A lost response may mean physical motion happened. Never retry this call.
         receipt = robot.call('primitive.execute', (prepared['plan_id'],), timeout_s=600)
-        log_execution_receipt(log,receipt,prepared['plan_id']); turns += 1
+        log_execution_receipt(log,receipt,prepared['plan_id'])
+        if peer_recovery.request(receipt, obs, max_recoveries-recoveries, executive.recovery_allowed, log):
+            recoveries += 1
+            if view_index is not None: used_views.discard(view_index)
+            continue
+        turns += 1
         if receipt.get('status') == 'failed':
             if (skill != 'pick' or receipt.get('failure_code') != 'empty_grasp' or
                 receipt.get('recoverable') is not True or receipt.get('stopped') is not True or

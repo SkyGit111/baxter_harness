@@ -5,6 +5,7 @@ import time
 
 from .task_plan import EXPECTED, VLA_SKILLS, compact_state, validate_plan, validate_check, workspace_context
 from .primitives import SKILLS
+from .primitive_runner import PeerMotionRecovery, peer_moved_before_dispatch
 from .task_monitor import TaskMonitor
 
 
@@ -389,9 +390,10 @@ class TaskExecutive:
             self.applied+=self.primitive_evidence['commands_applied'] or 0
             self.released=self.primitive_evidence['confirmed_release'] is True
             if fields.get('status') == 'failed':
-                self.failed(fields.get('failure_code','execution_failed'))
+                peer_changed=peer_moved_before_dispatch(fields)
+                self.failed(PeerMotionRecovery.cause if peer_changed else fields.get('failure_code','execution_failed'))
                 self.feedback.update({k:fields[k] for k in ('applied','message','outcome_uncertain','stopped','failed_stage','confirmed_commands') if k in fields})
-                if fields.get('recoverable') is False:self.current['status']='failed'
+                if fields.get('recoverable') is False and not peer_changed:self.current['status']='failed'
             elif fields.get('status') == 'completed' and fields.get('applied') is True:
                 self.primitive_ok = True; self.current['status'] = 'awaiting_verification'; self.dispatch = None
                 # Verify_grasp stages belong to this primitive. Do not mistake a planned release for a drop.

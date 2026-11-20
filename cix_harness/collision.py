@@ -26,6 +26,10 @@ class PeerStateChangedError(RuntimeError):
     pass
 
 
+class PeerJointMovedError(PeerStateChangedError):
+    """A measured inactive-arm joint left the previously checked motion envelope."""
+
+
 class ClearanceUnavailableError(RuntimeError):
     pass
 
@@ -389,8 +393,14 @@ class InterArmGuard:
 
     def check_peer(self,reference,current):
         a,b=state_joints(reference),state_joints(current)
-        if set(a)!=set(b) or max(abs(a[n]-b[n]) for n in a)>self.cfg['max_peer_joint_drift_rad']:
-            raise PeerStateChangedError('Inactive arm moved since observation; reobserve before motion')
+        if set(a)!=set(b):
+            raise PeerStateChangedError('Inactive arm joint names changed since observation')
+        joint=max(a,key=lambda name:abs(a[name]-b[name]))
+        drift=abs(a[joint]-b[joint])
+        limit=self.cfg['max_peer_joint_drift_rad']
+        if drift>limit:
+            raise PeerJointMovedError(f'Inactive arm moved since observation: {joint} changed {drift:.5f} rad '
+                                      f'(limit {limit:.5f}); reobserve before motion')
         if type(current.get('gripping')) is not bool or current['gripping']!=reference.get('gripping'):
             raise PeerStateChangedError('Inactive arm occupancy changed or is unknown')
         x=reference.get('gripper_percent');y=current.get('gripper_percent')

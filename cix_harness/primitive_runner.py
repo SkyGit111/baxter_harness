@@ -97,6 +97,69 @@ def finish_execution_failure(log,receipt):
     return 2
 
 
+def peer_moved_before_dispatch(receipt):
+    """Recognize a consumed plan refused before its first command, including older bridges."""
+    stage=receipt.get('failed_stage') or {}
+    reason=receipt.get('message') or ''
+    legacy=(receipt.get('failure_type')=='PeerStateChangedError' and
+            (reason=='Inactive arm moved since observation; reobserve before motion' or
+             reason.startswith('Inactive arm moved since observation: ')))
+    return (receipt.get('status')=='failed' and receipt.get('failure_code')=='execution_failed' and
+            (receipt.get('failure_type')=='PeerJointMovedError' or legacy) and
+            receipt.get('applied') is False and receipt.get('outcome_uncertain') is False and
+            type(receipt.get('confirmed_commands')) is int and receipt['confirmed_commands']==0 and
+            type(receipt.get('completed_stage_count')) is int and receipt['completed_stage_count']==0 and
+            receipt.get('completed_stages')==[] and isinstance(stage,dict) and
+            type(stage.get('stage_index')) is int and stage['stage_index']==0 and
+            stage.get('status')=='failed' and stage.get('command_state')=='not_dispatched' and
+            receipt.get('stop_attempted') is False and receipt.get('stopped') is None and
+            not receipt.get('stop_error') and not receipt.get('arm_state_errors'))
+
+
+class PeerMotionRecovery:
+    """One fresh observation and new planning opportunity per task. Never reuse the old token."""
+    cause='peer_moved_before_dispatch'
+
+    def __init__(self):
+        self.plan_id=None
+        self.waiting_for_observation=False
+        self.waiting_for_plan=False
+
+    def request(self,receipt,obs,remaining,allowed,log):
+        if self.plan_id is not None or remaining<=0 or not peer_moved_before_dispatch(receipt):
+            return False
+        state=obs['state']
+        if type(state.get('gripping')) is not bool or (allowed and not allowed(self.cause)):
+            return False
+        self.plan_id=receipt['plan_id'];self.obs_id=obs['id']
+        self.arm=state.get('arm');self.gripping=state['gripping']
+        self.waiting_for_observation=True;self.waiting_for_plan=True
+        log('recovery',kind='reobserve_peer_motion',cause=self.cause,attempt=1,
+            retired_plan_id=self.plan_id,previous_obs_id=self.obs_id,replayed=False)
+        return True
+
+    def observation_error(self,obs,log):
+        if not self.waiting_for_observation:return None
+        state=obs['state']
+        if not obs.get('id') or obs['id']==self.obs_id:return 'peer_recovery_observation_not_fresh'
+        if state.get('arm')!=self.arm or state.get('gripping') is not self.gripping:
+            return 'active_grasp_or_arm_changed_during_peer_recovery'
+        self.waiting_for_observation=False
+        log('peer_motion_reobserved',obs_id=obs['id'],previous_obs_id=self.obs_id,
+            retired_plan_id=self.plan_id,arm=self.arm,gripping=self.gripping)
+        return None
+
+    def plan_error(self,prepared,obs,log):
+        if self.plan_id is None:return None
+        if prepared.get('plan_id')==self.plan_id:return 'peer_recovery_plan_token_reused'
+        if not self.waiting_for_plan or prepared.get('status')=='rejected':return None
+        if not prepared.get('plan_id') or prepared.get('obs_id',obs['id'])!=obs['id'] or obs['id']==self.obs_id:
+            return 'peer_recovery_plan_without_fresh_observation'
+        self.waiting_for_plan=False
+        log('peer_motion_replanned',obs_id=obs['id'],plan_id=prepared['plan_id'],retired_plan_id=self.plan_id)
+        return None
+
+
 def run(args,log,robot=None,planner=decide,recovery_allowed=None):
     from .timing import timed_rpc
     robot=timed_rpc(robot or HttpRpcClient(args.robot_port),log)
@@ -106,10 +169,13 @@ def run(args,log,robot=None,planner=decide,recovery_allowed=None):
     history=[];completed=[];used_views=set();recoveries=0;actions=0;empty_grasps=0;retract_pending=False
     max_recoveries=getattr(args,'max_recoveries',3)
     max_grasp_retries=getattr(args,'max_grasp_retries',1)
+    peer_recovery=PeerMotionRecovery()
     log('start',route='primitives',goal=instruction(args.task),mode='live' if args.execute else 'preview')
     # A preflight rejection spends recovery budget, but no motion/skill turn.
     for _ in range(args.max_turns+max_recoveries+1):
         obs=robot.call('primitive.observe');log.camera(obs,'primitive')
+        problem=peer_recovery.observation_error(obs,log)
+        if problem:log('finish',status=problem);return 2
         views=[i for i in obs.get('recovery',{}).get('view_indices',[]) if i not in used_views]
         view_index=None;is_retraction=retract_pending
         if retract_pending:
@@ -145,6 +211,8 @@ def run(args,log,robot=None,planner=decide,recovery_allowed=None):
         if view_index is not None:used_views.add(view_index)
         prepared=robot.call('primitive.prepare',(obs['id'],decision['skill'],decision['uv']),timeout_s=60,**options)
         log('primitive_plan',**prepared)
+        problem=peer_recovery.plan_error(prepared,obs,log)
+        if problem:log('finish',status=problem);return 2
         if prepared.get('status')=='rejected':
             history.append(feedback(decision,prepared))
             if prepared.get('recoverable') is not True or prepared.get('applied') is not False:
@@ -155,8 +223,13 @@ def run(args,log,robot=None,planner=decide,recovery_allowed=None):
         if not args.execute:return 0
         # A lost response can follow real motion: never automatically retry this call.
         receipt=robot.call('primitive.execute',(prepared['plan_id'],),timeout_s=600)
-        log_execution_receipt(log,receipt,prepared['plan_id']);actions+=1
+        log_execution_receipt(log,receipt,prepared['plan_id'])
         history.append(feedback(decision,receipt))
+        if peer_recovery.request(receipt,obs,max_recoveries-recoveries,recovery_allowed,log):
+            recoveries+=1
+            if view_index is not None:used_views.discard(view_index)
+            continue
+        actions+=1
         if receipt.get('status','completed')=='failed':
             if (decision['skill']!='pick' or receipt.get('failure_code')!='empty_grasp'
                 or receipt.get('recoverable') is not True or receipt.get('stopped') is not True

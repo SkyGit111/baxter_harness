@@ -16,8 +16,8 @@ from pathlib import Path
 from .baxter import Baxter, validate_config
 from .camera import D455Camera
 from .collision import (ArmCollisionError, ClearanceUnavailableError, InterArmGuard,
-                        KDLArmCapsules, PeerStateChangedError, validate_clearance_config)
-from .primitive_service import PrimitiveService
+                        KDLArmCapsules, PeerJointMovedError, PeerStateChangedError, validate_clearance_config)
+from .primitive_service import PrimitiveService, undispatched_peer_failure
 from .primitives import tcp_from_eef
 from .rpc import serve
 from .workspace import workspace_metadata
@@ -231,9 +231,18 @@ class DualBridge:
         try:
             if empty_clear_view and self.robots[arm].read_state().get('gripping') is not False:
                 raise PeerStateChangedError('Empty clear-view grasp state changed before planning')
-            self.clearance_receipt=self.guard.path_clearance(arm,self.robots[arm].joints(),paths,
-                                                            self.peer_reference,self.robots[peer].read_state(),
-                                                            **({'active_holding':False} if empty_clear_view else {}))
+            measured=self.robots[peer].read_state()
+            reference=self.peer_reference
+            rechecking=self.executing_arm==arm
+            if rechecking:
+                self.guard.check_peer(reference,measured)
+                reference=measured
+            receipt=self.guard.path_clearance(arm,self.robots[arm].joints(),paths,reference,measured,
+                                              **({'active_holding':False} if empty_clear_view else {}))
+            if rechecking:
+                self.guard.check_peer(reference,self.robots[peer].read_state())
+                self.peer_reference=reference
+            self.clearance_receipt=receipt
         finally:self.clearance_seconds=time.monotonic()-began
         return self.clearance_receipt
 
@@ -260,8 +269,15 @@ class DualBridge:
                 if not self.armed:raise RuntimeError('Dual bridge is read-only')
                 if keep is None:raise ValueError('Selected arm changed; obtain a new observation and plan')
                 self.executing_arm=arm
-                self.check_running_arm(arm)
-                result=self.services[arm].execute(plan_id)
+                service=self.services[arm]
+                try:
+                    self.check_running_arm(arm)
+                except PeerJointMovedError as error:
+                    result=undispatched_peer_failure(plan_id,service.prepared,error,self.shared.remaining,
+                                                     time.monotonic()-began)
+                    self.robots[arm].audit('primitive_failed',error=str(error),**result)
+                else:
+                    result=service.execute(plan_id)
                 result['selected_arm']=arm
                 result['arm_states']={};state_errors={}
                 for selected in ARMS:
