@@ -247,12 +247,16 @@ class DualBridge:
             measured=self.robots[peer].read_state()
             reference=self.peer_reference
             rechecking=self.executing_arm==arm
+            fresh_plan=self.guard.cfg.get('peer_motion_policy')=='swept_clearance' and not rechecking
             if rechecking:
                 self.guard.check_peer(reference,measured,checked_path=self.clearance_receipt,peer_arm=peer)
                 reference=measured
+            elif fresh_plan:
+                self.guard.peer_joint_pair(reference,measured)
+                reference=measured
             receipt=self.guard.path_clearance(arm,self.robots[arm].joints(),paths,reference,measured,
                                               **({'active_holding':False} if empty_clear_view else {}))
-            if rechecking:
+            if rechecking or fresh_plan:
                 self.guard.check_peer(reference,self.robots[peer].read_state(),checked_path=receipt,peer_arm=peer)
                 self.peer_reference=reference
             self.clearance_receipt=receipt

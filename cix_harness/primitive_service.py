@@ -346,6 +346,7 @@ class PrimitiveService:
         finally:
             if self.moveit is not None:
                 self.moveit.execution_reference = None
+                self.moveit.checked_robot_state = None
         timings['execute_total']=time.monotonic()-started
         result['timings_s']=timings
         if result['status']=='completed':self.robot.audit('primitive_completed',**result)
@@ -430,7 +431,7 @@ class PrimitiveService:
                                     segments=[(stage_index+i,stage_phase(suffix,i,'place'),path) for i,path in enumerate(new_paths)]
                                     self.moveit.check(joints,segments,executing=True)
                                 stages[stage_index:]=suffix;paths[stage_index:]=new_paths
-                                r.motion_remaining-=1;ring_iterations+=1
+                                r.motion_remaining-=1;operations+=1;ring_iterations+=1
                                 r.audit('ring_servo_replanned',plan_id=token,iteration=ring_iterations,frame_number=frame,
                                         stage_index=stage_index,correction_tcp_m=suffix[0]['tcp_m'],
                                         measured_offset_xy_m=[offset.dx,offset.dy],allowance_m=offset.allowance)

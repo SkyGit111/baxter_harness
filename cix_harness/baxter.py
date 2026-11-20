@@ -193,7 +193,7 @@ class Baxter:
     def ready(self):
         guard = getattr(self, 'primitive_moveit_guard', None)
         if guard is not None and guard.execution_reference is not None:
-            guard.check_inactive(guard.execution_reference)
+            guard.check_inactive(guard.execution_reference,during_motion=True)
         if time.monotonic() >= getattr(self,'lease_end',math.inf):
             raise RuntimeError('Motion lease expired')
         state = self.enable.state()

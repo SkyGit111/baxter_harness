@@ -64,6 +64,21 @@ class MoveItPrimitivePath(unittest.TestCase):
             self.guard.check(self.start,segments,executing=True)
         self.assertIs(self.guard.execution_reference,checked)
 
+    def test_far_peer_motion_with_metric_certificate_still_checks_actual_body_and_head(self):
+        self.guard.check(self.start,[(0,'transit',self.knots)],executing=True)
+        self.full=dict(self.full,left_s1=.39,right_s0=.05)
+        certificate=Mock(return_value=True)
+        with patch.object(type(self.r),'peer_path_supports',certificate,create=True):
+            self.guard.check_inactive(self.guard.execution_reference,during_motion=True)
+            self.assertEqual(self.seen[-1]['left_s1'],.39)
+            self.assertEqual(self.seen[-1]['right_s0'],.05)
+            self.guard._valid=Mock(return_value=NS(valid=False,contacts=[]))
+            with self.assertRaises(MoveItCollisionError):
+                self.guard.check_inactive(self.guard.execution_reference,during_motion=True)
+            self.full=dict(self.full,head_pan=.30)
+            with self.assertRaisesRegex(RuntimeError,'Head moved'):
+                self.guard.check_inactive(self.guard.execution_reference,during_motion=True)
+
     def test_continuous_points_are_from_actual_cubic_executor(self):
         self.r.cfg['planning']['trajectory_mode'] = 'continuous'
         knots = [dict(self.start, right_s0=.04, right_w0=.09), dict(self.start, right_s0=.10, right_w0=.11)]

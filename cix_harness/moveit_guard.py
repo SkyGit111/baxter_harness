@@ -96,6 +96,7 @@ class MoveItGuard:
         self.inactive = joint_names('right' if self.arm == 'left' else 'left') | {'head_pan'}
         self.required_world = required_world
         self.execution_reference = None
+        self.checked_robot_state = None
         self.ros = None
 
     def _connect(self):
@@ -166,10 +167,26 @@ class MoveItGuard:
             raise RuntimeError('Fresh measured joints of both arms and head required by MoveIt')
         return values
 
-    def check_inactive(self, reference):
+    def check_inactive(self, reference, *, during_motion=False):
         values = self.peer()
-        if any(abs(values[n] - reference[n]) > .015 for n in self.inactive):
-            raise RuntimeError('Inactive arm or head moved during MoveIt collision validation')
+        if abs(values['head_pan']-reference['head_pan'])>.015:
+            raise RuntimeError('Head moved during MoveIt collision validation')
+        if any(abs(values[n]-reference[n])>.015 for n in self.inactive):
+            validate=getattr(type(self.robot),'peer_path_supports',None)
+            if not callable(validate) or not validate(self.robot,values):
+                raise RuntimeError('Inactive arm moved during MoveIt collision validation')
+            if during_motion:
+                # A metric cross-arm clearance certificate covers the whole
+                # segment. Check the measured body against all the other FCL
+                # geometry too, including the table and any attached objects.
+                if self.checked_robot_state is None:
+                    raise RuntimeError('Missing the MoveIt scene for measured body revalidation')
+                joints=self.checked_robot_state.joint_state
+                joints.position=[values.get(n,q) for n,q in zip(joints.name,joints.position)]
+                result=self._valid(self.checked_robot_state)
+                if result.valid is not True:
+                    contacts=[(c.contact_body_1,c.contact_body_2) for c in result.contacts]
+                    raise MoveItCollisionError('Measured robot in collision after peer displacement: '+str(contacts))
         return values
 
     def _valid(self, state):
@@ -214,6 +231,7 @@ class MoveItGuard:
                 # Monitor from the pose whose full geometry just cleared this
                 # segment. Never move the anchor when a check fails.
                 self.execution_reference = reference
+                self.checked_robot_state = state
         except MoveItCollisionError:
             raise
         except Exception:

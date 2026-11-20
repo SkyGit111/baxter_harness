@@ -8,7 +8,8 @@ from cix_harness import ring_peg
 from cix_harness.primitive_service import PrimitiveService
 from cix_harness.primitives import plan
 from cix_harness.task_plan import workspace_context
-from tests.test_primitives import Execution,profile
+from tests import test_primitives
+from tests.test_primitives import profile
 
 
 def example():
@@ -33,7 +34,7 @@ class RingTask(unittest.TestCase):
         ring.update(location='held',center_base_m=[.752,.27,.106]);scene['held_ring_id']=ring['id']
         state.update(gripping=True,eef_m=[.752,.27,.105],joint_names=['j'],joint_rad=[0.])
         stages=[{'kind':'gripper','open':True},{'kind':'verify_grasp','held':False}]
-        s,r=Execution().service(stages,True);s.profile=p;r.cfg['primitives']=p
+        s,r=test_primitives.Execution().service(stages,True);s.profile=p;r.cfg['primitives']=p
         token,created,initial,ss,paths,n,_,_=s.prepared;s.prepared=(token,created,initial,ss,paths,n,'place',True)
         _,detail=ring_peg.release_geometry(p,scene,state,ring,peg);s.ring_planned=(token,dict(detail,skill='place',obs_id='initial'))
         r.read_state.side_effect=lambda:copy.deepcopy(state);r.endpoint_position.side_effect=lambda:list(state['eef_m'])

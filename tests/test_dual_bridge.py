@@ -336,6 +336,23 @@ class DualBridgeTests(unittest.TestCase):
 
 
 class CapsuleGeometryTests(unittest.TestCase):
+    def test_metric_swept_margin_can_cover_measured_peer_drift_but_never_grip_change(self):
+        cfg=configuration()['inter_arm_clearance']
+        cfg.update(peer_motion_policy='swept_clearance',max_peer_joint_drift_rad=.01)
+        models={name:FakeModel(name,cfg) for name in ('left','right')}
+        guard=InterArmGuard(cfg,models)
+        models['right'].capsule_displacement_bounds=lambda excess:{'wrist':2*excess['right_j0']}
+        ref={'joint_names':['right_j0'],'joint_rad':[0.],'gripping':False,'gripper_percent':100.}
+        sample={**ref,'joint_rad':[.05]}
+        checked={'checked':True,'swept_intervals_checked':True,'minimum_clearance_m':.15}
+        self.assertAlmostEqual(guard.check_peer(ref,sample,checked_path=checked,peer_arm='right')['right_j0'],.05)
+        with self.assertRaises(PeerStateChangedError):
+            guard.check_peer(ref,sample,checked_path={**checked,'minimum_clearance_m':.10},peer_arm='right')
+        with self.assertRaisesRegex(PeerStateChangedError,'occupancy'):
+            guard.check_peer(ref,{**sample,'gripping':True},checked_path=checked,peer_arm='right')
+        with self.assertRaises(PeerStateChangedError):
+            guard.check_peer(ref,sample,peer_arm='right')
+
     def test_middle_link_crossing_is_detected_even_with_far_apart_endpoints(self):
         left=Capsule('left_elbow',(-1,0,0),(1,0,0),.05)
         right=Capsule('right_forearm',(0,-1,0),(0,1,0),.05)

@@ -49,6 +49,8 @@ def validate_clearance_config(cfg, armed=False):
         raise ValueError('Inter-arm capsule geometry must be explicitly verified before arming')
     _number(cfg['minimum_distance_m'],.005,.3,'minimum inter-arm distance')
     _number(cfg['max_peer_joint_drift_rad'],.001,.05,'inactive-arm joint drift')
+    if cfg.get('peer_motion_policy','joint_limit') not in ('joint_limit','swept_clearance'):
+        raise ValueError('Unknown inactive-arm motion policy')
     _number(cfg['max_joint_sample_rad'],.001,.05,'collision sampling step')
     _number(cfg.get('max_peer_gripper_drift_percent',2.),.1,10.,'inactive-gripper drift')
     if cfg.get('body_geometry','chain_segments') not in ('chain_segments','urdf_cylinders'):
@@ -391,16 +393,10 @@ class InterArmGuard:
         if set(models)!={'left','right'}:raise ClearanceUnavailableError('Both arm collision models are required')
         self.models=models
 
-    def check_peer(self,reference,current):
+    def peer_joint_pair(self,reference,current):
         a,b=state_joints(reference),state_joints(current)
         if set(a)!=set(b):
             raise PeerStateChangedError('Inactive arm joint names changed since observation')
-        joint=max(a,key=lambda name:abs(a[name]-b[name]))
-        drift=abs(a[joint]-b[joint])
-        limit=self.cfg['max_peer_joint_drift_rad']
-        if drift>limit:
-            raise PeerJointMovedError(f'Inactive arm moved since observation: {joint} changed {drift:.5f} rad '
-                                      f'(limit {limit:.5f}); reobserve before motion')
         if type(current.get('gripping')) is not bool or current['gripping']!=reference.get('gripping'):
             raise PeerStateChangedError('Inactive arm occupancy changed or is unknown')
         x=reference.get('gripper_percent');y=current.get('gripper_percent')
@@ -408,6 +404,30 @@ class InterArmGuard:
             raise PeerStateChangedError('Inactive gripper position is unknown')
         if abs(x-y)>self.cfg.get('max_peer_gripper_drift_percent',2.):
             raise PeerStateChangedError('Inactive gripper moved since observation')
+        return a,b
+
+    def check_peer(self,reference,current,*,checked_path=None,peer_arm=None):
+        a,b=self.peer_joint_pair(reference,current)
+        joint=max(a,key=lambda name:abs(a[name]-b[name]))
+        drift=abs(a[joint]-b[joint])
+        limit=self.cfg['max_peer_joint_drift_rad']
+        if drift>limit:
+            if (self.cfg.get('peer_motion_policy')=='swept_clearance' and checked_path
+                    and checked_path.get('checked') and checked_path.get('swept_intervals_checked')
+                    and peer_arm in self.models):
+                model=self.models[peer_arm]
+                bounds=getattr(model,'capsule_displacement_bounds',None)
+                if callable(bounds):
+                    # The original path includes every peer joint in its drift
+                    # box. Only the distance from this measurement to that box
+                    # consumes its remaining metric clearance.
+                    excess={n:max(0.,abs(a[n]-b[n])-limit) for n in a}
+                    extra=max(bounds(excess).values())
+                    clearance=checked_path['minimum_clearance_m']-extra
+                    if math.isfinite(clearance) and clearance>=self.cfg['minimum_distance_m']:
+                        return b
+            raise PeerJointMovedError(f'Inactive arm moved since observation: {joint} changed {drift:.5f} rad '
+                                      f'(limit {limit:.5f}); reobserve before motion')
         return b
 
     def current_clearance(self,arm,active_state,peer_state):
