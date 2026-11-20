@@ -46,8 +46,10 @@ class CallChain:
                      'task_step_failed','finish','stop','task_finished'):
             row={**self.context,**{k:item[k] for k in keys if k in item}}
             if event=='task_plan':row['steps']=item.get('steps',[])
+            if event=='primitive_plan' and item.get('moveit_full_path'):
+                row['moveit_full_path']=item['moveit_full_path']
             if event=='primitive_result':
-                row['stages']=[{k:s[k] for k in ('stage_index','phase','duration_s','timings_s','motion_detail') if k in s}
+                row['stages']=[{k:s[k] for k in ('stage_index','phase','duration_s','timings_s','motion_detail','moveit') if k in s}
                                for s in item.get('completed_stages',[])]
             self.rows.append(row)
 

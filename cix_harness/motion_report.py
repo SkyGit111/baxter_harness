@@ -46,6 +46,8 @@ def stage_rows(receipts, targets, state, skill, segments):
                'status': receipt.get('status', 'completed'), 'duration_s': receipt.get('duration_s'),
                'timings_s': receipt.get('timings_s'), 'gripping': receipt.get('gripping'),
                'measured_eef_displacement_m': math.dist(previous_eef, end) if previous_eef and end else None}
+        if receipt.get('moveit'):
+            row['moveit'] = receipt['moveit']
         if stage.get('kind') == 'move':
             row['requested_rotation_deg'] = angle_degrees(last_orientation, stage.get('xyzw'))
             last_orientation = stage.get('xyzw')
@@ -92,7 +94,7 @@ def summarize(folder, audit_path=None):
                     'selected_approach_path': event.get('selected_approach_path'),
                     'selected_yaw_rad': event.get('selected_yaw_rad'),
                     'nominal_motion_seconds': event.get('nominal_motion_seconds'),
-                    'motion_schedule': event.get('motion_schedule'),
+                    'motion_schedule': event.get('motion_schedule'), 'moveit_full_path': event.get('moveit_full_path'),
                     'execution_status': 'unknown', 'execute_timings_s': None, 'stages': []}
             if event.get('status') == 'ready':
                 plans[plan_id] = {'row': plan, 'state': observations.get(event.get('obs_id'), {}),

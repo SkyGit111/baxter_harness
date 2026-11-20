@@ -8,6 +8,7 @@ from .primitives import SKILLS, TargetDepthError, TargetWorkspaceError, validate
 from .workspace import workspace_metadata
 from .planning import candidate_profiles,stage_phase
 from .collision import ArmCollisionError
+from .moveit_guard import MoveItGuard, MoveItCollisionError, options as collision_options
 
 
 class SceneChangedError(ValueError):
@@ -55,6 +56,9 @@ class PrimitiveService:
         options=robot.cfg.get('planning',{})
         if not isinstance(options,dict) or options.get('trajectory_mode','legacy') not in ('legacy','continuous'):
             raise ValueError('Unsupported primitive trajectory mode')
+        backend, required_world = collision_options(options)
+        self.moveit = MoveItGuard(robot, required_world) if backend == 'moveit' else None
+        robot.primitive_moveit_guard = self.moveit
         self.profile=validate_profile(robot.cfg['primitives'])
         self.observation=None
         self.prepared=None
@@ -99,10 +103,11 @@ class PrimitiveService:
         timings={'grounding':0.,'skill_plan':0.,'ik_preflight':0.}
         try:
             result=self._prepare(obs_id,skill,uv,target_base_m,view_index,timings)
-        except (TargetDepthError,TargetWorkspaceError,SceneChangedError,IKPreflightError) as error:
+        except (TargetDepthError,TargetWorkspaceError,SceneChangedError,IKPreflightError,MoveItCollisionError) as error:
             # Only these explicit, pre-actuation failures permit replanning.
             code={TargetDepthError:'target_depth',TargetWorkspaceError:'target_workspace',
-                  SceneChangedError:'scene_changed',IKPreflightError:'ik_preflight'}[type(error)]
+                  SceneChangedError:'scene_changed',IKPreflightError:'ik_preflight',
+                  MoveItCollisionError:'moveit_collision'}[type(error)]
             result={'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,
                     'failure_code':code,'message':str(error),'recoverable':True}
         except BaseException as error:
@@ -131,7 +136,7 @@ class PrimitiveService:
             target=(ground_pixel(uv,depth,r.camera.intrinsics,p) if uv is not None else target_base_m)
             if target is not None:target=vector(target,3,'base target')
         peer_check=getattr(type(r),'check_other_arm_path',None)
-        attempts=[];last_error=None
+        attempts=[];last_error=None;moveit_receipt=None
         for yaw,candidate in candidate_profiles(p,obs['state'],skill,r.cfg.get('planning',{})):
             attempt_started=time.monotonic()
             route=candidate.get('approach_path','staged')
@@ -149,7 +154,13 @@ class PrimitiveService:
                 if callable(peer_check):
                     with _measure(timings,'other_arm_preflight'):
                         if peer_check(r,paths) is False:raise ValueError('Other arm path check rejected the plan')
-            except (IKPreflightError,ArmCollisionError) as error:
+                if self.moveit is not None:
+                    if len(paths) != len(stages):
+                        raise RuntimeError('Incomplete primitive paths for MoveIt')
+                    with _measure(timings,'moveit_full_path'):
+                        segments = [(i, stage_phase(stages, i, skill), path) for i, path in enumerate(paths)]
+                        moveit_receipt = self.moveit.check(initial, segments)
+            except (IKPreflightError,ArmCollisionError,MoveItCollisionError) as error:
                 attempts.append({'yaw_rad':yaw,'approach_path':route,'status':'rejected','reason':str(error),'seconds':time.monotonic()-attempt_started})
                 last_error=error
                 continue
@@ -173,6 +184,8 @@ class PrimitiveService:
                 'applied':False,'ik_preflight':True,'required_stages':operations,
                 'expires_in_s':r.cfg['max_observation_age_s'],'planning_candidates':attempts,
                 'selected_approach_path':route,'motion_schedule':motion_schedule,
+                'collision_backend':'moveit' if self.moveit is not None else 'builtin',
+                'moveit_full_path':moveit_receipt,
                 'nominal_motion_seconds':sum(s['nominal_duration_s'] for s in motion_schedule) if motion_schedule else None,
                 'selected_yaw_rad':yaw,'trajectory_mode':r.cfg.get('planning',{}).get('trajectory_mode','legacy')}
 
@@ -267,6 +280,9 @@ class PrimitiveService:
             self.robot.audit('primitive_execute_failed',plan_id=plan_id,status='failed',
                              error=str(error),timings_s=dict(timings))
             raise
+        finally:
+            if self.moveit is not None:
+                self.moveit.execution_reference = None
         timings['execute_total']=time.monotonic()-started
         result['timings_s']=timings
         self.robot.audit('primitive_completed' if result['status']=='completed' else 'primitive_recovery_available',**result)
@@ -278,19 +294,25 @@ class PrimitiveService:
         token,created,initial,stages,paths,operations,skill,holding=prepared;r=self.robot;p=self.profile
         r.motion_remaining-=operations;receipts=[];grasp_verified=False
         r.audit('primitive_dispatch',plan_id=token,skill=skill,stages=stages,timings_s=dict(timings))
-        stage=None;stage_started=None;stage_timings={};departed=False
+        stage=None;stage_started=None;stage_timings={};departed=False;actuation_attempted=False
         try:
             for stage_index,(stage,path) in enumerate(zip(stages,paths)):
                 stage_started=time.monotonic();stage_timings={}
-                phase=stage_phase(stages,stage_index,skill);motion_detail=None
+                phase=stage_phase(stages,stage_index,skill);motion_detail=None;moveit_receipt=None
                 r.audit('primitive_stage_started',plan_id=token,stage_index=stage_index,
                         skill=skill,backend='primitives',phase=phase,stage=stage)
                 with _measure(stage_timings,'stage_validation',timings):
-                    r.ready();r.joints()
+                    r.ready();initial=r.joints()
+                if self.moveit is not None:
+                    with _measure(stage_timings,'moveit_stage',timings):
+                        moveit_receipt = self.moveit.check(initial, [(stage_index, phase, path)], executing=True)
+                        measured = r.joints()
+                        if max(abs(measured[n]-initial[n]) for n in initial)>.015:
+                            raise RuntimeError('Arm moved during MoveIt trajectory revalidation')
                 if stage['kind']=='move':
                     with _measure(stage_timings,'motion_verification',timings):
                         if holding and not r.grip.gripping():raise RuntimeError('Held object lost before movement')
-                    initial=r.joints();options={}
+                    options={}
                     continuous=r.cfg.get('planning',{}).get('trajectory_mode')=='continuous'
                     if continuous:
                         with _measure(stage_timings,'trajectory_preflight',timings):
@@ -305,6 +327,7 @@ class PrimitiveService:
                         options={'continuous':True,'motion_phase':phase}
                     r.motion_context={'plan_id':token,'stage_index':stage_index,'skill':skill,'backend':'primitives','phase':phase}
                     with _measure(stage_timings,'motion',timings):
+                        actuation_attempted=True
                         motion_detail=r.move_segment(initial,path,r.endpoint_position(),max_travel=p['max_leg_m'],**options)
                     with _measure(stage_timings,'motion_verification',timings):
                         d,a=r.arrival_error(path[-1][1])
@@ -313,6 +336,7 @@ class PrimitiveService:
                         if holding and not r.grip.gripping():raise RuntimeError('Held object lost during movement')
                 elif stage['kind']=='gripper':
                     with _measure(stage_timings,'gripper_command',timings):
+                        actuation_attempted=True
                         if not r.grip.command_position(100. if stage['open'] else 0.,block=True,timeout=2):
                             raise RuntimeError('Gripper command timeout')
                     with _measure(stage_timings,'gripper_settle',timings):
@@ -332,6 +356,7 @@ class PrimitiveService:
                     receipt={'stage':stage,'eef_m':r.endpoint_position(),'gripping':bool(r.grip.gripping())}
                 receipt.update(stage_index=stage_index,phase=phase,duration_s=time.monotonic()-stage_started,timings_s=dict(stage_timings))
                 if isinstance(motion_detail,dict):receipt['motion_detail']=motion_detail
+                if moveit_receipt is not None:receipt['moveit']=moveit_receipt
                 receipts.append(receipt)
                 stage_started=None
                 r.audit('primitive_stage_applied',plan_id=token,**receipt)
@@ -340,6 +365,12 @@ class PrimitiveService:
             if stage_started is not None:
                 failed_stage={'stage':stage,'stage_index':stage_index,'phase':phase,'status':'failed','duration_s':time.monotonic()-stage_started,
                               'timings_s':dict(stage_timings)}
+            if self.moveit is not None and not actuation_attempted:
+                r.motion_remaining+=operations
+                timings['execute_total']=time.monotonic()-started
+                r.audit('primitive_failed',plan_id=token,status='failed',applied=False,error=str(error),
+                        completed_stages=len(receipts),failed_stage=failed_stage,timings_s=dict(timings))
+                raise
             stopped=False
             with _measure(timings,'stop'):
                 try:

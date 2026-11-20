@@ -13,6 +13,9 @@ def geometry_fingerprint(cfg):
                 'policy_to_base_xyzw', 'contact_guard', 'commissioning_scope')}
     geometry['primitives'] = {k: v for k, v in cfg.get('primitives', {}).items()
                               if k not in ('calibrated', 'notes')}
+    planning = cfg.get('planning', {})
+    if planning.get('collision_backend') == 'moveit':
+        geometry['moveit_required_world_objects'] = sorted(planning.get('moveit_required_world_objects', []))
     return hashlib.sha256(json.dumps(geometry, sort_keys=True, allow_nan=False).encode()).hexdigest()[:24]
 
 

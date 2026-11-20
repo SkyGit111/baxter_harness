@@ -41,6 +41,8 @@ def validate_config(cfg, armed):
         if not primitive_trial or hybrid_trial: validate_guard(cfg['contact_guard'])
         if primitive_trial:
             from .primitives import validate_profile
+            from .moveit_guard import options as collision_options
+            collision_options(cfg.get('planning', {}))
             validate_profile(cfg['primitives'])
             if armed and cfg['primitives'].get('calibrated') is not True:
                 raise ValueError('Primitive geometry must be measured before arming')
@@ -121,6 +123,8 @@ class Baxter:
         # The SDK caches the last pose and joints even after their publishers stop.
         self.state_times = {}
         self.state_stamps = {}
+        self.capture_body_joints = cfg.get('planning', {}).get('collision_backend') == 'moveit'
+        self.body_joint_sample = None
         self.wrist_state = None
         self.controller_feedback = {}
         self.subscribers = [
@@ -168,6 +172,7 @@ class Baxter:
                         ['vla'] if scope in ('supervised_policy_task', 'task_workspace') else [])
         return {"armed": self.armed, "can_preview_ik": self.calibrated_profile,
                 "backend_capabilities": capabilities,
+                "primitive_collision_backend": self.cfg.get('planning', {}).get('collision_backend', 'builtin') if 'primitives' in capabilities else None,
                 "hybrid_protocol": 'serialized_backends_v1' if scope == 'supervised_hybrid_task' else None,
                 "environment_fingerprint": geometry_fingerprint(self.cfg),
                 "ik_solver": self.cfg.get('ik_solver', 'baxter_service'),
@@ -180,6 +185,9 @@ class Baxter:
                 "policy_to_base_xyzw": self.cfg.get("policy_to_base_xyzw")}
 
     def ready(self):
+        guard = getattr(self, 'primitive_moveit_guard', None)
+        if guard is not None and guard.execution_reference is not None:
+            guard.check_inactive(guard.execution_reference)
         if time.monotonic() >= getattr(self,'lease_end',math.inf):
             raise RuntimeError('Motion lease expired')
         state = self.enable.state()
@@ -207,6 +215,18 @@ class Baxter:
         received = self.telemetry_time(message.header.stamp, key)
         if received is not None:
             self.state_times[key] = received
+            if key == 'joints' and getattr(self, 'capture_body_joints', False):
+                names = message.name
+                if (len(names) == len(message.position) == len(set(names))
+                        and all(math.isfinite(x) for x in message.position)):
+                    self.body_joint_sample = (received, dict(zip(names, message.position)))
+                else:
+                    self.body_joint_sample = None
+
+    def full_body_joint_sample(self):
+        if self.body_joint_sample is None:
+            raise RuntimeError('No complete measured Baxter joint sample for MoveIt')
+        return self.body_joint_sample
 
     def note_effector(self, message):
         received = self.telemetry_time(message.timestamp, "gripper")
