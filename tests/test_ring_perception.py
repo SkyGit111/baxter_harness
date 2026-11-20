@@ -147,3 +147,39 @@ class RingPerceptionTest(unittest.TestCase):
         self.assertEqual(observed['wrist_held_observation']['frame_number'],34)
         cv2.circle(color,(80,80),12,(20,45,235),-1)
         self.assertIsNone(held_ring(color,state,profile,scene))
+
+    def test_coarse_board_window_becomes_a_peg_only_after_current_wrist_cap_and_hole_match(self):
+        from cix_harness.primitive_service import PrimitiveService
+        from cix_harness.ring_peg import RingGeometryError
+        service=PrimitiveService.__new__(PrimitiveService)
+        service.profile={'ring_peg':{'wrist_alignment':{'cross_camera_tolerance_m':.012}}}
+        scene={'pegs':[],'rings':[{'id':'red','color':'red'}],'held_ring_id':'red','missing':[{'id':'post'}]}
+        candidate={'id':'post','color':'red','tip_base_m':[.60,.02,.10],'radius_interval_m':[.003,.0046]}
+        from importlib import import_module
+        wrist=import_module('cix_harness.ring_wrist')
+        match={'peg_radius_m':.0039,'peg_radius_error_m':.0006,'wrist_tip_base_m':[.601,.02,.10]}
+        with patch.object(wrist,'measure',side_effect=RingGeometryError('cap occluded')):
+            with self.assertRaises(RingGeometryError):service._confirm_wrist_peg(scene,{},candidate,None,{})
+        self.assertEqual(scene['pegs'],[])
+        with patch.object(wrist,'measure',return_value=dict(match,peg_radius_m=.011)):
+            with self.assertRaises(RingGeometryError):service._confirm_wrist_peg(scene,{},candidate,None,{})
+        self.assertEqual(scene['pegs'],[])
+        with patch.object(wrist,'measure',return_value=match):
+            service._confirm_wrist_peg(scene,{},candidate,None,{'frame_number':123})
+        self.assertEqual(scene['pegs'][0]['measurement_source'],'registered_board_and_current_wrist_cap')
+        self.assertEqual(scene['pegs'][0]['wrist_cap_frame']['frame_number'],123)
+        self.assertEqual(scene['missing'],[])
+
+    def test_fixed_cap_memory_requires_current_separated_rigid_mount_features(self):
+        from cix_harness.ring_wrist_shaft import registered_cap
+        rng=np.random.default_rng(9);image=rng.integers(0,255,(54,115,3),dtype=np.uint8)
+        landmarks=[{'id':name,'uv_px':[x,25],'bgr':image[20:31,x-5:x+6].tolist()}
+                   for name,x in [('blue',20),('corner',85)]]
+        record={'frame':'base','method':'visible_cap_with_measured_protrusion','mount_anchors':landmarks,
+                'observations':[{'arc_samples':16,'tip_interval_base_m':[[.6,.1,.08],[.6,.1,.09]]}]}
+        self.assertEqual(len(registered_cap(record,image)),2)
+        hidden=image.copy();hidden[18:34,75:95]=0
+        self.assertIsNone(registered_cap(record,hidden))
+        moved=np.roll(image,3,axis=1)
+        self.assertIsNone(registered_cap(record,moved))
+        self.assertIsNone(registered_cap(dict(record,observations=[]),image))

@@ -1,7 +1,7 @@
 import time
 import unittest
 from types import SimpleNamespace as NS
-from unittest.mock import patch
+from unittest.mock import Mock,patch
 
 from cix_harness import ring_peg,ring_transport
 from cix_harness.primitive_service import PrimitiveService
@@ -52,6 +52,79 @@ class HeldRingTransport(unittest.TestCase):
         self.assertEqual(ring_peg.verified(action,self.scene,self.state),'move_to')
         for change in ({'held_ring_id':None},{'obs_id':'earlier'}):
             self.assertIsNone(ring_peg.verified(action,dict(self.scene,**change),self.state))
+
+    def test_near_hover_revised_peg_does_not_backtrack_to_the_pick_location(self):
+        target=ring_transport.hover(self.profile,self.peg)
+        self.state['eef_m']=[target[0]-.032,target[1]+.01,target[2]-.006]
+        self.assertFalse(ring_transport.at_hover(self.profile,self.state,self.peg))
+        self.assertTrue(ring_transport.near_peg(self.profile,self.state,self.peg))
+        ring_transport.release_profile(self.profile,self.state,self.peg)
+        receipt=self.prepare('move_to')
+        self.assertEqual(receipt['status'],'ready',receipt)
+        self.assertNotIn(self.profile['ring_peg']['transport']['via_tcp_base_m'],[s.get('tcp_m') for s in receipt['stages']])
+
+    def test_fresh_fk_can_verify_transport_when_peg_is_occluded_but_cannot_open(self):
+        target=ring_transport.hover(self.profile,self.peg)
+        self.state['eef_m']=[target[0]-.006,target[1]-.004,target[2]-.002]
+        self.service.ring_last_action={'skill':'move_to','peg_id':self.peg['id'],'ring_id':self.ring['id'],
+                                      'obs_id':'earlier','contact_tcp_m':target}
+        self.scene['pegs']=[]
+        self.service.robot.camera=NS(last_depth=Mock(),intrinsics=Mock())
+        obs={'id':'fresh','state':self.state}
+        with patch.object(self.service,'_ring_scene',return_value=self.scene),patch('cix_harness.primitive_service.workspace_metadata'),patch.dict('sys.modules',{'pyrealsense2':Mock()}):
+            self.service._describe_observation(obs)
+        transport=obs['ring_scene']['held_transport']
+        self.assertTrue(transport['at_hover']);self.assertFalse(transport['peg_currently_localized'])
+        self.assertEqual(obs['ring_scene']['verified_skill'],'move_to')
+        self.assertEqual(self.prepare('place')['status'],'rejected')
+
+    def test_depth_uncertainty_applies_to_held_ring_but_not_fingertip_height(self):
+        s=self.profile['ring_peg']
+        s.update(matching_parts_verified=True,vertical_uncertainty_m=.0056,
+                 release_gap_m=.004,fingertip_below_tcp_m=0.,
+                 guided_release={'exposed_height_range_m':[.09,.10],'max_free_drop_m':.04})
+        self.peg.update(tip_base_m=[.74,.27,-.05329],support_z_m=-.14791,support_uv_px=[40,70])
+        self.ring['depth_plane_p90_m']=.00764
+        h=ring_peg._guided_heights(s,self.ring,self.peg,-.04369,.013285)
+        self.assertAlmostEqual(h['planned_tcp_z_m'],-.04369)
+        self.assertAlmostEqual(h['free_drop_m'],.022885);self.assertAlmostEqual(h['free_drop_upper_m'],.036125)
+        self.assertAlmostEqual(h['guided_distance_m'],.09462)
+        self.assertEqual(ring_peg.resolve(self.profile,self.scene,self.state,'place',uv=[.40,.70])[1]['id'],self.peg['id'])
+        with self.assertRaisesRegex(ring_peg.RingGeometryError,'free drop'):
+            ring_peg._guided_heights(s,self.ring,self.peg,-.04369,.030)
+        self.peg['support_z_m']=self.peg['tip_base_m'][2]-.0898
+        uncertain=ring_peg._guided_heights(s,self.ring,self.peg,-.04369,.013285)
+        self.assertLess(uncertain['guided_distance_m'],.09);self.assertGreater(uncertain['guided_distance_range_m'][1],.09)
+        self.peg['support_z_m']=self.peg['tip_base_m'][2]-.06
+        with self.assertRaisesRegex(ring_peg.RingGeometryError,'interval'):
+            ring_peg._guided_heights(s,self.ring,self.peg,-.04369,.013285)
+
+    def test_guided_release_servo_corrects_height_and_bounds_a_best_effort_trial(self):
+        s=self.profile['ring_peg'];s.update(matching_parts_verified=True,vertical_uncertainty_m=.002,
+            fingertip_below_tcp_m=0.,guided_release={'exposed_height_range_m':[.035,.045],
+                'max_free_drop_m':.025,'matched_attempt_radius_fraction':.9})
+        self.peg['radius_m']=.0095
+        self.state['eef_m']=[.74,.27,.098]
+        self.ring['center_base_m']=[.747,.27,.116];self.ring['depth_plane_p90_m']=.001
+        prior={'peg_id':self.peg['id'],'ring_id':self.ring['id'],'color':'red'}
+        def check(**args):
+            return ring_peg.verify_before_open(self.profile,self.scene,self.state,prior,**args)
+        with self.assertRaises(ring_peg.RingAlignmentNeeded):check()
+        with self.assertRaises(ring_peg.RingAlignmentNeeded):check(servo_budget_spent=True,best_prior_offset_m=.003)
+        result=check(servo_budget_spent=True,best_prior_offset_m=.008)
+        self.assertEqual(result['release_basis'],'bounded_matching_parts_gravity_attempt')
+        self.assertAlmostEqual(result['release_xy_error_m'],.007)
+        self.ring['center_base_m'][0]=.751
+        with self.assertRaises(ring_peg.RingAlignmentNeeded):check(servo_budget_spent=True,best_prior_offset_m=.012)
+        self.ring['center_base_m']=[.74,.27,.109];self.state['eef_m'][2]=.091
+        with self.assertRaises(ring_peg.RingAlignmentNeeded) as low:check()
+        self.assertGreater(low.exception.dz,0.)
+        self.ring['center_base_m'][2]=.133;self.state['eef_m'][2]=.115
+        with self.assertRaises(ring_peg.RingAlignmentNeeded) as high:check()
+        self.assertLess(high.exception.dz,0.)
+        suffix=ring_peg.correction_suffix(self.profile,self.state,high.exception,[{'kind':'gripper','open':True}])
+        self.assertEqual(suffix[0]['tcp_m'][:2],self.state['eef_m'][:2])
+        self.assertLess(suffix[0]['tcp_m'][2],self.state['eef_m'][2])
 
 
 if __name__=='__main__':

@@ -48,6 +48,20 @@ class SurveyedFingertipContact(unittest.TestCase):
         with self.assertRaisesRegex(RingGeometryError, 'No fingertip contact depth'):
             self.contact()
 
+    def test_tangential_grip_requires_matching_sweep_and_reachable_opposing_walls(self):
+        survey = self.profile['ring_peg']['local_pick_support']
+        survey['grasp_offset_base_xy_m'] = [0., .006]
+        with self.assertRaisesRegex(RingGeometryError, 'Observed grasp offset'):
+            self.contact()
+        self.ring['local_support_reference_evidence']['grasp_offset_base_xy_m'] = [0., .006]
+        self.assertAlmostEqual(self.contact()[0][1], .206)
+        survey['grasp_offset_base_xy_m'] = [.006, 0.]
+        with self.assertRaisesRegex(RingGeometryError, 'opposing ring walls'):
+            self.contact()
+        survey['grasp_offset_base_xy_m'] = [0., .022]
+        with self.assertRaisesRegex(RingGeometryError, 'opposing ring walls'):
+            self.contact()
+
     def test_contact_upper_band_may_yield_a_clean_miss_without_lowering_the_table_floor(self):
         self.profile['ring_peg']['local_pick_support']['swept_table_upper_z_m'] = .0395
         contact, evidence = self.contact()

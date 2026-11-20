@@ -15,16 +15,27 @@ class RingViewConflict(RingGeometryError):
 
 
 class RingAlignmentNeeded(RingGeometryError):
-    def __init__(self,dx,dy,allowance,frame):
-        self.dx,self.dy,self.allowance,self.frame=dx,dy,allowance,frame
-        super().__init__('Observed hole is offset from peg by {:.1f} mm, allowance {:.1f} mm'.format(
-            1000*math.hypot(dx,dy),1000*allowance))
+    def __init__(self,dx,dy,allowance,frame,*,dz=0.):
+        self.dx,self.dy,self.dz,self.allowance,self.frame=dx,dy,dz,allowance,frame
+        if dz:message='Measured ring release height needs a vertical correction of {:.1f} mm'.format(1000*dz)
+        else:message='Observed hole is offset from peg by {:.1f} mm, allowance {:.1f} mm'.format(
+            1000*math.hypot(dx,dy),1000*allowance)
+        super().__init__(message)
 
 
 def validate_settings(settings):
     if 'transport' in settings:
         from .ring_transport import validate
         validate(settings['transport'])
+    if 'guided_release' in settings:
+        if settings.get('matching_parts_verified') is not True:
+            raise ValueError('Guided release requires verified matched parts')
+        guide=settings['guided_release']
+        lo,hi=vector(guide['exposed_height_range_m'],2,'measured exposed peg height range')
+        number(lo,.005,.30,'minimum exposed peg height');number(hi,lo,.30,'maximum exposed peg height')
+        number(guide['max_free_drop_m'],.001,.12,'maximum ring bottom to tip free drop')
+        if 'matched_attempt_radius_fraction' in guide:
+            number(guide['matched_attempt_radius_fraction'],.1,1.,'matched ring attempt fraction of projected hole radius')
     for name,low,high in [('ring_thickness_m',.001,.10),('horizontal_uncertainty_m',.0001,.10),
                           ('vertical_uncertainty_m',.0001,.10),('jaw_open_half_span_m',.002,.15),
                           ('finger_half_width_m',.0005,.05),('fingertip_below_tcp_m',0,.15),
@@ -217,6 +228,43 @@ def pick_geometry(profile,scene,ring,orientation):
                     'support_survey':survey_evidence,'tcp_table_error_m':s.get('tcp_table_error_m',0.)}
 
 
+def _guided_heights(s,ring,peg,tcp_z,bottom_offset):
+    """Propagate ring-size error only through the ring bottom, never through a physical fingertip."""
+    guide=s['guided_release'];tip=peg['tip_base_m'][2];support=peg['support_z_m']
+    rod_height=tip-support;lo,hi=guide['exposed_height_range_m']
+    core_error=s['vertical_uncertainty_m']+fit_error(peg,'depth_plane_p90_m')
+    tip_low,tip_high=tip-core_error,tip+core_error
+    if 'tip_position_interval_base_m' in peg:
+        bracket=peg['tip_position_interval_base_m']
+        if not isinstance(bracket,list) or len(bracket)!=2:raise RingGeometryError('Invalid observed peg tip bracket')
+        tip_low,tip_high=sorted(vector(v,3,'peg tip bound')[2] for v in bracket)
+        if not tip_low<=tip<=tip_high:raise RingGeometryError('Observed peg tip outside its reported height interval')
+        core_error=max(core_error,tip-tip_low,tip_high-tip)
+    support_error=fit_error(peg,'depth_support_spread_m')
+    physical_range=[tip_low-support-support_error,tip_high-support+support_error]
+    if physical_range[1]<lo or physical_range[0]>hi:
+        raise RingGeometryError('Observed exposed peg height interval differs from the estimated guide range')
+    ring_error=fit_error(ring,'depth_plane_p90_m')
+    # The same TCP change shifts both the finger and the ring. Choose the smallest
+    # vertical position satisfying their individual lower bounds above the tip.
+    finger_offset=-s['fingertip_below_tcp_m']
+    ring_error_bound=core_error+ring_error
+    safe_tcp_above_tip=s['release_gap_m']+max(core_error-finger_offset,ring_error_bound-bottom_offset)
+    planned_free=safe_tcp_above_tip+bottom_offset
+    free_upper=planned_free+ring_error_bound
+    if free_upper>guide['max_free_drop_m']:
+        raise RingGeometryError('Required ring bottom to peg tip free drop exceeds measured transfer allowance')
+    actual_free=tcp_z+bottom_offset-tip
+    return {'planned_tcp_z_m':tip+safe_tcp_above_tip,'free_drop_m':planned_free,'free_drop_upper_m':free_upper,
+            'current_free_drop_m':actual_free,'current_free_drop_upper_m':actual_free+ring_error_bound,
+            'max_free_drop_m':guide['max_free_drop_m'],'guided_distance_m':rod_height,
+            'guided_distance_range_m':physical_range,'site_height_estimate_m':[lo,hi],
+            'tip_measurement_source':peg.get('measurement_source'),'tip_depth_measured':peg.get('current_tip_depth_measured'),
+            'potential_fall_to_stack_m':planned_free+rod_height,
+            'potential_fall_to_stack_upper_m':free_upper+physical_range[1],'finger_tip_error_m':core_error,
+            'ring_relative_z_error_m':ring_error,'ring_tip_error_m':ring_error_bound}
+
+
 def release_geometry(profile,scene,state,ring,peg):
     """Allow gravity to thread the ring. The held annulus and fingers stay over the peg tip."""
     s=profile['ring_peg'];inner,outer=dimension(ring);tip=measured(peg,'tip_base_m',3)
@@ -233,10 +281,14 @@ def release_geometry(profile,scene,state,ring,peg):
         optical_error=s.get('relative_xy_uncertainty_m',s['horizontal_uncertainty_m'])
         margin=optical_error+fit_error(ring,'inner_boundary_p90_m')+fit_error(peg,'outer_boundary_p90_m')
     slope=math.hypot(axis[0],axis[1])/axis[2]; tilt=math.hypot(normal[0],normal[1]);down=outer*tilt+thick
-    center_z_above_tcp=center[2]-tcp[2];tip_gap=max(s['release_gap_m']+vertical,
-        s['fingertip_below_tcp_m']+center_z_above_tcp-down+vertical+s['release_gap_m'])
+    center_z_above_tcp=center[2]-tcp[2];guide=None
+    if 'guided_release' in s:
+        guide=_guided_heights(s,ring,peg,tcp[2],center_z_above_tcp-down)
+        tip_gap=guide['free_drop_m'];vertical=guide['ring_tip_error_m']
+    else:
+        tip_gap=max(s['release_gap_m']+vertical,s['fingertip_below_tcp_m']+center_z_above_tcp-down+vertical+s['release_gap_m'])
     drop=tip[2]+tip_gap-support
-    if drop+vertical>s['max_drop_m']:raise RingGeometryError('Release exceeds measured allowed fall to stack')
+    if guide is None and drop+vertical>s['max_drop_m']:raise RingGeometryError('Release exceeds measured allowed fall to stack')
     # After the rod enters the bore, it guides the fall. Only entry and passage
     # through the ring thickness require unsupported alignment at its tip.
     free_xy=inner*normal[2]-rod/axis[2]-margin-(tip_gap+thick)*slope-thick*tilt
@@ -254,9 +306,11 @@ def release_geometry(profile,scene,state,ring,peg):
         'peg_tip_base_m':tip,'ring_center_base_m':center,'free_xy_m':free_xy,'drop_m':drop,
         'alignment_sensor':'wrist' if wrist else 'D455','hole_to_tip_xy_m':offset,'matching_parts_verified':matched,
         'centering_goal_m':min(.001,inner*normal[2]*.25,max(.00035,optical_error*.5)),
+        'projected_inner_radius_m':inner*normal[2],'alignment_uncertainty_m':optical_error,
         'attempt_max_offset_m':min(.002,inner*normal[2]*.45),
         'stack_count_before':peg.get('stack_count'),'stack_depth_delta_before_m':peg.get('stack_depth_delta_m'),
         'stack_delta_from_frame':peg.get('stack_delta_from_frame'),'finger_bottom_z_m':tcp[2]-s['fingertip_below_tcp_m']}
+    if guide:evidence['guided_release']=guide
     return contact,evidence
 
 
@@ -275,37 +329,58 @@ def resolve(profile,scene,state,skill,uv=None,*,release_peg_id=None):
     ring=indexed(scene,'rings',scene.get('held_ring_id'))
     if ring.get('location')!='held' or s.get('source_ring_id') not in (None,ring['id']):raise RingGeometryError('Held ring identity unverified')
     peg=(indexed(scene,'pegs',release_peg_id) if release_peg_id is not None else
-         selected(scene,'pegs',uv,('tip_uv_px',),s.get('destination_peg_id')))
+         selected(scene,'pegs',uv,('tip_uv_px','support_uv_px'),s.get('destination_peg_id')))
     if color(ring)!=color(peg):raise RingGeometryError('Held ring and receiving peg colours differ')
     return ring,peg
 
 
-def verify_before_open(profile,scene,state,prior,*,servo_budget_spent=False):
+def verify_before_open(profile,scene,state,prior,*,servo_budget_spent=False,best_prior_offset_m=None):
     ring,peg=resolve(profile,scene,state,'place',release_peg_id=prior['peg_id'])
     if color(ring)!=prior['color'] or ring['id']!=prior['ring_id']:raise RingGeometryError('Held ring changed during transport')
-    _,e=release_geometry(profile,scene,state,ring,peg);s=profile['ring_peg']
+    requested,e=release_geometry(profile,scene,state,ring,peg);s=profile['ring_peg']
     gap=e['ring_bottom_z_m']-e['peg_tip_base_m'][2];error_xy=math.hypot(*e['hole_to_tip_xy_m'])
+    guide=e.get('guided_release');finger_gap=e['finger_bottom_z_m']-e['peg_tip_base_m'][2]
+    if guide:
+        tcp=tcp_from_eef(state['eef_m'],state['eef_xyzw'],profile)
+        dz=requested[2]-tcp[2]
+        if min(gap,finger_gap)<=0:
+            raise RingGeometryError('Measured ring or fingertips intersect peg height; reobserve before movement')
+        if gap<=guide['ring_tip_error_m'] or finger_gap<=guide['finger_tip_error_m']:
+            if dz>0:raise RingAlignmentNeeded(0.,0.,0.,scene.get('frame_number'),dz=dz)
     if gap<=e['vertical_uncertainty_m']:
         raise RingGeometryError('Held ring is too low for free lateral alignment above peg')
-    if e['finger_bottom_z_m']<=e['peg_tip_base_m'][2]+e['vertical_uncertainty_m']:
+    finger_error=guide['finger_tip_error_m'] if guide else e['vertical_uncertainty_m']
+    if e['finger_bottom_z_m']<=e['peg_tip_base_m'][2]+finger_error:
         raise RingGeometryError('Fingertips are below the allowed peg release window')
-    if e['ring_bottom_z_m']-e['support_z_m']+e['vertical_uncertainty_m']>s['max_drop_m']:
+    if not guide and e['ring_bottom_z_m']-e['support_z_m']+e['vertical_uncertainty_m']>s['max_drop_m']:
         raise RingGeometryError('Measured fall exceeds allowed drop')
     clear=e['free_xy_m']>0 and error_xy<e['free_xy_m']
     allowance=e['free_xy_m']
     if e['matching_parts_verified']:
         allowance=max(allowance,e['attempt_max_offset_m'] if servo_budget_spent else e['centering_goal_m'])
+    bounded=False
+    fraction=s.get('guided_release',{}).get('matched_attempt_radius_fraction')
+    if (fraction is not None and e['matching_parts_verified'] and servo_budget_spent and
+        best_prior_offset_m is not None and error_xy<=best_prior_offset_m+min(.00075,e['alignment_uncertainty_m'])):
+        adjusted=min(s.get('servo_step_m',.008),fraction*e['projected_inner_radius_m'])
+        bounded=allowance<error_xy<=adjusted
+        allowance=max(allowance,adjusted)
     if not clear and error_xy>allowance:
         raise RingAlignmentNeeded(*e['hole_to_tip_xy_m'],allowance,scene.get('frame_number'))
-    return dict(e,release_xy_error_m=error_xy,release_clearance_m=gap,
-                release_basis='resolved_clearance' if clear else 'centered_matching_parts_gravity_attempt')
+    if guide and guide['current_free_drop_upper_m']>guide['max_free_drop_m']:
+        if dz<0:raise RingAlignmentNeeded(0.,0.,0.,scene.get('frame_number'),dz=dz)
+        raise RingGeometryError('Measured ring is too far above the peg tip to release')
+    basis=('resolved_clearance' if clear else
+           ('bounded_matching_parts_gravity_attempt' if bounded else 'centered_matching_parts_gravity_attempt'))
+    return dict(e,release_xy_error_m=error_xy,release_clearance_m=gap,release_basis=basis,
+                applied_alignment_allowance_m=allowance,best_prior_offset_m=best_prior_offset_m)
 
 
 def correction_suffix(profile,state,offset,remaining):
-    """Take one bounded horizontal step. Replan release and vertical retreat from its endpoint."""
-    tcp=tcp_from_eef(state['eef_m'],state['eef_xyzw'],profile);error=math.hypot(offset.dx,offset.dy)
+    """Apply one observed alignment correction, preserving the fixation of the gripper."""
+    tcp=tcp_from_eef(state['eef_m'],state['eef_xyzw'],profile);error=math.hypot(offset.dx,offset.dy,offset.dz)
     bound=profile['ring_peg'].get('servo_step_m',.008);gain=min(.8,bound/error)
-    target=[tcp[0]+gain*offset.dx,tcp[1]+gain*offset.dy,tcp[2]]
+    target=[tcp[0]+gain*offset.dx,tcp[1]+gain*offset.dy,tcp[2]+gain*offset.dz]
     stage={'kind':'move','tcp_m':target,'xyzw':state['eef_xyzw'],'motion_phase':'placement'}
     suffix=[stage]
     for existing in remaining:

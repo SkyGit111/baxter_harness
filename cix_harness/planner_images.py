@@ -9,8 +9,11 @@ IMAGE_SYSTEM = '''Images belong to the same observation, but are different camer
 Image 1 is the external D455 scene view and is the ONLY pixel coordinate frame for uv.
 If present, image 2 is the selected robot arm's wrist camera. Use it as additional
 evidence of fingertip alignment, occupancy and local occlusion. Its viewpoint, scale,
-lighting and field of view differ; never copy wrist coordinates into uv. A wrist-only
-visible object cannot supply a scene uv: request a clear scene view instead. Do not
+lighting and field of view differ; never copy wrist coordinates into uv. For a matched
+peg localized by the calibrated detector in the current ring_scene.pegs, its tip_uv_px
+and support_uv_px are already in image 1. You may select either measured landmark even
+when the arm covers it in image 1. Normalize it using the scene resolution. For a
+wrist-only target without a registered scene landmark, request a new view. Do not
 infer a calibrated wrist-to-base transform or depth from this RGB image. Freshness
 metadata refers to observation assembly; reused images do not show subsequent motion.
 If views or telemetry disagree, report uncertainty and reobserve rather than declaring

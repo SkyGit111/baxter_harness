@@ -322,11 +322,18 @@ class Baxter:
                 # Leave time for the next D455 frame without expiring the wrist image.
                 self.wrist_condition.wait_for(lambda: self._eligible_wrist(wrist_limit-.07, True), timeout=.6)
         before_camera=time.monotonic()
-        image, captured, frame_number = self.camera.capture()
+        ring_settings=self.cfg.get('primitives',{}).get('ring_peg',{})
+        before_ring=self.read_state() if ring_settings.get('local_pick_support') else None
+        use_ring_window=before_ring is not None and before_ring['gripping'] is False
+        image,captured,frame_number=(self.camera.capture_ring_depth() if use_ring_window else self.camera.capture())
         after_camera=time.monotonic()
         obs_id = uuid.uuid4().hex
         state=self.read_state(frame_number)
         angles=dict(zip(state['joint_names'],state['joint_rad']))
+        if use_ring_window:
+            initial=dict(zip(before_ring['joint_names'],before_ring['joint_rad']))
+            if state['gripping'] is not False or initial.keys()!=angles.keys() or max(abs(initial[n]-v) for n,v in angles.items())>.005:
+                raise RuntimeError('Robot moved during stationary ring depth observation')
         obs = {"id": obs_id, "image": image, "state": state}
         after_state=time.monotonic()
         wrist = self._eligible_wrist(wrist_limit, auxiliary_wrist)
@@ -350,6 +357,9 @@ class Baxter:
         ended=time.monotonic()
         obs['camera_metadata']={'scene':{'source':'d455','frame_number':frame_number,
                                         'age_s':round(max(0.,ended-captured),4)}}
+        if use_ring_window:
+            window=self.camera.ring_depth_window
+            obs['camera_metadata']['scene']['stationary_depth_window']={k:window[k] for k in ('frame_numbers','depth_frame_numbers','duration_s')}
         if 'wrist_image' in obs:
             obs['camera_metadata']['wrist']={'source':self.cfg['arm']+'_wrist','arm':self.cfg['arm'],
                                             'frame_number':getattr(wrist[1].header,'seq',None),

@@ -92,6 +92,7 @@ class PrimitiveService:
             self.skills=tuple(s for s in self.skills if s in allowed_ring)
         self.ring_planned=None
         self.ring_last_action=None
+        self.ring_shaft_views={}
         self.observation=None
         self.prepared=None
 
@@ -128,11 +129,19 @@ class PrimitiveService:
             obs['ring_scene']=self._ring_scene(obs['state'],obs['id'])
             obs['ring_scene']['missed_ring']=ring_peg.missed_ring(self.ring_last_action,obs['ring_scene'],obs['state'])
             if 'transport' in self.profile['ring_peg']:
-                from .ring_transport import at_hover
+                from .ring_transport import at_hover,at_target,near_peg
                 scene=obs['ring_scene']
-                peg=next((row for row in scene.get('pegs',[]) if row['id']==self.profile['ring_peg'].get('destination_peg_id')),None)
-                scene['held_transport']={'skill':'move_to','peg_id':self.profile['ring_peg'].get('destination_peg_id'),
-                    'at_hover':bool(peg and peg.get('tip_base_m') and obs['state'].get('gripping') and at_hover(self.profile,obs['state'],peg))}
+                destination=self.profile['ring_peg'].get('destination_peg_id')
+                peg=next((row for row in scene.get('pegs',[]) if row['id']==destination),None)
+                held=obs['state'].get('gripping') is True
+                last=self.ring_last_action or {}
+                arrived=(held and last.get('skill')=='move_to' and last.get('peg_id')==destination and
+                         bool(last.get('contact_tcp_m')) and at_target(self.profile,obs['state'],last['contact_tcp_m']))
+                visible=bool(peg and peg.get('tip_base_m'))
+                scene['held_transport']={'skill':'move_to','peg_id':destination,'peg_currently_localized':visible,
+                    'at_hover':bool(arrived or (held and visible and at_hover(self.profile,obs['state'],peg))),
+                    'local_approach_available':bool(held and visible and near_peg(self.profile,obs['state'],peg)),
+                    'pose_reference':'completed_transport_and_current_fk' if arrived else ('current_peg' if visible else None)}
             obs['ring_scene']['verified_skill']=ring_peg.verified(self.ring_last_action,obs['ring_scene'],obs['state'])
         tcp=tcp_from_eef(obs['state']['eef_m'],obs['state']['eef_xyzw'],self.profile)
         views=self.profile.get('observation_tcp_m',[])
@@ -147,9 +156,24 @@ class PrimitiveService:
     def _ring_scene(self,state,obs_id,captured=None,settled_since=None):
         from .ring_perception import observe_ring_scene
         c=self.robot.camera
-        measured=observe_ring_scene(c.last_color,c.last_depth,c.intrinsics,self.profile,
-                                    self.profile['ring_peg']['perception'],state)
-        if (state.get('gripping') is True and not measured.get('held_ring_id')
+        window=(getattr(c,'ring_depth_window',None) if state.get('gripping') is False and
+                'local_pick_support' in self.profile['ring_peg'] else None)
+        measured=observe_ring_scene(c.last_color,window['depth_m'] if window else c.last_depth,c.intrinsics,
+            self.profile,self.profile['ring_peg']['perception'],state,**({'latest_depth_pair':window['latest_pair_m']} if window else {}))
+        if window:measured['stationary_depth_window']={k:window[k] for k in ('frame_numbers','depth_frame_numbers','duration_s')}
+        destination=self.profile['ring_peg'].get('destination_peg_id')
+        candidate=next((p for p in measured.get('provisional_pegs',[]) if p['id']==destination),None)
+        memory=self.profile['ring_peg'].get('wrist_alignment',{}).get('rigid_peg_memories',{}).get(destination)
+        matched=None
+        if memory and state.get('gripping') is True:
+            from .ring_wrist_shaft import registered_cap
+            matched=registered_cap(memory,c.last_color)
+            if matched:
+                existing=next((p for p in measured['pegs'] if p['id']==destination),{})
+                candidate=dict(memory['peg'],**{k:v for k,v in existing.items()
+                    if k.startswith('current_support') or k.startswith('stack_depth')})
+                measured['current_rigid_mount_matches']=matched
+        if (state.get('gripping') is True and (not measured.get('held_ring_id') or candidate is not None)
                 and 'wrist_alignment' in self.profile['ring_peg'] and hasattr(self.robot,'wrist_condition')):
             from .ring_wrist_held import held_ring
             if settled_since is None:settled_since=getattr(self.robot,'wrist_after_motion',-math.inf)
@@ -158,14 +182,100 @@ class PrimitiveService:
             except ring_peg.RingGeometryError as error:
                 measured['wrist_held_rejection']=str(error)
             else:
-                ring=held_ring(pixels,state,self.profile,measured,self.ring_last_action)
+                ring=(held_ring(pixels,state,self.profile,measured,self.ring_last_action)
+                      if candidate is not None or not measured.get('held_ring_id') else None)
                 measured['wrist_held_observation']=meta
                 if ring is not None:
                     ident=ring['id']
                     measured['rings']=[v for v in measured['rings'] if v['id']!=ident]+[ring]
                     measured['missing']=[v for v in measured['missing'] if v['id']!=ident]
                     measured['held_ring_id']=ident
+                if candidate is not None and measured.get('held_ring_id'):
+                    try:
+                        self._confirm_wrist_peg(measured,state,candidate,pixels,meta)
+                    except ring_peg.RingGeometryError as error:
+                        measured['wrist_peg_rejection']=str(error)
+                        if matched and ring is not None and not isinstance(error,ring_peg.RingViewConflict):
+                            self._use_fixed_cap(measured,candidate,ring,memory,meta)
+                        elif ring is not None and not matched:
+                            try:
+                                self._confirm_shaft_peg(measured,state,candidate,ring,pixels,meta)
+                            except ring_peg.RingGeometryError as shaft_error:
+                                measured['wrist_shaft_rejection']=str(shaft_error)
         return dict(measured,obs_id=obs_id,frame_number=c.last_number,resolution=[c.intrinsics.width,c.intrinsics.height])
+
+    def _confirm_wrist_peg(self,scene,state,candidate,pixels,meta):
+        from .ring_wrist import measure
+        settings=self.profile['ring_peg']['wrist_alignment']
+        ring=ring_peg.indexed(scene,'rings',scene['held_ring_id'])
+        if ring['color']!=candidate['color']:raise ring_peg.RingGeometryError('Different ring and mount colours')
+        match=measure(pixels,state,ring,candidate,settings)
+        radius=match['peg_radius_m'];error=match['peg_radius_error_m'];lo,hi=candidate['radius_interval_m']
+        if radius+error<lo or radius-error>hi:
+            raise ring_peg.RingGeometryError('Wrist cap diameter differs from the surveyed post')
+        if math.dist(match['wrist_tip_base_m'][:2],candidate['tip_base_m'][:2])>settings['cross_camera_tolerance_m']:
+            raise ring_peg.RingViewConflict('Wrist cap position differs from the registered board')
+        confirmed=dict(candidate,requires_current_wrist_tip=False,
+                       measurement_source='registered_board_and_current_wrist_cap',
+                       wrist_tip_base_m=match['wrist_tip_base_m'],tip_base_m=match['wrist_tip_base_m'],
+                       radius_m=radius,wrist_cap_frame=meta)
+        scene['pegs']=[p for p in scene['pegs'] if p['id']!=candidate['id']]+[confirmed]
+        scene['missing']=[p for p in scene['missing'] if p['id']!=candidate['id']]
+        scene['wrist_alignment']=dict(match,**meta)
+
+    def _use_fixed_cap(self,scene,candidate,ring,memory,meta):
+        tip=candidate['tip_base_m'];center=ring['center_base_m'];lo,hi=candidate['radius_interval_m']
+        cfg=self.profile['ring_peg']['wrist_alignment'];source=memory['method']+'_current_stand_and_wrist_hole'
+        error=memory['tip_xy_uncertainty_m']+ring['wrist_size_depth_uncertainty_m']*memory['max_hole_ray_slope']+cfg['relative_xy_uncertainty_m']
+        match={'offset_xy_m':[tip[i]-center[i] for i in (0,1)],'wrist_tip_base_m':tip,'wrist_hole_base_m':center,
+               'measurement_source':source,'uncertainty_m':error,'inner_radius_m':ring['inner_radius_m'],
+               'inner_radius_error_m':ring['inner_boundary_p90_m'],'peg_radius_m':candidate['radius_m'],
+               'peg_radius_error_m':(hi-lo)/2,'radii_source':'surveyed_physical_parts'}
+        peg=dict(candidate,measurement_source=source,requires_current_wrist_tip=False,
+                 cap_measurement_ids=[v['source_observation_id'] for v in memory['observations']])
+        scene['pegs']=[p for p in scene['pegs'] if p['id']!=peg['id']]+[peg]
+        scene['missing']=[p for p in scene['missing'] if p['id']!=peg['id']]
+        scene['wrist_alignment']=dict(match,**meta)
+
+    def _confirm_shaft_peg(self,scene,state,candidate,ring,pixels,meta):
+        from .ring_wrist_shaft import shaft_view,triangulate
+        settings=self.profile['ring_peg']['wrist_alignment']
+        now=dict(shaft_view(pixels,state,ring,candidate,settings),wrist_frame=meta)
+        ident=candidate['id']
+        history=self.ring_shaft_views.setdefault(ident,[])
+        references=settings.get('shaft_reference_views',{}).get(ident,[])+history
+        fits=[]
+        for old in references:
+            try:fits.append(triangulate(old,now,candidate))
+            except ring_peg.RingGeometryError:continue
+        # Retain distinct viewpoints at this peg across completed arm motions.
+        if all(math.dist(now['camera_origin'],s['camera_origin'])>=.016 for s in history):
+            history.append(now)
+            if len(history)>8:history.pop(0)
+        if not fits:raise ring_peg.RingGeometryError('Current shaft measured; a second wrist viewpoint is required')
+        best=min(fits,key=lambda f:f['condition'])
+        spread=max(math.dist(best['wrist_tip_base_m'],f['wrist_tip_base_m']) for f in fits)
+        if spread>.008:raise ring_peg.RingGeometryError('Shaft triangulations disagree on peg position')
+        tip=best['wrist_tip_base_m'];center=ring['center_base_m']
+        baseline_sigma=(best['condition']*max(s['fit_p90_px']+.5 for s in best['shaft_views'])
+                        *math.dist(tip,now['camera_origin'])/settings['K'][0][0])
+        outer_fraction=ring.get('wrist_size_depth_uncertainty_m',0.)
+        view_slope=math.hypot(center[0]-now['camera_origin'][0],center[1]-now['camera_origin'][1])/max(.001,abs(center[2]-now['camera_origin'][2]))
+        error=spread+baseline_sigma+view_slope*outer_fraction+settings['relative_xy_uncertainty_m']
+        lo,hi=candidate['radius_interval_m']
+        match={'offset_xy_m':[tip[i]-center[i] for i in (0,1)],'wrist_tip_base_m':tip,'wrist_hole_base_m':center,
+               'shaft_source':'current_registered_shaft_and_independent_wrist_pose','uncertainty_m':error,
+               'inner_radius_m':ring['inner_radius_m'],'inner_radius_error_m':ring['inner_boundary_p90_m'],
+               'peg_radius_m':candidate['radius_m'],'peg_radius_error_m':(hi-lo)/2,
+               'radii_source':'surveyed_physical_parts','alternative_tip_spread_m':spread}
+        confirmed=dict(candidate,requires_current_wrist_tip=False,
+                       measurement_source='current_wrist_and_independent_wrist_shaft',
+                       tip_base_m=tip,axis_base=best['axis_base'],shaft_geometry=best,
+                       support_center_base_m=best['support_base_m'])
+        # Short shaft segments inside the same-colour mount can intersect well
+        # without predicting the distal cap. Keep this estimate for view planning.
+        scene['provisional_shaft_estimate']=dict(confirmed,requires_current_wrist_tip=True)
+        scene['provisional_shaft_alignment']=dict(match,**meta)
 
     def _fresh_ring_wrist(self,state,captured,settled_since):
         from cv_bridge import CvBridge
@@ -448,7 +558,7 @@ class PrimitiveService:
         r.motion_remaining-=operations;receipts=[];grasp_verified=False
         r.audit('primitive_dispatch',plan_id=token,skill=skill,stages=stages,timings_s=dict(timings))
         stage=None;stage_started=None;stage_timings={};departed=False;actuation_attempted=False
-        stage_index=0;ring_iterations=0;settled_since=getattr(r,'wrist_after_motion',-math.inf)
+        stage_index=0;ring_iterations=0;best_xy_error=None;settled_since=getattr(r,'wrist_after_motion',-math.inf)
         try:
             while stage_index<len(stages):
                 stage,path=stages[stage_index],paths[stage_index]
@@ -502,15 +612,20 @@ class PrimitiveService:
                             try:
                                 if 'wrist_alignment' in p['ring_peg']:
                                     try:
-                                        scene['wrist_alignment']=self._ring_wrist_alignment(scene,measured_state,self.ring_planned[1]['peg_id'],captured,settled_since)
+                                        if 'wrist_alignment' not in scene:
+                                            scene['wrist_alignment']=self._ring_wrist_alignment(scene,measured_state,self.ring_planned[1]['peg_id'],captured,settled_since)
                                         r.audit('ring_wrist_alignment',plan_id=token,d455_frame_number=frame,**scene['wrist_alignment'])
                                     except ring_peg.RingViewConflict:raise
                                     except ring_peg.RingGeometryError as error:
                                         if not p['ring_peg'].get('matching_parts_verified'):raise
                                         r.audit('ring_wrist_unavailable',plan_id=token,d455_frame_number=frame,reason=str(error))
                                 result=ring_peg.verify_before_open(p,scene,measured_state,self.ring_planned[1],
-                                    servo_budget_spent=ring_iterations>=p['ring_peg'].get('servo_iterations',3))
+                                    servo_budget_spent=ring_iterations>=p['ring_peg'].get('servo_iterations',3),
+                                    best_prior_offset_m=best_xy_error)
                             except ring_peg.RingAlignmentNeeded as offset:
+                                if not offset.dz:
+                                    xy_error=math.hypot(offset.dx,offset.dy)
+                                    best_xy_error=xy_error if best_xy_error is None else min(xy_error,best_xy_error)
                                 if ring_iterations>=p['ring_peg'].get('servo_iterations',3):
                                     raise RuntimeError('Ring alignment budget exhausted: '+str(offset)) from offset
                                 if r.motion_remaining<1:raise RuntimeError('No remaining stage for ring alignment')
@@ -526,7 +641,8 @@ class PrimitiveService:
                                 r.motion_remaining-=1;operations+=1;ring_iterations+=1
                                 r.audit('ring_servo_replanned',plan_id=token,iteration=ring_iterations,frame_number=frame,
                                         stage_index=stage_index,correction_tcp_m=suffix[0]['tcp_m'],
-                                        measured_offset_xy_m=[offset.dx,offset.dy],allowance_m=offset.allowance)
+                                        measured_offset_xy_m=[offset.dx,offset.dy],requested_z_correction_m=offset.dz,
+                                        best_prior_offset_m=best_xy_error,allowance_m=offset.allowance)
                                 continue
                             except ring_peg.RingGeometryError as error:
                                 r.audit('ring_release_rejected',plan_id=token,frame_number=frame,reason=str(error),

@@ -5,6 +5,16 @@ import zlib
 import numpy as np
 
 
+def window_depth(frames):
+    """Median metres for pixels observed in at least four of five distinct RGB-D pairs."""
+    if len(frames)!=5:raise ValueError('Expected five aligned ring depth frames')
+    arr=np.stack(frames)
+    valid=np.isfinite(arr)&(arr>.1)&(arr<3.)
+    values=np.sort(np.where(valid,arr,np.inf),axis=0)
+    count=np.sum(valid,axis=0)
+    return np.where(count==5,values[2],np.where(count==4,(values[1]+values[2])*.5,0.))
+
+
 def _pack(image):
     return base64.b64encode(zlib.compress(image.tobytes(order='C'), 6)).decode('ascii')
 
@@ -39,7 +49,7 @@ def make_reference(bgr, depths, origin, footprint, ring, frame_ids):
     }
 
 
-def check_reference(geometry, bgr, ring, reference):
+def check_reference(geometry, bgr, ring, reference, latest_pair=None):
     """Check placement, visibility, global height, and connected local changes in this frame."""
     import cv2
     report = {'verified': False}
@@ -51,6 +61,8 @@ def check_reference(geometry, bgr, ring, reference):
                   survey_frame_ids=reference['frame_ids'])
     if 'jaw_axis_base_xy' in reference:
         report['jaw_axis_base_xy'] = reference['jaw_axis_base_xy']
+    if 'grasp_offset_base_xy_m' in reference:
+        report['grasp_offset_base_xy_m'] = reference['grasp_offset_base_xy_m']
     if uv_error > 2.5 or xy_error > .007:
         return dict(report, reason='ring_moved_from_surveyed_site')
     h, w = reference['shape']
@@ -91,6 +103,19 @@ def check_reference(geometry, bgr, ring, reference):
         count, _, stat, _ = cv2.connectedComponentsWithStats(flag.astype(np.uint8), connectivity=8)
         return int(stat[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0
     values = [largest(flag) for flag in (image_change, raised, correlated, mask & ~valid)]
+    if latest_pair is not None:
+        if len(latest_pair)!=2:raise ValueError('Expected last two unfiltered ring depth frames')
+        direction=rays @ geometry.n
+        samples=np.array([p[y:y+h,x:x+w][valid] for p in latest_pair])
+        usable=(samples>.1)&(samples<3.)&np.isfinite(samples)
+        deltas=(samples-baseline[valid])*direction
+        recent=np.zeros(mask.shape,dtype=bool)
+        recent[valid]=(np.all(usable&(deltas>.006),axis=0) | (usable[-1]&(deltas[-1]>.015)))
+        newest_missing=np.zeros(mask.shape,dtype=bool)
+        newest_missing[valid]=~usable[-1]
+        report.update(persistent_raw_foreground_px=largest(recent),newest_raw_missing_px=largest(newest_missing))
+        if report['persistent_raw_foreground_px']>=6 or report['newest_raw_missing_px']>=6:
+            return dict(report,reason='new_obstacle_or_occlusion_in_latest_depth_pairs')
     report.update(zip(('appearance_component_px','elevated_component_px',
                        'correlated_component_px','missing_component_px'), values))
     if any(value >= limit for value, limit in zip(values, (6, 6, 4, 6))):

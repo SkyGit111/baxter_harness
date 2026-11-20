@@ -206,6 +206,16 @@ def _registered_peg(spec,board,bgr,geom):
     def chroma(a):return a/np.maximum(1.,a.sum(axis=2,keepdims=True))
     cap_chroma_rms=float(np.sqrt(np.mean((chroma(cap_now)-chroma(cap_ref))**2)))
     if cap_chroma_rms>.045:return None
+    row=_peg_geometry(spec,geom,tip,support)
+    if row is not None:
+        row.update(measurement_source='current_board_and_cap_appearance_registered_to_exposure_bracket',
+                   appearance_ncc=score,current_cap_chroma_rms=cap_chroma_rms,
+                   board_corner_drift_px=corner_drift,observed_rim_color=spec['color'])
+    return row
+
+
+def _peg_geometry(spec,geom,tip,support):
+    ref=spec['bracket_reference']
     h0=float(ref['observed_stack_height_m']);limits=np.asarray(ref['protrusion_m'],dtype=float)
     if limits.shape!=(2,) or not 0<limits[0]<=limits[1]:return None
     tip_interval=[geom.on_plane([tip],geom.n,geom.d-h0-limit)[0] for limit in limits]
@@ -215,10 +225,46 @@ def _registered_peg(spec,board,bgr,geom):
             'radius_m':float(ref['radius_m']),'radius_interval_m':ref['radius_interval_m'],'axis_base':shaft.tolist(),
             'support_z_m':float(pc[2]),'support_center_base_m':pc.tolist(),'support_uv_px':support.tolist(),
             'stack_bottom_to_top':None,'observed_ring_ids':[],'tip_position_interval_base_m':[v.tolist() for v in tip_interval],
-            'measurement_source':'current_board_and_cap_appearance_registered_to_exposure_bracket',
-            'appearance_ncc':score,'current_cap_chroma_rms':cap_chroma_rms,'board_corner_drift_px':corner_drift,
             'depth_support_spread_m':ref['depth_support_spread_m'],'current_tip_depth_measured':False,
-            'tip_position_uncertainty_m':ref['tip_position_uncertainty_m'],'observed_rim_color':spec['color']}
+            'tip_position_uncertainty_m':ref['tip_position_uncertainty_m']}
+
+
+def _coarse_peg(spec,board,bgr,geom,specs):
+    """A search window for a new wrist measurement, never an observed post."""
+    import cv2
+    ref=spec.get('bracket_reference')
+    if not ref or 'board_quad_px' not in ref:return None
+    source=_ordered_quad(ref['board_quad_px']);anchors=[]
+    if board is not None:
+        target=_ordered_quad(board)
+        if np.max(np.linalg.norm(target-source,axis=1))>ref.get('max_board_drift_px',2.5):board=None
+    if board is not None:
+        warp=cv2.getPerspectiveTransform(source,target)
+        source_name='current_board_corners'
+    else:
+        # The wrist can also hide a board edge. Locate two separate, textured
+        # neighbouring mounts whose positions on the rigid stand are known.
+        for other in specs:
+            r=other.get('bracket_reference',{})
+            if other['id']==spec['id'] or 'appearance_bgr' not in r:continue
+            patch=np.uint8(r['appearance_bgr']);h,w=patch.shape[:2]
+            x,y=map(int,r['patch_center_px']);x0=x-w//2-3;y0=y-h//2-3
+            image=bgr[y0:y0+h+6,x0:x0+w+6]
+            if image.shape[:2]!=(h+6,w+6) or np.max(patch.reshape(-1,3).std(axis=0))<5:continue
+            _,score,_,origin=cv2.minMaxLoc(cv2.matchTemplate(image,patch,cv2.TM_CCOEFF_NORMED))
+            shift=np.asarray(origin)-3
+            if score>=.92 and np.linalg.norm(shift)<=2.5:anchors.append((other['id'],np.array([x,y]),shift))
+        if len(anchors)<2:return None
+        points=np.array([a[1] for a in anchors]);shifts=np.array([a[2] for a in anchors])
+        if np.linalg.norm(np.ptp(points,axis=0))<30 or np.max(np.linalg.norm(shifts-shifts[0],axis=1))>1:return None
+        warp=np.eye(3);warp[:2,2]=np.median(shifts,axis=0)
+        source_name='two_current_neighbour_mounts'
+    xy=cv2.perspectiveTransform(np.float32([[ref['tip_px'],ref['support_px']]]),warp)[0]
+    row=_peg_geometry(spec,geom,*xy)
+    if row is not None:
+        row.update(measurement_source='unconfirmed_fixed_board_search_window',registration_source=source_name,
+                   registration_anchors=[a[0] for a in anchors],requires_current_wrist_tip=True)
+    return row
 
 
 def _local_table(ring,bgr,geometry):
@@ -297,13 +343,13 @@ def _stack_surface(peg,spec,hsv,geom):
                current_support_height_change_m=float(median-ref['observed_stack_height_m']))
 
 
-def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
+def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state,*,latest_depth_pair=None):
     """Use only tiles in this frame. Missing/ambiguous contours remain explicit observations."""
     import cv2
     bgr=np.asarray(bgr);depth=np.asarray(depth_m)
     if depth.ndim!=2 or bgr.shape!=(*depth.shape,3) or bgr.dtype!=np.uint8:raise ValueError('Expected aligned uint8 BGR and metric depth')
     h,w=depth.shape;hsv=cv2.cvtColor(bgr,cv2.COLOR_BGR2HSV);geometry=_Geometry(depth,intrinsics,profile)
-    scene={'rings':[],'pegs':[],'missing':[],'held_ring_id':None,'resolution':[w,h],'board_polygon_px':None}
+    scene={'rings':[],'pegs':[],'provisional_pegs':[],'missing':[],'held_ring_id':None,'resolution':[w,h],'board_polygon_px':None}
     board=None
     if settings.get('board'):
         x0,y0,x1,y1=_roi(settings['board'],w,h)
@@ -325,6 +371,9 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
                 registered=_registered_peg(spec,board,bgr,geometry)
                 if registered is None:
                     found=[]
+                    if state.get('gripping') is True:
+                        candidate=_coarse_peg(spec,board,bgr,geometry,settings['pegs'])
+                        if candidate is not None:scene['provisional_pegs'].append(candidate)
                 else:
                     # A round patch in the peg ROI can be a ring or a gripper.
                     # The board and tip appearance establish which physical post this is.
@@ -392,7 +441,7 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
                 spec=next(s for s in settings['rings'] if s['id']==ring['id'])
                 if spec.get('local_support_reference'):
                     from .ring_support_reference import check_reference
-                    evidence=check_reference(geometry,bgr,ring,spec['local_support_reference'])
+                    evidence=check_reference(geometry,bgr,ring,spec['local_support_reference'],latest_depth_pair)
                     ring['local_support_reference_verified']=evidence['verified']
                     ring['local_support_reference_evidence']=evidence
     if tcp is not None:

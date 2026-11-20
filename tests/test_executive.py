@@ -288,6 +288,14 @@ class ContractsAndEvidence(unittest.TestCase):
         e=self.executive('vla',planner,max_calls=1)
         with self.assertRaisesRegex(RuntimeError,'call budget'):e.choose(obs())
 
+    def test_passive_right_arm_does_not_trigger_replanning_of_occluded_left_frame(self):
+        scene=obs()
+        scene.update(available_arms=['left'],arm_states={'left':scene['state'],'right':{'gripping':False}})
+        planner=ScriptedPlanner([[dict(step(),arm='left')]],[check('blocked',reason='occluded')])
+        e=self.executive('primitives',planner)
+        self.assertEqual(e.choose(scene)['reason'],'occluded')
+        self.assertEqual([phase for phase,_ in planner.contexts],['plan','check'])
+
     def test_model_request_uses_json_plan_schema_and_current_image(self):
         planner=VisualTaskPlanner(9110,'local')
         response={'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'steps':[step()]})}}]}

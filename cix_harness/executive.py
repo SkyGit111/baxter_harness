@@ -286,6 +286,7 @@ class TaskExecutive:
                 if not self.build_plan(obs, cause):
                     return self.terminal('blocked', 'Replanning budget exhausted', 'no_progress')
         rejected = 0
+        occlusion_replanned = False
         for _ in range(16):
             if self.current and self.current.get('arm',obs.get('state',{}).get('arm'))!=obs.get('state',{}).get('arm'):
                 return {'decision':'observe_arm','arm':self.current['arm'],'evidence':'Acquire the selected arm state and invalidate prior observation tokens'}
@@ -315,10 +316,16 @@ class TaskExecutive:
                     return self.terminal('blocked', 'Replanning budget exhausted', 'no_progress')
                 continue
             if kind == 'blocked':
+                active_arm=obs.get('state',{}).get('arm')
+                peer_skills=obs.get('arm_skills',{})
+                peer_can_clear=any(arm!=active_arm and
+                                   (not peer_skills or 'clear_view' in peer_skills.get(arm,[]))
+                                   for arm in obs.get('available_arms',[]))
                 replan_occlusion=(self.current and self.current['on_failure']=='replan') or (
-                    'arm_states' in obs and (not self.current or self.current['on_failure']!='stop'))
-                if answer['reason'] == 'occluded' and replan_occlusion:
+                    peer_can_clear and (not self.current or self.current['on_failure']!='stop'))
+                if answer['reason'] == 'occluded' and replan_occlusion and not occlusion_replanned:
                     self.failures.append('occluded')
+                    occlusion_replanned = True
                     # In a dual scene the OTHER arm may be the occluder. Let the
                     # planner select it explicitly; never blindly move the active arm.
                     if self.build_plan(obs, 'occluded: '+answer['evidence']): continue

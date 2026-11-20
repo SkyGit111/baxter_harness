@@ -69,7 +69,12 @@ def measure(bgr,state,ring,peg,config):
     expected=K[0,0]*np.array([ring['inner_radius_m'],peg['radius_m']])/cam[:,2];hsv=cv2.cvtColor(bgr,cv2.COLOR_BGR2HSV)
     if min(expected)<2.5:raise RingGeometryError('Wrist view does not resolve the ring hole and peg tip')
     ring_roi=K[0,0]*ring['outer_radius_m']/cam[0,2]+config.get('search_margin_px',12)
-    rc,rt=_mask_roi(hsv,projected[0],ring_roi,config['ring_hsv_ranges'][ring['color']]);pc,pt=_mask_roi(hsv,projected[1],expected[1]+config.get('search_margin_px',12),config['peg_tip_hsv_ranges'])
+    ranges=config['ring_hsv_ranges'][ring['color']]
+    if ring.get('measurement_source')=='selected_wrist_calibrated_annulus':
+        # Use the same colour support that identified the ring between the fingers.
+        ranges=[([low[0],max(low[1],95),max(low[2],105)],high) for low,high in ranges]
+    rc,rt=_mask_roi(hsv,projected[0],ring_roi,ranges)
+    pc,pt=_mask_roi(hsv,projected[1],expected[1]+config.get('search_margin_px',12),config['peg_tip_hsv_ranges'])
     hole,p_error,rim_points=_ellipse(rc,rt,projected[0],expected[0],True)
     tip,q_error,tip_points=_ellipse(pc,pt,projected[1],expected[1],False)
     xy=cv2.undistortPoints(np.array([hole,tip],np.float64).reshape(-1,1,2),K,D).reshape(-1,2)
@@ -85,5 +90,6 @@ def measure(bgr,state,ring,peg,config):
     inner,inner_error=_metric_rim(rim_points,K,D,R,t,landmarks[0],ring['normal_base'])
     radius,rod_error=_metric_rim(tip_points,K,D,R,t,landmarks[1],peg['axis_base'])
     return {'offset_xy_m':offset.tolist(),'uncertainty_m':uncertainty,'hole_uv_px':hole,'peg_uv_px':tip,
+            'wrist_hole_base_m':points[0].tolist(),'wrist_tip_base_m':points[1].tolist(),
             'inner_radius_m':inner,'inner_radius_error_m':inner_error,'peg_radius_m':radius,'peg_radius_error_m':rod_error,
             'hole_edge_px':len(rim_points),'peg_edge_px':len(tip_points),'inter_camera_disagreement_m':disagreement}

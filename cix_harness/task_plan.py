@@ -63,7 +63,10 @@ An empty/far arm can pick: approach/opening are handled below. IK checks reachab
 Robot-left may be image-right. If the arm hides target/support: blocked, reason=occluded.
 Ambiguous identity is ambiguous_target; absent object is not_found. Do not guess hidden pixels.
 For primitive act: pick uv on object's TOP interior, place on SUPPORT, stack on receiving
-block TOP; move_to selects a surface with no height offset. uv=[0..1,0..1], origin image top-left.
+block TOP. Ordinary move_to selects a surface. For configured ring transport, select the
+receiving peg with its scene-view tip or colour marker landmark. A fresh measured wrist
+tip registered to that scene may supply the landmark even while the arm covers the scene tip.
+uv=[0..1,0..1], origin image top-left.
 All other skills and the VLA route use uv=null. Every other decision uses uv=null.
 For act/step_done/task_done reason=none; blocked/replan requires a specific reason.
 On target_depth choose a different interior point; repeated failure needs a changed plan.
@@ -99,7 +102,7 @@ def workspace_context(obs, context):
         result['ring_scene']=copy.deepcopy(obs['ring_scene'])
         result['ring_task']='Pick only a loose ring. Use its current center or rim landmark for identity. Place on the peg marked by the same colour using its tip landmark. Do not move the original peg markers. Check verified_skill on a fresh observation.'
         if 'held_transport' in obs['ring_scene']:
-            result['ring_task']+=' For a placement goal, insert move_to at the matching peg tip between pick and place. It carries the ring to a hover without opening. If already held, start there. Once held_transport.at_hover is true, inspect and place.'
+            result['ring_task']+=' For placement, move_to carries the held ring to the matching peg without opening. Use its supplied tip_uv_px or support_uv_px in the D455 image; the current wrist may register these landmarks when the arm covers the D455 tip. At hover with local_approach_available, place uses the corrected peg directly. A completed transport and current FK can verify arrival while the peg is occluded. Opening still requires a currently localized peg.'
     return result
 
 

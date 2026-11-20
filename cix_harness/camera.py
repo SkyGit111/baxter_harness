@@ -21,6 +21,7 @@ class D455Camera:
         self.serial=profile.get_device().get_info(rs.camera_info.serial_number)
         self.intrinsics=profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
         self.last_depth=None
+        self.ring_depth_window=None
         self.last_number = -1
         # Do not advertise a ready bridge before the device actually streams.
         try:
@@ -34,6 +35,15 @@ class D455Camera:
     def capture(self):
         import cv2
         import numpy as np
+        frame,captured=self._aligned_pair()
+        ok, jpeg = cv2.imencode(".jpg", np.asanyarray(frame.get_data()), [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok or time.monotonic() - captured >= 0.5:
+            raise RuntimeError("Could not obtain a fresh D455 JPEG")
+        return image_data(jpeg.tobytes()), captured, self.last_number
+
+    def _aligned_pair(self):
+        import numpy as np
+        self.ring_depth_window=None
 
         # Discard the SDK's newest buffered frame, which may predate the last
         # motion. The subsequent frame must have a greater device frame number.
@@ -62,22 +72,42 @@ class D455Camera:
                 'color_timestamp_domain':str(frame.get_frame_timestamp_domain()),
                 'depth_timestamp_domain':str(raw_depth.get_frame_timestamp_domain()),
             }
-        ok, jpeg = cv2.imencode(".jpg", np.asanyarray(frame.get_data()), [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if not ok or time.monotonic() - captured >= 0.5:
-            raise RuntimeError("Could not obtain a fresh D455 JPEG")
-        return image_data(jpeg.tobytes()), captured, self.last_number
+        return frame,captured
+
+    def capture_ring_depth(self):
+        """Keep the latest original JPEG and add repeated aligned depths for thin tabletop parts."""
+        depths=[];numbers=[];depth_numbers=[];began=time.monotonic()
+        for i in range(5):
+            if i==4:image,captured,number=self.capture()
+            else:
+                self._aligned_pair()
+                number=self.last_number
+            if self.last_depth is None:
+                raise RuntimeError('Missing depth in stationary ring observation')
+            depths.append(self.last_depth)
+            numbers.append(number);depth_numbers.append(self.last_pair['depth_frame_number'])
+        if len(set(depth_numbers))!=5 or len(set(numbers))!=5:
+            raise RuntimeError('Repeated depth or color pair in stationary ring observation')
+        from .ring_support_reference import window_depth
+        self.ring_depth_window={'depth_m':window_depth(depths),'latest_pair_m':depths[-2:],
+            'frame_numbers':numbers,'depth_frame_numbers':depth_numbers,'duration_s':time.monotonic()-began}
+        return image,captured,number
 
     def save_depth(self, path):
         import numpy as np
         if self.last_depth is None:
             raise RuntimeError('No aligned depth for current camera frame')
         i=self.intrinsics
+        window=getattr(self,'ring_depth_window',None)
+        extras=({'ring_depth_median_m':window['depth_m'],'ring_latest_pair_m':window['latest_pair_m'],
+                 'ring_color_frame_numbers':window['frame_numbers'],'ring_depth_frame_numbers':window['depth_frame_numbers']}
+                if window else {})
         np.savez_compressed(path,depth_m=self.last_depth,bgr=self.last_color,
                             intrinsics=np.array([i.fx,i.fy,i.ppx,i.ppy]),frame_number=self.last_number,
                             K=np.array([[i.fx,0.,i.ppx],[0.,i.fy,i.ppy],[0.,0.,1.]]),
                             D=np.asarray(i.coeffs),distortion_model=str(i.model),
                             camera_serial=self.serial,depth_scale_m=self.depth_scale,
-                            resolution=np.array([i.width,i.height]),**self.last_pair)
+                            resolution=np.array([i.width,i.height]),**self.last_pair,**extras)
 
     def close(self):
         self.pipeline.stop()

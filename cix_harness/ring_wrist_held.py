@@ -67,8 +67,20 @@ def held_ring(bgr,state,profile,scene,prior=None):
         for hole,branch in zip(contours,tree[0]):
             if branch[3]!=i or len(hole)<16:continue
             (hx,hy),holes,_=cv2.fitEllipse(hole)
-            if min(holes)<5 or abs(np.mean(holes)/np.mean(axes)-inner/outer)>.09 or math.dist([x,y],[hx,hy])>.12*max(axes):continue
-            options=_circle_poses(edge,K,D,outer)
+            if min(holes)<5:continue
+            # The same-colour mount can merge into part of the held ring's outline.
+            # Only measured outer arcs surrounding the independently observed bore vote.
+            points=edge.reshape(-1,2);offsets=points-[hx,hy]
+            angles=(np.arctan2(offsets[:,1],offsets[:,0])+np.pi)*24/(2*np.pi)
+            bins=angles.astype(int)%24;radii=np.linalg.norm(offsets,axis=1)
+            sectors=[np.median(radii[bins==j]) for j in range(24) if np.any(bins==j)]
+            if len(sectors)<19:continue
+            mid=np.median(sectors);keep=(radii>.78*mid)&(radii<1.16*mid)
+            if len(np.unique(bins[keep]))<17:continue
+            arc=points[keep]
+            (x,y),axes,ellipse_angle=cv2.fitEllipse(arc)
+            if abs(np.mean(holes)/np.mean(axes)-inner/outer)>.09 or math.dist([x,y],[hx,hy])>.12*max(axes):continue
+            options=_circle_poses(arc,K,D,outer)
             possible=[]
             for camera_center,n,error in options:
                 centre=t+R@camera_center;normal=R@n
@@ -88,6 +100,7 @@ def held_ring(bgr,state,profile,scene,prior=None):
                 'inner_boundary_p90_m':size_uncertainty,'outer_boundary_p90_m':worst[2],
                 'depth_plane_p90_m':depth_scale_uncertainty,'measurement_source':'selected_wrist_calibrated_annulus',
                 'wrist_hole_uv_px':[hx,hy],'wrist_outer_uv_px':[x,y],'wrist_outer_diameters_px':list(axes),
+                'wrist_outer_angle_deg':ellipse_angle,
                 'wrist_hole_diameters_px':list(holes),'wrist_center_to_tcp_m':(center-tcp).tolist(),
                 'source_ring_visible_on_table':False,
                 'wrist_size_depth_uncertainty_m':depth_scale_uncertainty,'candidate_normals_base':[p[1].tolist() for p in possible]})
