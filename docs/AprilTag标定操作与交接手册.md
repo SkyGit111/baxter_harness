@@ -535,10 +535,12 @@ python3 -m cix_harness.handeye_volume plan --bounds bounds.json --reference refe
 
 ```bash
 python3 -m cix_harness.handeye --fit "$RUN/train.json" --holdout "$RUN/holdout.json" \
-  --volume-plan volume-plan.json --manifest "$RUN/manifest.json" \
+  --volume-plan volume-plan.json --manifest "$RUN/manifest.json" --pose-estimator stationary-window \
   --max-mm "$TASK_MM" --max-deg "$TASK_DEG" --output "$RUN/handeye.json" \
   --optical-frame "$COLOR_OPTICAL_FRAME" --extrinsics-output "$RUN/extrinsics.json"
 ```
+
+本轮在第 7 个训练位置后冻结静止窗估计方法。每个位置都取同一个已通过时序与静止检查的窗口，对四个有序光学三维角点分别取逐坐标中位数，再以实测标板尺寸刚体对齐。腕部位置取该窗口中位数，腕部朝向取投影至 SO(3) 的平均值。训练和留出共用该公式。报告中的 `stationary_windows` 记录每个窗口的帧数和中心、法向抖动，`last_frame_diagnostic` 保留原末帧方案的训练与留出误差。正式空间覆盖使用选定估计器输出的实际中心；从旧数据复现末帧模式可传 `--pose-estimator last-frame`。
 
 刚性误差阈值由物体和夹指的空间余量确定。输出报告含逐姿态误差、训练集旋转激励、最大误差和 RMS。训练和留出一致性通过时生成 `table_survey` 可读取的外参候选，接着用独立物理点检查绝对坐标。用 `--camera 原外参.yaml` 可以冻结并核验已有的 easy_handeye eye-on-base 外参。读取旧的累积 `get_sample_list` 快照时，需明确传入 `--holdout-includes-fit`，程序先核对完整训练前缀再取新增姿态。
 

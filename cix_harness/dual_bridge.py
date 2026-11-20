@@ -43,6 +43,10 @@ def build_dual_candidate(left,right,budget=64,lease_seconds=600,clearance=None):
 def validate_dual_config(cfg, armed=False):
     if not isinstance(cfg,dict) or set(cfg.get('arms',{}))!=set(ARMS):
         raise ValueError('Dual configuration requires complete left and right arm profiles')
+    motion_arms=cfg.get('motion_arms',list(ARMS))
+    if (not isinstance(motion_arms,list) or not motion_arms or
+            any(arm not in ARMS for arm in motion_arms) or len(set(motion_arms))!=len(motion_arms)):
+        raise ValueError('motion_arms must list distinct robot arms')
     if not isinstance(cfg.get('camera_serial',''),str):raise ValueError('Invalid shared camera serial')
     if type(cfg.get('motion_budget')) is not int or not 1<=cfg['motion_budget']<=64:
         raise ValueError('Dual task requires one shared stage budget in 1..64')
@@ -57,7 +61,7 @@ def validate_dual_config(cfg, armed=False):
             raise ValueError('Per-arm budgets/leases must match the shared task, not add to it')
         if profile.get('camera_serial','')!=cfg.get('camera_serial',''):
             raise ValueError('Both arm profiles must use the single shared camera')
-        validate_config(profile,armed)
+        validate_config(profile,armed and arm in motion_arms)
     # One physical camera has one base transform. Tool/TCP and workspaces may differ.
     for key in ('camera_to_base_xyzw','camera_to_base_translation_m'):
         if cfg['arms']['left']['primitives'][key]!=cfg['arms']['right']['primitives'][key]:
@@ -107,10 +111,11 @@ class DualBridge:
         if set(robots)!=set(ARMS):raise ValueError('Both robot interfaces are required')
         if robots['left'].camera is not robots['right'].camera:
             raise ValueError('Dual arm interfaces must share one camera owner')
-        if robots['left'].armed!=robots['right'].armed:
-            raise ValueError('Mixed armed/read-only interfaces are not a dual bridge')
+        self.motion_arms=tuple(cfg.get('motion_arms',ARMS))
+        self.armed=any(r.armed for r in robots.values())
+        if any(r.armed!=(self.armed and arm in self.motion_arms) for arm,r in robots.items()):
+            raise ValueError('Armed interfaces must match the configured motion_arms')
         self.robots=robots;self.cfg=cfg;self.shared=shared;self.guard=guard
-        self.armed=robots['left'].armed
         if self.armed and guard is None:raise ClearanceUnavailableError('Armed dual bridge has no collision guard')
         self.services={arm:service_factory(robots[arm]) for arm in ARMS}
         self.selected_arm=None;self.peer_reference=None;self.clearance_receipt=None;self.clearance_seconds=0.
@@ -119,6 +124,7 @@ class DualBridge:
 
     def _arm(self,arm):
         if arm not in ARMS:raise ValueError('Select robot arm left or right explicitly')
+        if arm not in self.motion_arms:raise ValueError(f'The {arm} arm is reserved for passive observation')
         return arm
 
     def _invalidate(self,keep_observation=None,keep_prepared=None):
@@ -142,10 +148,10 @@ class DualBridge:
         with self.lock:
             per_arm={arm:self.robots[arm].health() for arm in ARMS}
             geometry={'arms':{arm:v.get('environment_fingerprint') for arm,v in per_arm.items()},
-                      'inter_arm_clearance':self.cfg.get('inter_arm_clearance')}
+                      'inter_arm_clearance':self.cfg.get('inter_arm_clearance'),'motion_arms':self.motion_arms}
             fingerprint=hashlib.sha256(json.dumps(geometry,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:24]
             return {'armed':self.armed,'motion_scope':'supervised_dual_primitive_task','dual_protocol':PROTOCOL,'protocol':PROTOCOL,
-                    'backend_capabilities':['primitives'],'available_arms':list(ARMS),'selected_arm':self.selected_arm,
+                    'backend_capabilities':['primitives'],'available_arms':list(self.motion_arms),'selected_arm':self.selected_arm,
                     'motion_remaining':self.shared.remaining,'lease_remaining_s':max(0.,self.shared.deadline-time.monotonic()),
                     'environment_fingerprint':fingerprint,'arms':per_arm,
                     'clearance':{'configured':self.guard is not None,
@@ -168,9 +174,9 @@ class DualBridge:
                 after_peer=time.monotonic()
                 self.peer_reference=copy.deepcopy(states[peer])
                 workspaces={};skills={};recovery={}
-                for selected in ARMS:
+                for selected in self.motion_arms:
                     workspaces[selected],skills[selected],recovery[selected]=self._describe_arm(selected,states[selected])
-                obs.update(selected_arm=arm,available_arms=list(ARMS),arm_states=states,
+                obs.update(selected_arm=arm,available_arms=list(self.motion_arms),arm_states=states,
                            workspaces=workspaces,arm_skills=skills,arm_recovery=recovery)
                 obs.setdefault('timings_s',{}).update(dual_peer_state_read=after_peer-before_peer,
                                                      dual_arm_metadata=time.monotonic()-after_peer,
@@ -284,7 +290,8 @@ def create_bridge(cfg,armed=False,*,camera_factory=D455Camera,robot_factory=Dual
     with ExitStack() as stack:
         stack.callback(camera.close)
         for arm in ARMS:
-            robots[arm]=robot_factory(cfg['arms'][arm],armed,camera=camera,shared=shared)
+            robots[arm]=robot_factory(cfg['arms'][arm],armed and arm in cfg.get('motion_arms',ARMS),
+                                     camera=camera,shared=shared)
             stack.callback(robots[arm].close)
         clearance=cfg.get('inter_arm_clearance')
         guard=InterArmGuard(clearance,{arm:model_factory(arm,clearance) for arm in ARMS}) if clearance is not None else None

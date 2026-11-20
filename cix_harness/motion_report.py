@@ -85,7 +85,7 @@ def summarize(folder, audit_path=None):
             step = event['step']
         elif name == 'planner_api':
             report['api_calls'].append({k:event.get(k) for k in
-                ('t','phase','model','status','seconds','total_seconds','auth_seconds',
+                ('t','phase','model','response_model','images','status','seconds','total_seconds','auth_seconds',
                  'first_sse_event_seconds','first_output_text_delta_seconds','error_stage','error_type')})
         elif name == 'primitive_plan':
             plan = {'plan_id': plan_id, 'skill': event.get('skill'), 'arm': event.get('selected_arm', step.get('arm')),

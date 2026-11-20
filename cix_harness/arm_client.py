@@ -6,6 +6,8 @@ class ArmClient:
         available=health.get('available_arms',[]) if self.dual else [health.get('arm')]
         requested=available if arms in ('auto','both') else [arms]
         if arms=='both' and not self.dual:raise ValueError('Both arms require the shared dual bridge')
+        if arms=='both' and set(available)!={'left','right'}:
+            raise ValueError('Both arms must be available for a two-arm task')
         if not requested or any(a not in ('left','right') or a not in available for a in requested):
             raise ValueError('Requested arm is not available on this bridge')
         self.allowed=list(requested);self.arm=self.allowed[0]

@@ -122,6 +122,23 @@ class DualBridgeTests(unittest.TestCase):
         self.assertNotIn('home',obs['primitive_skills']);self.assertNotIn('home',obs['arm_skills']['right'])
         self.assertIn('home',obs['arm_skills']['left'])
 
+    def test_left_only_scene_keeps_the_tagged_right_arm_passive(self):
+        cfg=configuration(True)
+        cfg['motion_arms']=['left']
+        cfg['arms']['right']['commissioned']=False
+        cfg['arms']['right']['primitives']['calibrated']=False
+        bridge=self.bridge(True,config=cfg)
+        self.assertTrue(bridge.robots['left'].armed)
+        self.assertFalse(bridge.robots['right'].armed)
+        self.assertEqual(bridge.health()['available_arms'],['left'])
+        self.assertIn('right',bridge.observe('left')['arm_states'])
+        for call in (lambda:bridge.observe('right'),lambda:bridge.prepare('right','x','open'),
+                     lambda:bridge.execute('right','x')):
+            with self.assertRaisesRegex(ValueError,'passive'):call()
+        plan=self.plan(bridge,'left')
+        self.assertEqual(bridge.execute('left',plan['plan_id'])['status'],'completed')
+        bridge.robots['right'].grip.command_position.assert_not_called()
+
     def test_depth_snapshot_uses_shared_camera_and_revokes_previous_plan(self):
         import tempfile
         bridge=self.bridge();self.plan(bridge,'left')

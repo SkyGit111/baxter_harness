@@ -135,7 +135,8 @@ def solve(fit, holdout, max_mm, max_deg, known_camera=None, min_excitation_deg=3
                            'deg':math.degrees(angle(actual[:3,:3].T @ expected[:3,:3]))})
         return {'count':len(errors),'samples':errors,'max_mm':max(x['mm'] for x in errors),
                 'rms_mm':math.sqrt(sum(x['mm']**2 for x in errors)/len(errors)),
-                'max_deg':max(x['deg'] for x in errors)}
+                'max_deg':max(x['deg'] for x in errors),
+                'rms_deg':math.sqrt(sum(x['deg']**2 for x in errors)/len(errors))}
     training, validation = residuals(fit), residuals(holdout)
     return {'fit':training,'holdout':validation,'fit_second_axis_rms_deg':excitation_deg,
             'mode':'verify_existing' if known_camera is not None else 'solve',
@@ -158,6 +159,8 @@ def main(argv=None):
     p.add_argument('--camera',type=Path,help='Check an existing easy_handeye eye-on-base YAML, or a base_T_camera pose JSON')
     p.add_argument('--extrinsics-output',type=Path,help='Export the candidate after rigid-pose and formal spatial checks pass')
     p.add_argument('--volume-plan',type=Path,help='Frozen marker-volume plan with at least 24 training and 6 holdout positions')
+    p.add_argument('--pose-estimator',choices=('last-frame','stationary-window'),default='last-frame',
+                   help='Use recorded endpoint poses or estimate one measured-ruler pose per synchronized RGB-D window')
     p.add_argument('--manifest',type=Path,help='Capture manifest including the plan hash and actual color intrinsics')
     p.add_argument('--optical-frame',help='D455 aligned color CameraInfo frame for the exported transform')
     p.add_argument('--max-mm',required=True,type=float)
@@ -169,8 +172,8 @@ def main(argv=None):
         p.error('--extrinsics-output requires the observed --optical-frame')
     if args.extrinsics_output and not args.volume_plan:
         p.error('--extrinsics-output requires a preassigned --volume-plan and its capture manifest')
-    if args.volume_plan and args.holdout_includes_fit:
-        p.error('Volume captures store separate explicitly assigned fit and holdout records')
+    if args.holdout_includes_fit and (args.volume_plan or args.pose_estimator=='stationary-window'):
+        p.error('Synchronized/volume captures store separate explicitly assigned fit and holdout records')
     camera=None
     if args.camera:
         raw=load(args.camera)
@@ -189,13 +192,24 @@ def main(argv=None):
             camera={'xyz':raw['camera_to_base_translation_m'],'xyzw':raw['camera_to_base_xyzw']}
         else:
             camera=raw.get('base_T_camera',raw)
-    fit_data,holdout_data=load(args.fit),load(args.holdout)
+    from .handeye_window import estimate_rows
+    raw_fit,raw_holdout=load(args.fit),load(args.holdout)
+    fit_data,fit_windows=estimate_rows(raw_fit,args.pose_estimator)
+    holdout_data,holdout_windows=estimate_rows(raw_holdout,args.pose_estimator)
     fit,holdout=pose_arrays(fit_data),pose_arrays(holdout_data)
     if args.holdout_includes_fit:
         if len(holdout)<=len(fit) or not all(np.allclose(a,b,rtol=0.,atol=1e-10) for a,b in zip(fit,holdout)):
             p.error('Cumulative snapshot must start with the complete, identical fit set and include new poses')
         holdout=holdout[len(fit):]
     report=solve(fit,holdout,args.max_mm,args.max_deg,camera,args.min_excitation_deg)
+    report['pose_estimator']=args.pose_estimator
+    if fit_windows is not None:
+        report['stationary_windows']={'fit':fit_windows,'holdout':holdout_windows}
+        try:
+            baseline=solve(pose_arrays(raw_fit),pose_arrays(raw_holdout),args.max_mm,args.max_deg,camera,args.min_excitation_deg)
+            report['last_frame_diagnostic']={k:baseline[k] for k in ('fit','holdout','base_T_camera','effector_T_tag','consistency_passed')}
+        except ValueError as error:
+            report['last_frame_diagnostic']={'error':str(error)}
     inputs={'fit':args.fit,'holdout':args.holdout}
     if args.camera:inputs['camera']=args.camera
     if args.volume_plan:

@@ -1,6 +1,7 @@
 """Responses API planner, sharing contracts with the board-local planner."""
 import json
 import os
+import re
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -146,7 +147,10 @@ class ResponsesTaskPlanner(VisualTaskPlanner):
                 if (not isinstance(response_id,str) or not response_id.startswith('resp_') or len(response_id)>200
                         or any(not (c.isascii() and (c.isalnum() or c in '_-')) for c in response_id)):
                     response_id=None
-                fields={'phase':name,'model':self.model,'status':'completed' if completed else 'error',
+                response_model=reply.get('model') if isinstance(reply,dict) else None
+                if not isinstance(response_model,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}',response_model):
+                    response_model=None
+                fields={'phase':name,'model':self.model,'response_model':response_model,'status':'completed' if completed else 'error',
                         'seconds':round((received if received is not None else ended)-began,3) if began is not None else None,
                         'total_seconds':round(ended-total_began,3),'auth_seconds':round(auth_seconds,3),
                         'first_sse_event_seconds':milestones.get('first_sse_event_seconds'),

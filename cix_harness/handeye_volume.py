@@ -168,16 +168,20 @@ def audit_volume(plan,fit,holdout,camera,manifest):
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__);subs=p.add_subparsers(dest='command',required=True)
     make=subs.add_parser('plan');audit=subs.add_parser('audit')
+    audit.add_argument('--pose-estimator',choices=('last-frame','stationary-window'),default='last-frame')
     for cli,names in ((make,('bounds','reference','output')),(audit,('plan','fit','holdout','manifest','output'))):
         for n in names:cli.add_argument('--'+n,required=True,type=Path)
     args=p.parse_args(argv)
     if args.command=='plan':
         result=generate_plan(load(args.bounds),load(args.reference))
     else:
-        fit,hold=load(args.fit),load(args.holdout)
+        from .handeye_window import estimate_rows
+        fit,_=estimate_rows(load(args.fit),args.pose_estimator)
+        hold,_=estimate_rows(load(args.holdout),args.pose_estimator)
         fit_result=solve(pose_arrays(fit),pose_arrays(hold),10,3)
         manifest=load(args.manifest)
         result=audit_volume(load(args.plan),fit,hold,fit_result['base_T_camera'],manifest)
+        result['pose_estimator']=args.pose_estimator
         result['volume_plan_sha256']=hashlib.sha256(args.plan.read_bytes()).hexdigest()
         if manifest.get('volume_plan_sha256')!=result['volume_plan_sha256']:
             result['failures'].append('Capture manifest does not attest to the supplied volume plan hash')

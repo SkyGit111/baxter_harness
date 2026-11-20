@@ -1,6 +1,6 @@
 """Plan and optionally collect a preregistered right-arm hand-eye volume on ROS 1."""
 import argparse
-from copy import deepcopy
+from copy import copy, deepcopy
 import hashlib
 import itertools
 import json
@@ -20,6 +20,24 @@ from .kinematics import IKUnreachableError
 from .moveit_probe import pose_request
 from .primitives import _slerp
 from .trajectory import check_controller_feedback
+
+
+# The existing driver stops when position tracking error exceeds .035 rad.
+# Plan the endpoint farther inside than this bound, allowing encoder quantization.
+TARGET_JOINT_MARGIN_RAD = .04
+
+
+def guarded_joint_step(previous, state, lower, upper, *, final=False):
+    """Only an actual legal near-limit start may use the inside exit corridor."""
+    for name in state:
+        before, after = previous[name], state[name]
+        lo,hi=lower[name],upper[name]
+        if not math.isfinite(after) or not lo<=before<=hi or not lo<=after<=hi:
+            raise CandidateRejected('Actual or proposed joint outside URDF: '+name)
+        inward_lo, inward_hi = lo+TARGET_JOINT_MARGIN_RAD, hi-TARGET_JOINT_MARGIN_RAD
+        if ((after < inward_lo-1e-8 and (final or after < before-1e-8))
+                or (after > inward_hi+1e-8 and (final or after > before+1e-8))):
+            raise CandidateRejected(f'{name} approaches its URDF limit or ends within {TARGET_JOINT_MARGIN_RAD:.3f} rad')
 
 
 def box_bounds(row):
@@ -92,7 +110,66 @@ def bounds_of_shape(frame, primitive):
 
 
 def covered(lo, hi, boxes):
-    return any(np.all(lo >= a) and np.all(hi <= b) for a, b in boxes)
+    """Whether the entire query box is inside the exact union of surveyed boxes."""
+    if any(np.all(lo >= a) and np.all(hi <= b) for a,b in boxes):
+        return True
+    remaining=[(lo,hi)]
+    for a,b in boxes:
+        following=[]
+        for lower,upper in remaining:
+            cut_lo,cut_hi=np.maximum(lower,a),np.minimum(upper,b)
+            if np.any(cut_hi<=cut_lo):
+                following.append((lower,upper))
+                continue
+            # Subtract this intersection as up to six disjoint rectangular slabs.
+            lower,upper=lower.copy(),upper.copy()
+            for axis in range(3):
+                if lower[axis] < cut_lo[axis]:
+                    cap=upper.copy();cap[axis]=cut_lo[axis]
+                    following.append((lower.copy(),cap));lower[axis]=cut_lo[axis]
+                if upper[axis] > cut_hi[axis]:
+                    cap=lower.copy();cap[axis]=cut_hi[axis]
+                    following.append((cap,upper.copy()));upper[axis]=cut_hi[axis]
+        if not following:
+            return True
+        remaining=following
+    return False
+
+
+def covers_primitive(frame, primitive, pad, contains):
+    """Prove the padded URDF solid lies inside the surveyed union, including at its corners."""
+    lo,hi=bounds_of_shape(frame,primitive)
+    if contains(lo-pad,hi+pad):
+        return True
+    _,offset,kind,data=primitive
+    pose=frame@offset
+    rot,centre=pose[:3,:3],pose[:3,3]
+    if kind=='box':
+        half=np.max(np.abs(data),axis=0)
+    else:
+        radius=data[0]
+        half=np.array([radius,radius,data[1] if kind=='cylinder' else radius])
+    pending=[(-half,half)]
+    while pending:
+        local_lo,local_hi=pending.pop()
+        origin_distance=np.maximum(np.maximum(local_lo,-local_hi),0.)
+        if kind in ('sphere','cylinder'):
+            d=origin_distance if kind=='sphere' else origin_distance[:2]
+            if d@d > radius**2+1e-14:
+                continue
+        mid=(local_lo+local_hi)*.5
+        half_size=(local_hi-local_lo)*.5
+        world_center=centre+rot@mid
+        world_half=abs(rot)@half_size+pad
+        if contains(world_center-world_half,world_center+world_half):
+            continue
+        axis=int(np.argmax(half_size))
+        if 2*half_size[axis] <= .012:
+            return False
+        left_hi,right_lo=local_hi.copy(),local_lo.copy()
+        left_hi[axis]=right_lo[axis]=mid[axis]
+        pending.extend([(local_lo,left_hi),(right_lo,local_hi)])
+    return True
 
 
 def nearest_order(start, poses, tool_radius):
@@ -254,17 +331,17 @@ class SpatialDriver(Driver):
                 if shape_sweep(before,pose,shape)+.025 <= self.clearance:
                     continue
                 lo,hi=bounds_of_shape(pose,shape)
-                if not self.coverage_contains(lo-.025,hi+.025):
+                if not covers_primitive(pose,shape,.025,self.coverage_contains):
                     gaps.add(shape[0]);self.missing_volume(shape[0],lo-.025,hi+.025)
         for old, new, (_, shapes) in zip(self.ref_bodies, self.link_poses(joints), self.bodies):
             for primitive in shapes:
                 if shape_sweep(old, new, primitive)+.020 <= self.body_clearance:
                     continue
                 lo, hi = bounds_of_shape(new, primitive)
-                if not self.coverage_contains(lo-.020, hi+.020):
+                if not covers_primitive(new,primitive,.020,self.coverage_contains):
                     gaps.add(primitive[0])
                     self.missing_volume(primitive[0],lo-.020,hi+.020)
-        if self.driving and gaps:
+        if gaps and (self.driving or self.scene_boxes):
             raise CandidateRejected('Missing measured obstacle coverage: '+', '.join(sorted(gaps)))
         js = self._state_request.robot_state.joint_state
         js.position = [joints[n] if n in joints else live.get(n, v) for n, v in zip(js.name, self._passive)]
@@ -277,7 +354,47 @@ class SpatialDriver(Driver):
         # A measured empty region can contain the future moving body. A
         # separately surveyed region may also contain modeled obstacles; every
         # state must still pass the scene collision query below.
-        return covered(lo,hi,self.free_boxes) or covered(lo,hi,self.scene_boxes)
+        return covered(lo,hi,self.free_boxes+self.scene_boxes)
+
+    def interior_ik(self):
+        if not hasattr(self,'_interior_ik'):
+            ik=copy(self.ik)
+            k=ik.kdl
+            lo,hi=k.JntArray(7),k.JntArray(7)
+            # A small numerical reserve keeps solutions on a soft IK limit from
+            # falling outside the independently checked command margin.
+            for i in range(7):
+                lo[i]=ik.lower[i]+TARGET_JOINT_MARGIN_RAD+.001
+                hi[i]=ik.upper[i]-TARGET_JOINT_MARGIN_RAD-.001
+            ik.solver=k.ChainIkSolverPos_NR_JL(ik.chain,lo,hi,ik.fk,ik.velocity,150,1e-6)
+            self._interior_ik=ik
+        return self._interior_ik
+
+    def checked_command_start(self,previous,goal,inward_only):
+        measured=super().checked_command_start(previous,goal,inward_only)
+        lower={n:self.ik.lower[i] for i,n in enumerate(self.ik.names)}
+        upper={n:self.ik.upper[i] for i,n in enumerate(self.ik.names)}
+        guarded_joint_step(measured,goal,lower,upper)
+        return measured
+
+    def execute(self,path,start,target,inward_only=False):
+        lower={n:self.ik.lower[i] for i,n in enumerate(self.ik.names)}
+        upper={n:self.ik.upper[i] for i,n in enumerate(self.ik.names)}
+        def pending():
+            for i,goal in enumerate(path):
+                measured=self.live()
+                try:
+                    guarded_joint_step(measured,goal,lower,upper,final=i==len(path)-1)
+                except CandidateRejected:
+                    # A legal, measured pose may already have passed an interim
+                    # inward waypoint. Never publish an outward correction.
+                    if (i==len(path)-1 or not self.in_limits(measured)
+                            or max(abs(measured[n]-goal[n]) for n in goal)>.01):
+                        raise
+                    self.record('passed_inward_waypoint',sample=i)
+                    continue
+                yield goal
+        super().execute(pending(),start,target,inward_only)
 
     def near_knots(self,start,target):
         first=fk_matrix(self.ik.forward(start))
@@ -289,11 +406,60 @@ class SpatialDriver(Driver):
         for i in range(1,steps+1):
             f=i/steps
             pose=transform({'xyz':((1-f)*first[:3,3]+f*target[:3,3]).tolist(),'xyzw':_slerp(q0,q1,f)})
-            previous=self.ik.solve(pose_msg(pose),previous,self.ik.forward(previous))
+            previous=self.interior_ik().solve(pose_msg(pose),previous,self.ik.forward(previous))
             knots.append(previous)
         return knots
 
+    def endpoint_branches(self,start,target):
+        """Find deterministic alternatives for the redundant elbow with bounded KDL."""
+        ik=self.interior_ik()
+        goal_msg=pose_msg(target).pose
+        goal=ik.frame(goal_msg.position,goal_msg.orientation)
+        candidates=[]
+        trial_seeds=[]
+        for offset in (0.,-.25,.25,-.55,.55,-.85,.85,-1.15,1.15):
+            for shoulder in (0.,-.35,.35):
+                bias={'right_e0':offset,'right_s0':shoulder,'right_w0':-.5*offset}
+                trial_seeds.append([max(ik.lower[i],min(ik.upper[i],start[n]+bias.get(n,0.))) for i,n in enumerate(ik.names)])
+        # Seeding only the current elbow can miss a disconnected IK family.
+        # Cover the bounded 7-D seed box deterministically, with a Halton grid.
+        def radical_inverse(index,base):
+            value=0.;place=1/base
+            while index:
+                index,digit=divmod(index,base);value+=digit*place;place/=base
+            return value
+        for trial in range(1,129):
+            trial_seeds.append([ik.lower[i]+(ik.upper[i]-ik.lower[i])*radical_inverse(trial,base)
+                                for i,base in enumerate((2,3,5,7,11,13,17))])
+        for values in trial_seeds:
+            seed=ik.kdl.JntArray(7);out=ik.kdl.JntArray(7)
+            for i,v in enumerate(values):seed[i]=v
+            if ik.solver.CartToJnt(seed,goal,out)<0:continue
+            q={n:float(out[i]) for i,n in enumerate(ik.names)}
+            if not self.in_limits(q) or not all(map(math.isfinite,q.values())):continue
+            if any(max(abs(q[n]-other[n]) for n in q)<.035 for other in candidates):continue
+            reached=fk_matrix(ik.forward(q))
+            if np.linalg.norm(reached[:3,3]-target[:3,3])>.001 or angle(reached[:3,:3].T@target[:3,:3])>.005:
+                continue
+            candidates.append(q)
+        return sorted(candidates,key=lambda q:sum((q[n]-start[n])**2 for n in q))
+
     def planned_path(self,start,target):
+        # A previous plan can preserve the redundant elbow branch. Rebuild the
+        # full path from the current joints and validate each state afresh.
+        for hint in self.survey.get('joint_path_hints', ()):
+            if not np.allclose(transform(hint['base_T_effector']),target,atol=1e-10,rtol=0):
+                continue
+            knots=hint['joint_knots']
+            if (not isinstance(knots,list) or not knots
+                    or any(set(q)!=set(start) or not all(map(math.isfinite,q.values())) for q in knots)):
+                raise ValueError('Malformed joint path hint')
+            try:
+                path=self.checked_knots(start,target,knots,reject_detour=True)
+                self.last_route='revalidated_joint_hint'
+                return path
+            except CandidateRejected as error:
+                self.record('joint_path_hint_rejected',reason=str(error))
         near_goal=None
         try:
             knots=self.near_knots(start,target)
@@ -303,6 +469,28 @@ class SpatialDriver(Driver):
             return path
         except (IKUnreachableError,CandidateRejected) as error:
             self.record('local_path_rejected',reason=str(error))
+        if near_goal is not None:
+            try:
+                path=self.checked_knots(start,target,[near_goal],reject_detour=True)
+                self.last_route='direct_joint_near_goal'
+                return path
+            except CandidateRejected as error:
+                self.record('direct_joint_rejected',reason=str(error))
+        seeds=self.endpoint_branches(start,target)
+        def alternatives():
+            yield from seeds
+            from .handeye_elbow import redundant_branches
+            pose=pose_msg(target).pose
+            yield from redundant_branches(self.interior_ik(),self.ik.frame(pose.position,pose.orientation),
+                                           start,seeds,TARGET_JOINT_MARGIN_RAD)
+        for branch in alternatives():
+            try:
+                self.check(branch)
+                path=self.checked_knots(start,target,[branch],reject_detour=True)
+                self.last_route='checked_elbow_branch'
+                return path
+            except CandidateRejected:
+                continue
         last_error=None
         for goal in ([near_goal,None] if near_goal is not None else [None]):
             try:
@@ -325,6 +513,16 @@ class SpatialDriver(Driver):
             request['goal_constraints']=[{'joint_constraints':[
                 {'joint_name':n,'position':v,'tolerance_above':.001,'tolerance_below':.001,'weight':1.}
                 for n,v in joint_goal.items()]}]
+        # OMPL must honor joint limits on the entire generated path as well.
+        # A start already inside the edge band is constrained to its measured
+        # side; every returned sample also gets the monotonic exit check.
+        constraints=[]
+        for i,n in enumerate(self.ik.names):
+            low=min(start[n],self.ik.lower[i]+TARGET_JOINT_MARGIN_RAD)
+            high=max(start[n],self.ik.upper[i]-TARGET_JOINT_MARGIN_RAD)
+            constraints.append({'joint_name':n,'position':(low+high)/2,'tolerance_above':(high-low)/2,
+                                'tolerance_below':(high-low)/2,'weight':1.})
+        request['path_constraints']={'joint_constraints':constraints}
         goal = MoveGroupGoal()
         genpy.message.fill_message_args(goal.request, [request])
         goal.planning_options.plan_only = True
@@ -372,7 +570,12 @@ class SpatialDriver(Driver):
         line_start=fk_matrix(self.ik.forward(start))[:3,3]
         line=target[:3,3]-line_start
         line_norm=float(line@line)
-        for knot in knots:
+        lower={n:self.ik.lower[i] for i,n in enumerate(self.ik.names)}
+        upper={n:self.ik.upper[i] for i,n in enumerate(self.ik.names)}
+        for i,knot in enumerate(knots):
+            # The checked and executed joint interpolation between successive
+            # knots is monotonic for each joint. Check extrema at the two knots.
+            guarded_joint_step(previous,knot,lower,upper,final=i==len(knots)-1)
             for q in joint_path(previous, knot):
                 if reject_detour:
                     delta=fk_matrix(self.ik.forward(q))[:3,3]-line_start
@@ -499,6 +702,7 @@ def main(argv=None):
                 path = driver.planned_path(start, pose)
                 gaps = sorted(driver.gaps)
                 record('preflight', id=row['id'], split=row['split'], samples=len(path),route=driver.last_route,
+                       target_joints=path[-1],
                        unmeasured_sweep_links=gaps, unmeasured_sweep_bounds_base_m=driver.coverage_report(),
                        marker_visibility=visible)
                 if gaps:

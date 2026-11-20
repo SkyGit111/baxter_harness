@@ -72,8 +72,10 @@ def check_config(path):
                 'table_polygon_present': isinstance(primitive.get('table_polygon_base_xy'), list),
                 'tcp_offset_present': isinstance(primitive.get('tcp_offset_tool_m'), list),
             }
-        result['status'] = 'ok' if (result['arms'] and all(
-            item['commissioned'] and item['primitive_calibrated'] for item in result['arms'].values())
+        selected=cfg.get('motion_arms',list(arms)) if result['kind']=='dual' else list(arms)
+        result['motion_arms']=selected
+        result['status'] = 'ok' if (selected and all(
+            result['arms'][arm]['commissioned'] and result['arms'][arm]['primitive_calibrated'] for arm in selected)
             and (result['kind'] != 'dual' or result['inter_arm_clearance_verified'])) else 'pending'
     except (OSError, ValueError, TypeError, KeyError, ImportError, AttributeError) as error:
         result['status'] = 'error'
@@ -144,7 +146,10 @@ def check_online(robot, view_dir=None):
         if health.get('motion_scope') != 'supervised_dual_primitive_task':
             result['checks']['dual_bridge'] = {'status': 'error', 'reason': 'wrong_motion_scope'}
             return result
-        for arm in ('left', 'right'):
+        available=health.get('available_arms',['left','right'])
+        if not available or any(arm not in ('left','right') for arm in available):
+            raise ValueError('Bridge did not advertise any eligible arm')
+        for arm in available:
             tick = time.monotonic()
             observation = robot.call('dual.observe', (arm,), timeout_s=20)
             states = observation.get('arm_states', {})

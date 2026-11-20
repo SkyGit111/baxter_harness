@@ -19,6 +19,12 @@ class HandeyeCapture(unittest.TestCase):
         old=dict(width=1280,height=720,fx=644.6696,fy=643.9489,ppx=640,ppy=360,
                  model='distortion.inverse_brown_conrady',coeffs=[0.]*5)
         self.assertLess(verify_optical_profile(old, dict(old,fx=644.8450,fy=644.1243)),.25)
+        changes=[]
+        shift=verify_optical_profile(old,dict(old,ppx=640.81),changes)
+        self.assertAlmostEqual(shift,.81)
+        self.assertLess(.8*changes[0],.003)
+        with self.assertRaises(ValueError):
+            verify_optical_profile(old,dict(old,width=640),changes)
         for changed in (dict(old,fx=650.),dict(old,ppx=642),dict(old,model='none')):
             with self.assertRaises(ValueError):
                 verify_optical_profile(old,changed)
@@ -191,13 +197,14 @@ class HandeyeCapture(unittest.TestCase):
             root=Path(folder); out=root/'new'; gate=root/'gate.json'
             gate.write_text(json.dumps({'id':'sample-1','base_T_effector':{'xyz':[0,0,0],'xyzw':[0,0,0,1]}}))
             args=NS(output_dir=out,serial='fake',train=1,holdout=0,duration_s=5.,color_mode='160x120',
-                    depth_mode='160x120',pose_gate=gate,width_m=.10,height_m=.10)
+                    depth_mode='160x120',pose_gate=gate,width_m=.10,height_m=.10,ready_file=root/'ready.json')
             with patch.dict('sys.modules',cv2=cv,pyrealsense2=rs,rospy=ros),patch(
                     'cix_harness.handeye_capture.EndpointReader',return_value=robot),patch(
                     'cix_harness.handeye_capture.time.monotonic',side_effect=lambda:clock[0]),patch('builtins.print'):
                 self.assertEqual(capture(args),0)
             record=json.loads((out/'train.json').read_text())[0]
             self.assertEqual(record['drive_pose_id'],'sample-1')
+            self.assertEqual(json.loads(args.ready_file.read_bytes())['session'],record['capture_session'])
             self.assertGreaterEqual(len(record['stationary_frames']),4)
             self.assertEqual(json.loads((out/'holdout.json').read_text()),[])
             self.assertTrue((out/'pose-001.npz').exists())

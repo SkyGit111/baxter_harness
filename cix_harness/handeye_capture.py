@@ -4,6 +4,7 @@ from collections import deque
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import threading
 import time
@@ -324,11 +325,11 @@ def volume_capture_plan(path):
     return poses, hashlib.sha256(raw).hexdigest(), counts
 
 
-def load_volume_checkpoint(out, manifest, poses):
+def load_volume_checkpoint(out, manifest, poses, ray_changes=None):
     old = json.loads((out/'manifest.json').read_text(encoding='utf8'))
     for k,v in manifest.items():
         if k in ('intrinsics','native_depth_intrinsics') and k in old:
-            verify_optical_profile(old[k],v)
+            verify_optical_profile(old[k],v,ray_changes)
         elif old.get(k) != v:
             raise ValueError('Capture plan, camera, stream calibration or ruler reference changed: '+k)
     sets = {s: json.loads((out/(s+'.json')).read_text(encoding='utf8')) for s in ('train','holdout')}
@@ -355,7 +356,7 @@ def load_volume_checkpoint(out, manifest, poses):
     return sets
 
 
-def verify_optical_profile(old, current):
+def verify_optical_profile(old, current, ray_changes=None):
     # The D455 SDK can report temperature-dependent focal lengths at startup.
     # Reject changes in sensor mode or distortion. Bound the full-frame pixel
     # shift, and always deproject each new sample using its actual SDK profile.
@@ -370,7 +371,9 @@ def verify_optical_profile(old, current):
         shifts.append(max(abs((u-old[pp]) * (current[focal]/old[focal]-1) + current[pp]-old[pp])
                           for u in (0,old[length]-1)))
     error=math.hypot(*shifts)
-    if error>.75:
+    if ray_changes is not None:
+        ray_changes.append(error/min(float(current['fx']),float(current['fy'])))
+    elif error>.75:
         raise ValueError('SDK optical profile changed by {:.3f} pixels at the image boundary'.format(error))
     return error
 
@@ -381,6 +384,10 @@ def capture(args):
     import rospy
 
     out=args.output_dir
+    ready_file=getattr(args,'ready_file',None)
+    ray_changes=[] if ready_file and args.width_m and args.height_m else None
+    if ready_file and ready_file.exists():
+        raise ValueError('Use a new readiness file for this camera session')
     poses = {}
     resume = getattr(args, 'resume', False)
     if getattr(args, 'volume_plan', None):
@@ -424,7 +431,7 @@ def capture(args):
         if poses:
             manifest['volume_plan_sha256'] = volume_hash
         if resume:
-            sets = load_volume_checkpoint(out,manifest,poses)
+            sets = load_volume_checkpoint(out,manifest,poses,ray_changes)
             original_manifest = json.loads((out/'manifest.json').read_text(encoding='utf8'))
         else:
             write_json(out/'manifest.json',manifest)
@@ -460,7 +467,7 @@ def capture(args):
                     aligned_intr=depth.profile.as_video_stream_profile().get_intrinsics()
                     actual_intrinsics=intrinsics_data(aligned_intr)
                     if resume and 'aligned_depth_intrinsics' in original_manifest:
-                        verify_optical_profile(original_manifest['aligned_depth_intrinsics'],actual_intrinsics)
+                        verify_optical_profile(original_manifest['aligned_depth_intrinsics'],actual_intrinsics,ray_changes)
                     if any(abs(getattr(aligned_intr,k)-getattr(intr,k))>.01 for k in ('fx','fy','ppx','ppy','width','height')):
                         raise RuntimeError('SDK aligned-depth intrinsics disagree with the color stream')
                     manifest['aligned_depth_intrinsics']=actual_intrinsics
@@ -488,6 +495,15 @@ def capture(args):
                 info.update(robot.sample(arrival),host_time_s=arrival,color_frame=previous_frame,
                             depth_frame=depth.get_frame_number(),color_stamp_ms=color.get_timestamp(),
                             depth_stamp_ms=depth.get_timestamp(),camera_timestamp_domain=str(color.get_frame_timestamp_domain()))
+                if ray_changes:
+                    shift=max(ray_changes)*max(p[2] for p in info['corners_optical_m'])
+                    if shift>.003:
+                        raise ValueError('Optical profile change exceeds 3 mm at measured tag depth')
+                    info['profile_displacement_bound_m']=shift
+                if ready_file and not ready_file.exists():
+                    write_json(ready_file,dict(pid=os.getpid(),session=session_file,frame=previous_frame,
+                                               pose_check=info['pose_check'],time=time.time(),
+                                               profile_displacement_bound_m=info.get('profile_displacement_bound_m')))
                 if args.pose_gate is not None:
                     if info['joint_limit_violations']:
                         raise ValueError('Drive gate cannot acknowledge out-of-model right joints: '+str(info['joint_limit_violations']))
@@ -561,6 +577,7 @@ def main(argv=None):
     p.add_argument('--train',type=int,default=12)
     p.add_argument('--holdout',type=int,default=4)
     p.add_argument('--pose-gate',type=Path,help='Require the measured endpoint to match an external pose ID/target throughout the window')
+    p.add_argument('--ready-file',type=Path,help='Publish readiness after fresh paired robot and metric tag observations')
     p.add_argument('--volume-plan',type=Path,help='Immutable spatial plan assigning each target and its train/holdout group by ID')
     p.add_argument('--resume',action='store_true',help='Continue the same spatial plan using the same camera calibration and recorded files')
     p.add_argument('--width-m',type=float,help='Ruler measurement of black outer border along decoded x')

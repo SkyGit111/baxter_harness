@@ -45,7 +45,7 @@ class PlannerImages(unittest.TestCase):
 
     def test_api_sends_both_images_and_logs_metadata_without_image_payload(self):
         opener=Mock();stream=Mock();log=Mock()
-        stream.read.return_value=json.dumps({'status':'completed','output':[{'type':'message','content':[
+        stream.read.return_value=json.dumps({'status':'completed','model':'provider-model-2026-11-20','output':[{'type':'message','content':[
             {'type':'output_text','text':'{"ok":true}'}]}]}).encode()
         opener.open.return_value.__enter__=Mock(return_value=stream)
         opener.open.return_value.__exit__=Mock(return_value=False)
@@ -55,6 +55,9 @@ class PlannerImages(unittest.TestCase):
         body=json.loads(opener.open.call_args.args[0].data)
         content=body['input'][1]['content']
         self.assertEqual([x['type'] for x in content],['input_text','input_image','input_image'])
+        self.assertEqual([x['image_url'] for x in content if x['type']=='input_image'],[IMAGE,IMAGE])
+        self.assertEqual(log.call_args.kwargs['response_model'],'provider-model-2026-11-20')
+        self.assertEqual(log.call_args.kwargs['model'],body['model'])
         self.assertIn('ONLY pixel coordinate frame for uv',body['input'][0]['content'])
         self.assertEqual(log.call_args.kwargs['images']['image_count'],2)
         self.assertNotIn('base64',json.dumps(log.call_args.kwargs))

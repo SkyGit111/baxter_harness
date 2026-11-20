@@ -9,8 +9,8 @@ import numpy as np
 
 from cix_harness.handeye import packed
 from cix_harness.handeye_spatial_drive import (
-    CandidateRejected, SpatialDriver, bounds_of_shape, covered, existing_samples,
-    marker_projection, validate_scene,
+    CandidateRejected, SpatialDriver, box_shape, bounds_of_shape, covered, covers_primitive, existing_samples,
+    guarded_joint_step, marker_projection, validate_scene,
 )
 from cix_harness.moveit_probe import joint_names
 
@@ -46,6 +46,28 @@ class SpatialDriveTests(unittest.TestCase):
         self.assertFalse(covered(lo,hi,[(lo+.001,hi+.001)]))
         self.assertTrue(covered(lo,hi,[(lo,hi)]))
 
+    def test_survey_adjoining_boxes_cover_union_without_filling_unseen_gaps(self):
+        lo=np.array([0.,0.,0.]);hi=np.array([2.,1.,1.])
+        a=(lo,np.array([1.,1.,1.]));b=(np.array([1.,0.,0.]),hi)
+        self.assertTrue(covered(lo,hi,[a,b]))
+        self.assertFalse(covered(lo,hi,[a,(b[0]+[.0004,0,0],hi)]))
+
+    def test_oblique_solid_in_survey_union_with_physical_padding(self):
+        pose=np.eye(4)
+        c=2**-.5
+        pose[:2,:2]=[[c,-c],[c,c]]
+        shape=box_shape('forearm',pose,[.4,.015,.015])
+        # Staircase of overlapping measured boxes, with a missing unoccupied
+        # corner of the world-aligned box around the diagonal forearm.
+        boxes=[(np.array([x-.05,x-.05,-.05]),np.array([x+.05,x+.05,.05]))
+               for x in np.arange(-.15,.151,.03)]
+        inside=lambda lo,hi:covered(lo,hi,boxes)
+        lo,hi=bounds_of_shape(np.eye(4),shape)
+        self.assertFalse(inside(lo-.005,hi+.005))
+        self.assertTrue(covers_primitive(np.eye(4),shape,.005,inside))
+        translated=np.eye(4);translated[2,3]=.045
+        self.assertFalse(covers_primitive(translated,shape,.005,inside))
+
     def test_cannot_skip_wrong_split_or_missing_capture_evidence(self):
         row={'id':'v01','split':'train','base_T_effector':packed(self.anchor)}
         record={'drive_pose_id':'v01','drive_target_base_T_effector':self.anchor.tolist(),'frame_id':'pose-001'}
@@ -71,7 +93,7 @@ class SpatialDriveTests(unittest.TestCase):
                    attached_collision_objects=['tool'])
         d.live=lambda:dict(start,head_pan=.42)
         d.check=Mock()
-        d.ik=NS(forward=lambda q: {'position':NS(x=0.,y=0.,z=1.),
+        d.ik=NS(names=names,lower=[-2.]*7,upper=[2.]*7,forward=lambda q: {'position':NS(x=0.,y=0.,z=1.),
                                   'orientation':NS(x=0.,y=0.,z=0.,w=1.)})
         d.ros=NS(Duration=float);d.move_group=Mock()
         trajectory=NS(joint_names=names,points=[NS(positions=[0.]*7),NS(positions=[.03]*7)])
@@ -90,3 +112,29 @@ class SpatialDriveTests(unittest.TestCase):
         self.assertEqual(sent.request.start_state.attached_collision_objects,['tool'])
         self.assertGreater(len(path),5)
         self.assertEqual(d.check.call_count,len(path)+1)
+
+    def test_inside_exit_and_goal_margin_do_not_clip_wrist_feedback(self):
+        low={'w1':-1.57079632679};high={'w1':2.}
+        start={'w1':-1.569};inner={'w1':-1.561}
+        guarded_joint_step(start,inner,low,high)
+        with self.assertRaisesRegex(CandidateRejected,'approaches'):
+            guarded_joint_step(inner,start,low,high)
+        with self.assertRaisesRegex(CandidateRejected,'ends within'):
+            guarded_joint_step(start,inner,low,high,final=True)
+        with self.assertRaisesRegex(CandidateRejected,'outside URDF'):
+            guarded_joint_step({'w1':-1.571},inner,low,high)
+        guarded_joint_step(inner,{'w1':-1.525},low,high,final=True)
+
+    def test_joint_hint_rechecks_present_joints_target_and_sweep(self):
+        driver=object.__new__(SpatialDriver)
+        start={'q':.01};knots=[{'q':.05},{'q':.10}]
+        driver.survey={'joint_path_hints':[{'base_T_effector':packed(self.anchor),'joint_knots':knots}]}
+        driver.checked_knots=Mock(return_value=knots)
+        self.assertEqual(driver.planned_path(start,self.anchor),knots)
+        driver.checked_knots.assert_called_once_with(start,self.anchor,knots,reject_detour=True)
+        self.assertEqual(driver.last_route,'revalidated_joint_hint')
+        driver.checked_knots=Mock(side_effect=CandidateRejected('observed collision'))
+        driver.record=Mock();driver.near_knots=Mock(side_effect=RuntimeError('ordinary planner'))
+        with self.assertRaisesRegex(RuntimeError,'ordinary planner'):
+            driver.planned_path(start,self.anchor)
+        driver.record.assert_called_once_with('joint_path_hint_rejected',reason='observed collision')
