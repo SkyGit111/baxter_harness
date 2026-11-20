@@ -4,11 +4,13 @@ import time
 import uuid
 from contextlib import contextmanager
 from .kinematics import IKUnreachableError
+from .primitives import check_stack_support
 from .primitives import SKILLS, TargetDepthError, TargetWorkspaceError, validate_profile, plan, ground_pixel, eef_from_tcp, tcp_from_eef, check_tcp
 from .workspace import workspace_metadata
 from .planning import candidate_profiles,stage_phase
 from .collision import ArmCollisionError, PeerJointMovedError
 from .moveit_guard import MoveItGuard, MoveItCollisionError, options as collision_options
+from . import ring_peg
 
 
 class SceneChangedError(ValueError):
@@ -84,6 +86,10 @@ class PrimitiveService:
         self.moveit = MoveItGuard(robot, required_world) if backend == 'moveit' else None
         robot.primitive_moveit_guard = self.moveit
         self.profile=validate_profile(robot.cfg['primitives'])
+        if 'ring_peg' in self.profile:
+            self.skills=tuple(s for s in self.skills if s in ('pick','place','clear_view','retreat','home'))
+        self.ring_planned=None
+        self.ring_last_action=None
         self.observation=None
         self.prepared=None
 
@@ -116,6 +122,9 @@ class PrimitiveService:
         depth=self.robot.camera.last_depth
         if depth is None:raise RuntimeError('Aligned depth missing')
         self.observation=(obs,time.monotonic(),depth.copy())
+        if 'ring_peg' in self.profile:
+            obs['ring_scene']=self._ring_scene(obs['state'],obs['id'])
+            obs['ring_scene']['verified_skill']=ring_peg.verified(self.ring_last_action,obs['ring_scene'],obs['state'])
         tcp=tcp_from_eef(obs['state']['eef_m'],obs['state']['eef_xyzw'],self.profile)
         views=self.profile.get('observation_tcp_m',[])
         obs['recovery']={'view_indices':[i for i,v in enumerate(views) if math.dist(tcp,v)>=.02],
@@ -126,16 +135,23 @@ class PrimitiveService:
         import pyrealsense2 as rs
         obs['workspace']=workspace_metadata(self.profile,self.robot.camera.intrinsics,rs.rs2_project_point_to_pixel)
 
+    def _ring_scene(self,state,obs_id):
+        from .ring_perception import observe_ring_scene
+        c=self.robot.camera
+        measured=observe_ring_scene(c.last_color,c.last_depth,c.intrinsics,self.profile,
+                                    self.profile['ring_peg']['perception'],state)
+        return dict(measured,obs_id=obs_id,frame_number=c.last_number,resolution=[c.intrinsics.width,c.intrinsics.height])
+
     def prepare(self,obs_id,skill,uv=None,target_base_m=None,view_index=0):
         started=time.monotonic()
         timings={'grounding':0.,'skill_plan':0.,'ik_preflight':0.}
         try:
             result=self._prepare(obs_id,skill,uv,target_base_m,view_index,timings)
-        except (TargetDepthError,TargetWorkspaceError,SceneChangedError,IKPreflightError,MoveItCollisionError) as error:
+        except (TargetDepthError,TargetWorkspaceError,SceneChangedError,IKPreflightError,MoveItCollisionError,ring_peg.RingGeometryError) as error:
             # Only these explicit, pre-actuation failures permit replanning.
             code={TargetDepthError:'target_depth',TargetWorkspaceError:'target_workspace',
                   SceneChangedError:'scene_changed',IKPreflightError:'ik_preflight',
-                  MoveItCollisionError:'moveit_collision'}[type(error)]
+                  MoveItCollisionError:'moveit_collision',ring_peg.RingGeometryError:'ring_geometry'}[type(error)]
             result={'status':'rejected','obs_id':obs_id,'skill':skill,'applied':False,
                     'failure_code':code,'message':str(error),'recoverable':True}
         except BaseException as error:
@@ -151,6 +167,7 @@ class PrimitiveService:
     def _prepare(self,obs_id,skill,uv=None,target_base_m=None,view_index=0,timings=None):
         from .contract import vector
         self.prepared=None
+        self.ring_planned=None
         if skill not in self.skills:
             raise ValueError('Primitive is outside the configured skill scope: '+str(skill))
         observation,self.observation=self.observation,None
@@ -162,8 +179,16 @@ class PrimitiveService:
         if skill not in ('pick','place','stack','move_to') and (uv is not None or target_base_m is not None):
             raise ValueError('This skill does not accept a target')
         if timings is None:timings={}
+        ring_objects=None;ring_detail=None
         with _measure(timings,'grounding'):
-            target=(ground_pixel(uv,depth,r.camera.intrinsics,p) if uv is not None else target_base_m)
+            if 'ring_peg' in p and skill in ('pick','place'):
+                if uv is None or target_base_m is not None:raise ring_peg.RingGeometryError('Select the ring or peg in the current D455 observation')
+                scene=obs['ring_scene']
+                if scene['obs_id']!=obs_id:raise ring_peg.RingGeometryError('Ring geometry belongs to another observation')
+                ring_objects=ring_peg.resolve(p,scene,obs['state'],skill,uv)
+                ring,peg=ring_objects
+                target=ring['rim_grasp_base_m'] if skill=='pick' else peg['tip_base_m']
+            else:target=(ground_pixel(uv,depth,r.camera.intrinsics,p) if uv is not None else target_base_m)
             if target is not None:target=vector(target,3,'base target')
         peer_check=_peer_path_check(r,skill,obs['state'].get('gripping'))
         attempts=[];last_error=None;moveit_receipt=None
@@ -173,7 +198,13 @@ class PrimitiveService:
             motion_schedule=[]
             try:
                 with _measure(timings,'skill_plan'):
-                    stages=plan(skill,obs['state'],candidate,target,view_index)
+                    if ring_objects is None:
+                        stages=plan(skill,obs['state'],candidate,target,view_index)
+                    else:
+                        if skill=='pick':
+                            contact,ring_detail=ring_peg.pick_geometry(candidate,scene,ring,candidate['tool_orientation_xyzw'])
+                        else:contact,ring_detail=ring_peg.release_geometry(candidate,scene,obs['state'],ring,peg)
+                        stages=plan(skill,obs['state'],candidate,target,view_index,ring_contact_tcp=contact)
                 operations=sum(s['kind'] in ('move','gripper') for s in stages)
                 if r.motion_remaining is None or r.motion_remaining<operations:
                     attempts.append({'yaw_rad':yaw,'approach_path':route,'status':'rejected',
@@ -190,7 +221,7 @@ class PrimitiveService:
                     with _measure(timings,'moveit_full_path'):
                         segments = [(i, stage_phase(stages, i, skill), path) for i, path in enumerate(paths)]
                         moveit_receipt = self.moveit.check(initial, segments)
-            except (IKPreflightError,ArmCollisionError,MoveItCollisionError) as error:
+            except (IKPreflightError,ArmCollisionError,MoveItCollisionError,ring_peg.RingGeometryError) as error:
                 attempts.append({'yaw_rad':yaw,'approach_path':route,'status':'rejected','reason':str(error),'seconds':time.monotonic()-attempt_started})
                 last_error=error
                 continue
@@ -209,8 +240,10 @@ class PrimitiveService:
         if set(final)!=set(initial) or max(abs(final[k]-initial[k]) for k in initial)>.015:
             raise SceneChangedError('Arm moved during path preflight')
         token=uuid.uuid4().hex
+        if ring_objects is not None:self.ring_planned=(token,dict(ring_detail,skill=skill,obs_id=obs_id,contact_tcp_m=contact))
         self.prepared=(token,time.monotonic(),initial,stages,paths,operations,skill,obs['state']['gripping'])
         return {'status':'ready','plan_id':token,'obs_id':obs_id,'skill':skill,'target_base_m':target,'stages':stages,
+                **({'ring_geometry':self.ring_planned[1]} if self.ring_planned else {}),
                 'applied':False,'ik_preflight':True,'required_stages':operations,
                 'expires_in_s':r.cfg['max_observation_age_s'],'planning_candidates':attempts,
                 'selected_approach_path':route,'motion_schedule':motion_schedule,
@@ -333,8 +366,10 @@ class PrimitiveService:
         r.motion_remaining-=operations;receipts=[];grasp_verified=False
         r.audit('primitive_dispatch',plan_id=token,skill=skill,stages=stages,timings_s=dict(timings))
         stage=None;stage_started=None;stage_timings={};departed=False;actuation_attempted=False
+        stage_index=0;ring_iterations=0
         try:
-            for stage_index,(stage,path) in enumerate(zip(stages,paths)):
+            while stage_index<len(stages):
+                stage,path=stages[stage_index],paths[stage_index]
                 stage_started=time.monotonic();stage_timings={};command_state='not_dispatched'
                 phase=stage_phase(stages,stage_index,skill);motion_detail=None;moveit_receipt=None
                 r.audit('primitive_stage_started',plan_id=token,stage_index=stage_index,
@@ -376,6 +411,40 @@ class PrimitiveService:
                             raise RuntimeError('Primitive stage did not reach target; do not proceed to contact/release')
                         if holding and not r.grip.gripping():raise RuntimeError('Held object lost during movement')
                 elif stage['kind']=='gripper':
+                    if skill=='place' and stage['open'] and 'ring_peg' in p:
+                        with _measure(stage_timings,'ring_release_check',timings):
+                            if not self.ring_planned or self.ring_planned[0]!=token:raise RuntimeError('Matching ring plan required')
+                            _,captured,frame=r.camera.capture();measured_state=r.read_state()
+                            scene=self._ring_scene(measured_state,'release-'+str(frame))
+                            try:result=ring_peg.verify_before_open(p,scene,measured_state,self.ring_planned[1])
+                            except ring_peg.RingAlignmentNeeded as offset:
+                                if ring_iterations>=p['ring_peg'].get('servo_iterations',3):
+                                    raise RuntimeError('Ring alignment budget exhausted: '+str(offset)) from offset
+                                if r.motion_remaining<1:raise RuntimeError('No remaining stage for ring alignment')
+                                suffix=ring_peg.correction_suffix(p,measured_state,offset,stages[stage_index:])
+                                joints,new_paths=self._preflight(suffix,{'state':measured_state},captured,skill='place')
+                                peer_check=_peer_path_check(r,'place',True)
+                                if callable(peer_check) and peer_check(r,new_paths) is False:
+                                    raise RuntimeError('Peer clearance rejected ring alignment')
+                                if self.moveit is not None:
+                                    segments=[(stage_index+i,stage_phase(suffix,i,'place'),path) for i,path in enumerate(new_paths)]
+                                    self.moveit.check(joints,segments,executing=True)
+                                stages[stage_index:]=suffix;paths[stage_index:]=new_paths
+                                r.motion_remaining-=1;ring_iterations+=1
+                                r.audit('ring_servo_replanned',plan_id=token,iteration=ring_iterations,frame_number=frame,
+                                        stage_index=stage_index,correction_tcp_m=suffix[0]['tcp_m'],
+                                        measured_offset_xy_m=[offset.dx,offset.dy],allowance_m=offset.allowance)
+                                continue
+                            except ring_peg.RingGeometryError as error:
+                                r.audit('ring_release_rejected',plan_id=token,frame_number=frame,reason=str(error),
+                                        held_ring_id=scene.get('held_ring_id'),missing=scene.get('missing',[]))
+                                raise
+                            r.audit('ring_release_checked',plan_id=token,frame_number=frame,geometry=result)
+                    if stage['open'] and skill=='stack' and 'stack_support' in p:
+                        pose=r.limb.endpoint_pose()
+                        pos,ori=pose['position'],pose['orientation']
+                        tcp=tcp_from_eef([pos.x,pos.y,pos.z],[ori.x,ori.y,ori.z,ori.w],p)
+                        check_stack_support(tcp,p,at_release=True)
                     with _measure(stage_timings,'gripper_command',timings):
                         actuation_attempted=True
                         command_state='outcome_unknown'
@@ -403,6 +472,7 @@ class PrimitiveService:
                 receipts.append(receipt)
                 stage_started=None
                 r.audit('primitive_stage_applied',plan_id=token,**receipt)
+                stage_index+=1
         except BaseException as error:
             failed_stage=None
             if stage_started is not None:
@@ -441,6 +511,8 @@ class PrimitiveService:
         finally:
             if actuation_attempted:
                 r.wrist_after_motion=time.monotonic()
+        if 'ring_peg' in p and self.ring_planned and self.ring_planned[0]==token:
+            self.ring_last_action=self.ring_planned[1]
         return {'plan_id':token,'skill':skill,'applied':True,'status':'completed','completed_stages':receipts,
                 'gripping':bool(r.grip.gripping()),'motion_remaining':r.motion_remaining}
 

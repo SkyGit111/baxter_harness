@@ -10,7 +10,7 @@ from unittest.mock import Mock,patch
 
 from cix_harness.kinematics import IKUnreachableError
 from cix_harness.prepare_site import build_candidate_profiles
-from cix_harness.primitives import (TargetWorkspaceError,_slerp,check_tcp,eef_from_tcp,
+from cix_harness.primitives import (TargetWorkspaceError,_slerp,check_stack_support,check_tcp,eef_from_tcp,
     plan,table_height,validate_profile,workspace_polygon)
 from cix_harness.primitive_service import PrimitiveService
 from cix_harness.workspace import workspace_metadata
@@ -44,6 +44,42 @@ def service(p=None,held=False,robot_type=Mock):
 
 
 class TableGeometry(unittest.TestCase):
+    def test_empty_side_entry_rises_toward_measured_table_instead_of_out_of_view(self):
+        p=profile();p.update(approach_path='direct_hover',max_leg_m=.5,
+                            table_polygon_base_xy=[[.5,-.3],[.8,-.3],[.8,.3],[.5,.3]])
+        entry=[.55,-.20,.12]
+        p['empty_entry_corridor']={'start_xy_m':[.45,-.30],'end_xy_m':entry[:2],'radius_m':.018,
+                                   'z_range_m':[-.12,.25],'table_entry_m':entry,'source':'surveyed entry'}
+        start=state()['eef_m']
+        check_tcp(start,p)
+        with self.assertRaises(TargetWorkspaceError):check_tcp(start,p,selected_target=True)
+        with self.assertRaises(ValueError):check_tcp(start,p,held_bottom_m=.02)
+        with self.assertRaises(ValueError):check_tcp([.44,-.23,.1],p)
+        self.assertEqual(plan('pick',state(),p,[.65,-.15,-.12])[0]['tcp_m'],entry)
+
+    def test_stack_requires_the_measured_support_top_and_a_stable_actual_release(self):
+        p=profile()
+        centre=[.60,.02,-.15]
+        p['stack_support']={'source':'measured pink top','top_center_m':centre,'center_radius_m':.012,
+                            'top_tolerance_m':.008}
+        self.assertTrue(plan('stack',state(True),p,centre))
+        for wrong in ([.625,.02,-.15],[.60,.02,-.18]):
+            with self.assertRaises(TargetWorkspaceError):plan('stack',state(True),p,wrong)
+        height=centre[2]+p['held_bottom_below_tcp_m']+p['release_clearance_m']
+        check_stack_support([.601,.02,height],p,at_release=True)
+        for wrong in ([.62,.02,height],[.60,.02,height+.02],[.60,.02,centre[2]]):
+            with self.assertRaises(ValueError):check_stack_support(wrong,p,at_release=True)
+
+        svc,robot,_=service(p,held=True)
+        robot.cfg['commissioning_scope']='supervised_primitive_task'
+        robot.armed=True;p['calibrated']=True
+        svc.prepared=('releasing',time.monotonic(),{'j':0.},[{'kind':'gripper','open':True}],[None],1,'stack',True)
+        # FK is measured at the old observation, nowhere near the support.
+        failed=svc.execute('releasing')
+        self.assertFalse(failed['applied'])
+        self.assertEqual(failed['failed_stage']['command_state'],'not_dispatched')
+        robot.grip.command_position.assert_not_called()
+
     def test_plane_replaces_flat_height_and_is_scale_invariant(self):
         p=profile()
         self.assertAlmostEqual(table_height(.4,-.3,p),-.21)

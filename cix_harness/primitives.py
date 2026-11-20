@@ -97,6 +97,13 @@ def check_tcp(xyz,p,selected_target=False,held_bottom_m=0.):
     if polygon is not None:
         crosses=[(b[0]-a[0])*(xyz[1]-a[1])-(b[1]-a[1])*(xyz[0]-a[0]) for a,b in zip(polygon,polygon[1:]+polygon[:1])]
         outside=not(all(c>=-1e-10 for c in crosses) or all(c<=1e-10 for c in crosses))
+        corridor=p.get('empty_entry_corridor')
+        if outside and corridor is not None and not selected_target and not held_bottom_m:
+            start,end=corridor['start_xy_m'],corridor['end_xy_m']
+            dx,dy=end[0]-start[0],end[1]-start[1]
+            f=max(0.,min(1.,((xyz[0]-start[0])*dx+(xyz[1]-start[1])*dy)/(dx*dx+dy*dy)))
+            outside=(math.dist(xyz[:2],[start[0]+f*dx,start[1]+f*dy])>corridor['radius_m'] or
+                     not corridor['z_range_m'][0]<=xyz[2]<=corridor['z_range_m'][1])
     if outside or any(not lo<=v<=hi for v,lo,hi in zip(xyz,p['tcp_workspace_min_m'],p['tcp_workspace_max_m'])):
         error=TargetWorkspaceError if selected_target else ValueError
         raise error('TCP target outside calibrated workspace; select a visible in-workspace target or replan/stop')
@@ -107,6 +114,22 @@ def transit_height(points,p,holding=False):
     """A plane is affine, so segment endpoint maxima bound every connecting leg."""
     margin=p['table_clearance_m']+p['approach_m']+(p['held_bottom_below_tcp_m'] if holding else 0.)
     return max(p['transit_z_m'],*(table_height(v[0],v[1],p)+margin for v in points))
+
+
+def check_stack_support(point,p,*,at_release=False):
+    support=p.get('stack_support')
+    if support is None:return
+    centre=vector(support['top_center_m'],3,'stack support top centre')
+    radius=number(support['center_radius_m'],.003,.1,'stack support centre radius')
+    ztol=number(support['top_tolerance_m'],.001,.03,'stack support top tolerance')
+    if math.dist(point[:2],centre[:2])>radius:
+        raise TargetWorkspaceError('Stack target outside the measured support centre')
+    if at_release:
+        gap=point[2]-p['held_bottom_below_tcp_m']-centre[2]
+        if gap < 0 or gap>p['release_clearance_m']+ztol:
+            raise ValueError('Held object outside the measured stacking release height')
+    elif abs(point[2]-centre[2])>ztol:
+        raise TargetWorkspaceError('Stack target depth disagrees with the measured support top')
 
 
 def _slerp(a,b,f):
@@ -127,6 +150,9 @@ def number(value, low, high, name):
     return value
 
 def validate_profile(p):
+    if 'ring_peg' in p:
+        from .ring_peg import validate_settings
+        validate_settings(p['ring_peg'])
     if p.get('frame') != 'base': raise ValueError('Primitive frame must be base')
     quaternion(p['tool_orientation_xyzw'])
     quaternion(p['camera_to_base_xyzw'])
@@ -148,6 +174,22 @@ def validate_profile(p):
         number(p['contact_band_m'],.01,p['approach_m'],'contact band')
     if 'clear_view_initial_lift_m' in p:
         number(p['clear_view_initial_lift_m'],.03,.30,'clear-view initial lift')
+    if 'empty_entry_corridor' in p:
+        corridor=p['empty_entry_corridor']
+        if not isinstance(corridor,dict) or not isinstance(corridor.get('source'),str) or not corridor['source'].strip():
+            raise ValueError('Empty entry corridor needs current scene evidence')
+        start=vector(corridor['start_xy_m'],2,'entry start');end=vector(corridor['end_xy_m'],2,'entry end')
+        zrange=vector(corridor['z_range_m'],2,'entry height range')
+        if math.dist(start,end)<.005 or zrange[0]>=zrange[1]:
+            raise ValueError('Invalid empty entry corridor dimensions')
+        number(corridor['radius_m'],.005,.10,'entry corridor radius')
+        if 'table_entry_m' in corridor:
+            check_tcp(corridor['table_entry_m'],p,selected_target=True)
+    if 'stack_support' in p:
+        support=p['stack_support']
+        if not isinstance(support,dict) or not isinstance(support.get('source'),str) or not support['source'].strip():
+            raise ValueError('Stack support requires measured top geometry and source')
+        check_stack_support(check_tcp(support['top_center_m'],p),p)
     minimum_floor=min(table_height(x,y,p) for x,y in workspace_polygon(p))+p['table_clearance_m']
     if not minimum_floor <= p['transit_z_m'] <= high[2]:
         raise ValueError('Transit height outside workspace')
@@ -185,7 +227,7 @@ def ground_pixel(uv,depth,intrinsics,p):
     camera=rs.rs2_deproject_pixel_to_point(intrinsics,[x,y],z)
     return [float(a+b) for a,b in zip(rotate(p['camera_to_base_xyzw'],camera),p['camera_to_base_translation_m'])]
 
-def plan(skill,state,p,target=None,view_index=0):
+def plan(skill,state,p,target=None,view_index=0,*,ring_contact_tcp=None):
     validate_profile(p)
     if skill not in SKILLS: raise ValueError('Unknown primitive')
     current=tcp_from_eef(state['eef_m'],state['eef_xyzw'],p)
@@ -226,7 +268,11 @@ def plan(skill,state,p,target=None,view_index=0):
         stages.append({'kind':'gripper','open':opened});planned_holding=not opened
     if skill in ('pick','place','stack','move_to'):
         point=vector(target,3,'base target')
-        if skill=='pick':point[2]-=p['grasp_inset_m']
+        if skill=='stack':check_stack_support(point,p)
+        if ring_contact_tcp is not None:
+            if 'ring_peg' not in p or skill not in ('pick','place'):raise ValueError('Unexpected ring contact target')
+            point=vector(ring_contact_tcp,3,'measured ring contact TCP')
+        elif skill=='pick':point[2]-=p['grasp_inset_m']
         elif skill in ('place','stack'):
             point[2]+=p['held_bottom_below_tcp_m']+p['release_clearance_m']
         # Validate only the selected contact target as a recoverable perception
@@ -236,7 +282,13 @@ def plan(skill,state,p,target=None,view_index=0):
         if direct:
             # Start all lateral motion above the transit plane. When already
             # higher, approach the hover point and turn in the same checked leg.
-            if current[2]<z:
+            entry=None
+            if skill=='pick' and 'table_entry_m' in p.get('empty_entry_corridor',{}):
+                try:check_tcp(current,p,selected_target=True)
+                except TargetWorkspaceError:entry=p['empty_entry_corridor']['table_entry_m']
+            if entry is not None:
+                move([entry[0],entry[1],max(z,entry[2])],state['eef_xyzw'],'clearance')
+            elif current[2]<z:
                 move([current[0],current[1],z],state['eef_xyzw'],'clearance')
             move([point[0],point[1],z],phase='transit')
         else:

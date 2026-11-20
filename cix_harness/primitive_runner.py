@@ -40,7 +40,9 @@ def decide(port,model,goal,obs,history):
       {'role':'system','content':SYSTEM}, {'role':'user','content':[
       {'type':'text','text':json.dumps({'goal':goal,'state':state,
         'available_skills':obs.get('primitive_skills',[s for s in SKILLS if s!='clear_view']),
-        'recovery':obs.get('recovery',{}),'recent':history[-3:]},ensure_ascii=False,separators=(',',':'))},
+        'recovery':obs.get('recovery',{}),'recent':history[-3:],
+        **({'ring_scene':obs['ring_scene'],'ring_task':'Pick loose rings only. Select the matching marked peg by its tip. Verify using verified_skill.'}
+           if 'ring_scene' in obs else {})},ensure_ascii=False,separators=(',',':'))},
       {'type':'image_url','image_url':{'url':obs['image']}}]}],
       'response_format':{'type':'json_schema','json_schema':{'name':'primitive_decision','strict':True,'schema':SCHEMA}}}
     choice=local_json(port,'/v1/chat/completions',body,timeout=180)['choices'][0]
@@ -204,6 +206,7 @@ def run(args,log,robot=None,planner=decide,recovery_allowed=None):
                 if args.task_kind=='pick':okay='pick' in completed and obs['state'].get('gripping') is True
                 elif args.task_kind in ('place','stack'):
                     okay=args.task_kind in completed and obs['state'].get('gripping') is False
+                if 'ring_scene' in obs and completed:okay=okay and obs['ring_scene'].get('verified_skill')==completed[-1]
             log('finish',status='done' if okay else 'blocked_or_unverified',evidence=decision['evidence'])
             return 0 if okay else 2
         if actions>=args.max_turns:log('finish',status='turn_budget_exhausted');return 2

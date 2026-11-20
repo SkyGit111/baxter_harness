@@ -153,6 +153,19 @@ class DualBridgeTests(unittest.TestCase):
             self.assertIsNone(service.prepared)
             bridge.robots[arm].grip.command_position.assert_not_called()
 
+    def test_camera_only_snapshot_does_not_require_or_certify_gripper_telemetry(self):
+        import tempfile
+        bridge=self.bridge();self.plan(bridge,'left')
+        arm=bridge.robots['left'];arm.stale=True
+        arm.camera.capture=Mock(return_value=(None,0.,42));arm.camera.save_depth=Mock()
+        with tempfile.TemporaryDirectory() as folder,patch('cix_harness.dual_bridge.Path',return_value=Path(folder)):
+            snapshot=bridge.scene_snapshot('left',camera_only=True)
+        self.assertEqual(snapshot['frame_number'],42)
+        self.assertNotIn('state',snapshot)
+        self.assertIsNone(bridge.services['left'].prepared)
+        self.assertIsNone(bridge.services['left'].observation)
+        arm.camera.save_depth.assert_called_once()
+
     def test_dual_constructor_initial_ready_has_no_owner_but_later_ready_checks_peer(self):
         cfg=configuration(True)['arms']['left'];shared=SharedMotion(12,600)
         def initialize(robot,cfg,armed,*,camera):

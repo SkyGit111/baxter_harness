@@ -8,8 +8,10 @@ import copy
 import hashlib
 import json
 import math
+import statistics
 import threading
 import time
+import uuid
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -107,6 +109,17 @@ class DualArmBaxter(Baxter):
     def check_empty_clear_view_path(self,paths):
         if self.dual_owner is None:raise ClearanceUnavailableError('No dual execution owner')
         return self.dual_owner.check_other_arm_path(self.cfg['arm'],paths,empty_clear_view=True)
+
+    def peer_path_supports(self,values):
+        owner=self.dual_owner
+        if owner is None or owner.guard is None or owner.guard.cfg.get('peer_motion_policy')!='swept_clearance':
+            return False
+        arm=self.cfg['arm'];peer='right' if arm=='left' else 'left'
+        if owner.selected_arm!=arm or not owner.clearance_receipt or owner.peer_reference is None:return False
+        state=owner.robots[peer].read_state()
+        state=dict(state,joint_rad=[values[n] for n in state['joint_names']])
+        owner.guard.check_peer(owner.peer_reference,state,checked_path=owner.clearance_receipt,peer_arm=peer)
+        return True
 
 
 class DualBridge:
@@ -235,12 +248,12 @@ class DualBridge:
             reference=self.peer_reference
             rechecking=self.executing_arm==arm
             if rechecking:
-                self.guard.check_peer(reference,measured)
+                self.guard.check_peer(reference,measured,checked_path=self.clearance_receipt,peer_arm=peer)
                 reference=measured
             receipt=self.guard.path_clearance(arm,self.robots[arm].joints(),paths,reference,measured,
                                               **({'active_holding':False} if empty_clear_view else {}))
             if rechecking:
-                self.guard.check_peer(reference,self.robots[peer].read_state())
+                self.guard.check_peer(reference,self.robots[peer].read_state(),checked_path=receipt,peer_arm=peer)
                 self.peer_reference=reference
             self.clearance_receipt=receipt
         finally:self.clearance_seconds=time.monotonic()-began
@@ -253,7 +266,7 @@ class DualBridge:
         if self.guard is None:raise ClearanceUnavailableError('Missing inter-arm collision guard')
         peer='right' if arm=='left' else 'left'
         peer_state=self.robots[peer].read_state()
-        self.guard.check_peer(self.peer_reference,peer_state)
+        self.guard.check_peer(self.peer_reference,peer_state,checked_path=self.clearance_receipt,peer_arm=peer)
         active_state=self.robots[arm].read_state()
         if self.clearance_receipt.get('includes_held_object') is False and active_state.get('gripping') is not False:
             raise PeerStateChangedError('Empty clear-view grasp state changed during execution')
@@ -304,15 +317,23 @@ class DualBridge:
         return {'healthz':self.health,'dual.observe':self.observe,'dual.prepare':self.prepare,'dual.execute':self.execute,
                 'dual.scene_snapshot':self.scene_snapshot}
 
-    def scene_snapshot(self,arm):
-        """Capture fresh aligned RGB-D for onsite geometry checks using the shared camera."""
+    def scene_snapshot(self,arm,*,camera_only=False):
+        """Capture RGB-D. For a visual survey, camera_only needs no robot telemetry."""
         with self.lock:
-            obs=self.observe(arm)
+            arm=self._arm(arm)
+            if camera_only:
+                self._invalidate();self.peer_reference=None;self.clearance_receipt=None
+                _,_,frame=self.robots[arm].camera.capture()
+                capture_id=uuid.uuid4().hex
+                record={'obs_id':capture_id,'selected_arm':arm,'frame_number':frame,'camera_only':True}
+            else:
+                obs=self.observe(arm)
+                capture_id=obs['id']
+                record={'obs_id':capture_id,'selected_arm':arm,'state':obs['state'],'arm_states':obs['arm_states']}
             folder=Path('runs/geometry');folder.mkdir(parents=True,exist_ok=True)
-            path=folder/(obs['id']+'.npz')
+            path=folder/(capture_id+'.npz')
             self.robots[arm].camera.save_depth(str(path))
-            return {'obs_id':obs['id'],'selected_arm':arm,'state':obs['state'],
-                    'arm_states':obs['arm_states'],'depth_file':str(path.resolve())}
+            return {**record,'depth_file':str(path.resolve())}
 
     def close(self):
         # Close subscribers before releasing the shared USB stream exactly once.
@@ -340,6 +361,28 @@ def create_bridge(cfg,armed=False,*,camera_factory=D455Camera,robot_factory=Dual
         return bridge
 
 
+def measure_joint_clock(ros):
+    """Measure robot stamp minus control-host time using advancing ROS joint packets."""
+    from sensor_msgs.msg import JointState
+    offsets=[];last_stamp=None;ready=threading.Event();lock=threading.Lock()
+    def sample(msg):
+        nonlocal last_stamp
+        stamp=msg.header.stamp.to_sec();now=ros.Time.now().to_sec()
+        with lock:
+            if math.isfinite(stamp) and (last_stamp is None or stamp>last_stamp):
+                offsets.append(stamp-now);last_stamp=stamp
+                if len(offsets)>=12:ready.set()
+    subscription=ros.Subscriber('/robot/joint_states',JointState,sample,queue_size=1)
+    try:
+        if not ready.wait(2.):raise RuntimeError('Robot clock sync did not receive 12 advancing joint packets')
+    finally:subscription.unregister()
+    with lock:values=sorted(offsets[:12])
+    offset=statistics.median(values)
+    if not math.isfinite(offset) or abs(offset)>2 or values[-2]-values[1]>.05:
+        raise RuntimeError('Robot clock offset was unstable or outside the supported range')
+    return offset
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',required=True)
@@ -351,6 +394,14 @@ def main():
     import rospy
     import signal
     rospy.init_node('cix_baxter_dual_bridge',disable_signals=True)
+    if cfg.get('measure_robot_clock_on_start'):
+        try:offset=measure_joint_clock(rospy)
+        except RuntimeError as error:
+            if args.arm_motion:raise
+            rospy.logwarn('Using configured clock offset for read-only mode: %s',error)
+        else:
+            for arm in ARMS:cfg['arms'][arm]['robot_clock_offset_s']=offset
+            rospy.loginfo('Baxter joint-stream clock offset at bridge startup: %.6f s',offset)
     def terminate(signum,frame):raise SystemExit(0)
     signal.signal(signal.SIGTERM,terminate)
     bridge=create_bridge(cfg,args.arm_motion)
