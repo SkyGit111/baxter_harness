@@ -271,6 +271,12 @@ class TaskExecutive:
         self.observe(obs)
         if not self.steps and not self.build_plan(obs, 'new_task'):
             return self.terminal('blocked', 'No valid plan', 'unreachable')
+        miss=obs.get('ring_scene',{}).get('missed_ring')
+        if miss and self.current and self.current['skill']=='place' and self.primitive_ok:
+            self.feedback={'failure_code':'ring_missed_peg','observed_loose_ring':miss}
+            self.failures.append('ring_missed_peg');self.emit('ring_missed_peg',**miss)
+            if self.current['on_failure']=='stop' or not self.build_plan(obs,'ring_missed_peg: re-pick this visible loose ring, then place it on its matching peg'):
+                return self.terminal('blocked','Released ring found on table; recovery budget exhausted','no_progress')
         if self.pending_failure:
             cause = self.pending_failure; self.pending_failure = None
             policy = self.current['on_failure'] if self.current else 'stop'
@@ -317,17 +323,10 @@ class TaskExecutive:
                     if self.build_plan(obs, 'occluded: '+answer['evidence']): continue
                     return self.terminal('blocked', 'Occlusion replanning budget exhausted', 'no_progress')
                 return self.terminal('blocked', answer['evidence'], answer['reason'])
-            if kind == 'task_done':
-                if self.current or not self.verified or self.mode != 'live' or not self.final_state_consistent(obs) or all(s.get('backend')=='code' for s in self.verified):
-                    self.feedback = {'failure_code': 'unverified_task_completion'}
-                    self.emit('task_checkpoint_rejected', **self.feedback)
-                    if rejected: return self.terminal('blocked', 'Task completion has no verified support', 'no_progress')
-                    rejected += 1; continue
-                self.task_verified = True
-                self.emit('task_verified', evidence=answer['evidence'], obs_id=obs['id'])
-                return self.terminal('done', answer['evidence'])
-            if kind == 'step_done':
-                if not self.can_verify(obs):
+            final_step_and_goal=(kind=='task_done' and self.current is not None and
+                                 self.index==len(self.steps)-1 and self.mode=='live' and self.can_verify(obs))
+            if kind == 'step_done' or final_step_and_goal:
+                if not final_step_and_goal and not self.can_verify(obs):
                     self.feedback = {'failure_code': 'missing_measured_postcondition', 'expect': self.current['expect']}
                     self.emit('task_checkpoint_rejected', **self.feedback)
                     if rejected: return self.terminal('blocked', 'Step outcome is not supported by telemetry', 'no_progress')
@@ -337,7 +336,16 @@ class TaskExecutive:
                 self.verified.append(copy.deepcopy(self.current));self.index += 1
                 self.feedback = None; self.reset_step(obs)
                 self.emit('task_step_verified', step=self.verified[-1])
-                continue
+                if kind=='step_done':continue
+            if kind == 'task_done':
+                if self.current or not self.verified or self.mode != 'live' or not self.final_state_consistent(obs) or all(s.get('backend')=='code' for s in self.verified):
+                    self.feedback = {'failure_code': 'unverified_task_completion'}
+                    self.emit('task_checkpoint_rejected', **self.feedback)
+                    if rejected: return self.terminal('blocked', 'Task completion has no verified support', 'no_progress')
+                    rejected += 1; continue
+                self.task_verified = True
+                self.emit('task_verified', evidence=answer['evidence'], obs_id=obs['id'])
+                return self.terminal('done', answer['evidence'])
             if self.primitive_ok:
                 # A complete primitive is not automatically repeated if the VLM dislikes the result.
                 if not self.build_plan(obs, 'primitive_completed_but_outcome_not_accepted'):

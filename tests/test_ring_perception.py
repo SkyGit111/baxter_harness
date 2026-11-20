@@ -49,3 +49,19 @@ class RingPerceptionTest(unittest.TestCase):
         self.depth[:]=.982
         cv2.circle(self.image,(40,56),15,(12,22,230),-1)
         self.assertFalse(self.observation()['rings'])
+
+    def test_a_dropped_ring_can_be_found_outside_its_original_roi(self):
+        spec=self.settings['rings'][0]
+        spec['loose_candidate']=True
+        self.settings['table_polygon_px']=[[2,2],[137,2],[137,97],[2,97]]
+        self.image[self.mask]=28;self.depth[self.mask]=1.
+        y,x=np.indices(self.depth.shape)
+        moved=(np.hypot(x-68,y-21)<=15)&(np.hypot(x-68,y-21)>6)
+        self.image[moved]=(12,22,230);self.depth[moved]=.982
+        ring,=self.observation()['rings']
+        self.assertEqual(ring['location'],'loose')
+        self.assertEqual(ring['localization'],'unique_free_ring_in_current_table_image')
+        np.testing.assert_allclose(ring['center_uv_px'],[68,21],atol=1.)
+        self.image[self.mask]=(12,22,230);self.depth[self.mask]=.982
+        spec['roi_px']=[3,4,24,31]
+        self.assertEqual(self.observation()['rings'],[])

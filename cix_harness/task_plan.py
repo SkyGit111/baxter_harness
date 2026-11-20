@@ -53,8 +53,10 @@ Prefer a short plan; do not copy an old plan without checking the current goal a
 
 CHECK_SYSTEM = '''Manage the CURRENT step using the new image, measured state and feedback.
 act executes only this step; step_done verifies it; replan replaces remaining steps;
-blocked stops except recoverable occlusion. task_done only after ALL steps are verified
-and the ORIGINAL goal is visibly satisfied. A motor acknowledgement alone is not success.
+blocked stops except recoverable occlusion. On the final step (remaining is empty), when
+the fresh image visibly satisfies the ORIGINAL goal and step_evidence confirms the final
+action, return task_done directly, with evidence for both the last step and the goal.
+Earlier steps must already be verified. A motor acknowledgement alone is not success.
 step_done requires step_evidence plus a visible correct outcome for the named target.
 Never accept the wrong object merely because gripping=true. Empty closed jaws are empty.
 An empty/far arm can pick: approach/opening are handled below. IK checks reachability.

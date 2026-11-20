@@ -88,6 +88,21 @@ class FakeModel:
 
 
 class DualBridgeTests(unittest.TestCase):
+    def test_clock_offset_measures_robot_minus_host_on_distinct_joint_packets(self):
+        from cix_harness.dual_bridge import measure_joint_clock
+        ros=Mock();handle=Mock()
+        def subscribe(topic,typ,callback,queue_size):
+            for i in range(12):
+                robot_time=1000+i*.01
+                packet=NS(header=NS(stamp=NS(to_sec=lambda:robot_time)))
+                ros.Time.now.return_value.to_sec.return_value=robot_time-.07
+                callback(packet);callback(packet)
+            return handle
+        ros.Subscriber.side_effect=subscribe
+        with patch.dict('sys.modules',{'sensor_msgs.msg':NS(JointState=object)}):
+            self.assertAlmostEqual(measure_joint_clock(ros),.07)
+        handle.unregister.assert_called_once()
+
     def setUp(self):
         geometry=NS(PoseStamped=lambda:NS(header=NS(),pose=NS(position=NS(),orientation=NS())))
         modules={'geometry_msgs.msg':geometry,'tf':NS(transformations=NS(quaternion_slerp=lambda a,b,f:a)),

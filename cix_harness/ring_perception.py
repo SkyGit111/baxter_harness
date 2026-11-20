@@ -129,7 +129,7 @@ def _face_geometry(mask,outer,inner,geometry):
     return stat
 
 
-def _detect(spec,kind,hsv,geometry):
+def _detect(spec,kind,hsv,geometry,allowed=None):
     import cv2
     h,w=geometry.depth.shape;x0,y0,x1,y1=_roi(spec,w,h)
     roi=hsv[y0:y1+1,x0:x1+1]
@@ -137,6 +137,7 @@ def _detect(spec,kind,hsv,geometry):
     for low,high in spec['hsv_ranges']:
         local|=cv2.inRange(roi,np.asarray(low,np.uint8),np.asarray(high,np.uint8))
     mask=np.zeros((h,w),np.uint8);mask[y0:y1+1,x0:x1+1]=local
+    if allowed is not None:mask=cv2.bitwise_and(mask,allowed)
     contours,hierarchy=cv2.findContours(mask,cv2.RETR_CCOMP,cv2.CHAIN_APPROX_NONE)
     results=[]
     if hierarchy is None:return results
@@ -165,6 +166,136 @@ def _detect(spec,kind,hsv,geometry):
     return results
 
 
+def _ordered_quad(points):
+    p=np.asarray(points,np.float32).reshape(4,2)
+    indices=np.argsort(np.arctan2(*(p-p.mean(axis=0)).T[::-1]))
+    p=p[indices]
+    return np.roll(p,-np.argmin(p.sum(axis=1)),axis=0)
+
+
+def _registered_peg(spec,board,bgr,geom):
+    """Reobserve the rigid board and local rod appearance before using a measured height interval."""
+    import cv2
+    ref=spec.get('bracket_reference')
+    if board is None or not ref:return None
+    source=_ordered_quad(ref['board_quad_px']);actual=_ordered_quad(board)
+    corner_drift=float(np.max(np.linalg.norm(source-actual,axis=1)))
+    if corner_drift>ref.get('max_board_drift_px',2.5):return None
+    warp=cv2.getPerspectiveTransform(source,actual)
+    transform=lambda p:cv2.perspectiveTransform(np.array([[p]],np.float32),warp)[0,0]
+    pred=transform(ref['patch_center_px']);tip=transform(ref['tip_px']);support=transform(ref['support_px'])
+    patch=np.asarray(ref['appearance_bgr'],dtype=np.uint8);h,w=patch.shape[:2]
+    if patch.ndim!=3 or patch.shape[-1]!=3 or min(w,h)<7 or min(w,h)%2==0 or max(w,h)>65:return None
+    if float(np.max(patch.reshape(-1,3).std(axis=0)))<5:return None
+    x,y=np.rint(pred).astype(int);sx,sy=x-w//2-3,y-h//2-3
+    crop=bgr[sy:sy+h+6,sx:sx+w+6]
+    if crop.shape[:2]!=(h+6,w+6):return None
+    scores=cv2.matchTemplate(crop,patch,cv2.TM_CCOEFF_NORMED)
+    _,score,_,origin=cv2.minMaxLoc(scores)
+    if not np.isfinite(score) or score<ref.get('min_appearance_ncc',.85):return None
+    shift=np.array([sx+origin[0]+w//2,sy+origin[1]+h//2])-pred
+    if np.linalg.norm(shift)>2.5:return None
+    tip+=shift;support+=shift
+    # Directly recheck the present marker pixels around the tip. Correlation of the larger tile
+    # alone can remain high when the gripper covers the cap but the surrounding coloured ring stays visible.
+    reference_tip=np.rint(np.asarray(ref['tip_px'])-ref['patch_center_px']+[w//2,h//2]).astype(int)
+    ux,uy=np.rint(tip).astype(int);rx,ry=reference_tip
+    cap_now=bgr[uy-2:uy+3,ux-2:ux+3].astype(float);cap_ref=patch[ry-2:ry+3,rx-2:rx+3].astype(float)
+    if cap_ref.shape!=(5,5,3) or cap_now.shape!=cap_ref.shape:return None
+    def chroma(a):return a/np.maximum(1.,a.sum(axis=2,keepdims=True))
+    cap_chroma_rms=float(np.sqrt(np.mean((chroma(cap_now)-chroma(cap_ref))**2)))
+    if cap_chroma_rms>.045:return None
+    h0=float(ref['observed_stack_height_m']);limits=np.asarray(ref['protrusion_m'],dtype=float)
+    if limits.shape!=(2,) or not 0<limits[0]<=limits[1]:return None
+    tip_interval=[geom.on_plane([tip],geom.n,geom.d-h0-limit)[0] for limit in limits]
+    pt=np.mean(tip_interval,axis=0);pc=geom.on_plane([support],geom.n,geom.d-h0)[0]
+    shaft=pt-pc;shaft/=np.linalg.norm(shaft)
+    return {'id':spec['id'],'kind':'peg','color':spec['color'],'tip_uv_px':tip.tolist(),'tip_base_m':pt.tolist(),
+            'radius_m':float(ref['radius_m']),'radius_interval_m':ref['radius_interval_m'],'axis_base':shaft.tolist(),
+            'support_z_m':float(pc[2]),'support_center_base_m':pc.tolist(),'support_uv_px':support.tolist(),
+            'stack_bottom_to_top':None,'observed_ring_ids':[],'tip_position_interval_base_m':[v.tolist() for v in tip_interval],
+            'measurement_source':'current_board_and_cap_appearance_registered_to_exposure_bracket',
+            'appearance_ncc':score,'current_cap_chroma_rms':cap_chroma_rms,'board_corner_drift_px':corner_drift,
+            'depth_support_spread_m':ref['depth_support_spread_m'],'current_tip_depth_measured':False,
+            'tip_position_uncertainty_m':ref['tip_position_uncertainty_m'],'observed_rim_color':spec['color']}
+
+
+def _local_table(ring,bgr,geometry):
+    """Use eight visibly bare angular sectors around the annular face as local table references."""
+    u,v=ring['center_uv_px'];h,w=geometry.depth.shape
+    dx,dy=np.meshgrid(np.arange(-24,25),np.arange(-24,25))
+    rad=np.hypot(dx,dy);x=np.rint(u+dx).astype(int);y=np.rint(v+dy).astype(int)
+    keep=(rad>=11)&(rad<=21)&(x>=0)&(x<w)&(y>=0)&(y<h)
+    x,y,dx,dy=[z[keep] for z in (x,y,dx,dy)]
+    dark=bgr[y,x].max(axis=1)<145
+    group=np.floor((np.arctan2(dy,dx)+np.pi)*4/np.pi).astype(int)%8
+    cx,cy=ring['center_base_m'][:2];n=geometry.n
+    sector_medians=[];pieces=[]
+    for i in range(8):
+        ok=(group==i)&dark
+        points=geometry.cloud(np.column_stack((x[ok],y[ok]))[::2])
+        if len(points)<12:continue
+        heights=points@n+geometry.d
+        if abs(np.median(heights))>.018 or np.percentile(heights,90)-np.percentile(heights,10)>.016:continue
+        # Correct sample Z for the known table slope at the ring XY.
+        z_here=points[:,2]+((points[:,0]-cx)*n[0]+(points[:,1]-cy)*n[1])/n[2]
+        sector_medians.append(float(np.median(z_here)));pieces.append(z_here)
+    if len(pieces)<6:return
+    vals=np.concatenate(pieces);mid=float(np.median(sector_medians))
+    upper=max(float(np.percentile(vals,95)),max(sector_medians))
+    ring.update(local_table_z_m=mid,local_table_upper_z_m=upper,
+                local_table_sector_centres_z_m=sector_medians,local_table_depth_count=len(vals),
+                thickness_from_local_table_m=float(ring['center_base_m'][2]-mid))
+
+
+def _stack_surface(peg,spec,hsv,geom):
+    import cv2
+    support=peg.get('support_uv_px');tip=peg['tip_uv_px']
+    ref=spec.get('bracket_reference',{})
+    ranges=ref.get('support_hsv_ranges',[])
+    if not support or not ranges:return
+    h,w=geom.depth.shape;u,v=np.rint(support).astype(int)
+    radius=ref.get('ring_radius_px',6.5)
+    y,x=np.mgrid[max(0,v-9):min(h,v+10),max(0,u-9):min(w,u+10)]
+    d=np.hypot(x-support[0],y-support[1]);pix=np.stack((x,y),axis=-1)
+    a=np.asarray(tip)-support;off=pix-np.asarray(support)
+    proj=np.clip((off@a)/max(1e-6,a@a),0.,1.)
+    shaft_dist=np.linalg.norm(off-proj[:,:,None]*a,axis=-1)
+    area=(d>radius*.4)&(d<radius*.92)&(shaft_dist>1.8)
+    colors=np.zeros(x.shape,np.uint8)
+    for low,high in ranges:colors|=cv2.inRange(hsv[y,x],np.uint8(low),np.uint8(high))
+    measured=pix[area&(colors>0)];pts=geom.cloud(measured);height=pts@geom.n+geom.d
+    peg['protected_color_face_visible']=len(measured)>=12
+    peg['protected_color_pixels']=len(measured)
+    if 'reference_depth_patch_mm' in ref and len(measured):
+        old=np.asarray(ref['reference_depth_patch_mm'],float)*.001
+        centre=np.asarray(ref['patch_center_px']);shift=np.asarray(tip)-ref['tip_px']
+        index=np.rint(measured-shift-centre+[old.shape[1]//2,old.shape[0]//2]).astype(int)
+        inside=(index[:,0]>=0)&(index[:,1]>=0)&(index[:,0]<old.shape[1])&(index[:,1]<old.shape[0])
+        index=index[inside];match=measured[inside]
+        depth_now=geom.depth[match[:,1],match[:,0]];depth_old=old[index[:,1],index[:,0]]
+        use=(depth_now>.1)&(depth_now<3.)&(depth_old>.1)&(depth_old<3.)
+        match=match[use];rise=(depth_now[use]-depth_old[use])*(geom.rays(match)@geom.n)
+        if len(rise)>=12:
+            delta=match-support;angles=np.arctan2(delta[:,1],delta[:,0])
+            bins=np.floor((angles+np.pi)*4/np.pi).astype(int)%8
+            sectors=[float(np.median(rise[bins==i])) for i in range(8) if np.sum(bins==i)>=3]
+            if len(sectors)>=3:
+                q25,median,q75=np.percentile(sectors,[25,50,75])
+                peg.update(stack_depth_delta_m=float(median),stack_delta_sector_medians_m=sectors,
+                           stack_delta_paired_pixels=len(rise),stack_delta_from_frame=ref.get('reference_frame'))
+                # Report a rise separately from task success. The harness must also verify the release,
+                # absence of a loose ring, and consistency with the newly added ring's thickness.
+                peg['stack_rise_supported']=bool(q25>.005 and q75-q25<.008 and median>.007)
+    if len(pts)<12 or len(pts)<.55*len(measured):return
+    p10,median,p90=np.percentile(height,[10,50,90])
+    if p90-p10>.016 or not .01<median<.28:return
+    base=geom.on_plane([support],geom.n,geom.d-median)[0]
+    peg.update(current_support_z_m=float(base[2]),current_support_base_m=base.tolist(),current_support_depth_count=len(pts),
+               current_support_interval_height_m=[float(p10),float(p90)],current_support_height_m=float(median),
+               current_support_height_change_m=float(median-ref['observed_stack_height_m']))
+
+
 def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
     """Use only tiles in this frame. Missing/ambiguous contours remain explicit observations."""
     import cv2
@@ -189,6 +320,9 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
     for kind in ('ring','peg'):
         for spec in settings.get(kind+'s',[]):
             found=_detect(spec,kind,hsv,geometry)
+            if kind=='peg' and len(found)!=1:
+                registered=_registered_peg(spec,board,bgr,geometry)
+                if registered is not None:found=[registered]
             if kind=='ring' and tcp is not None and spec.get('loose_candidate'):
                 projected=geometry.project(tcp)
                 if projected is not None:
@@ -197,6 +331,16 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
                         fresh=_detect(extra,kind,hsv,geometry)
                         near=[r for r in fresh if np.min(np.linalg.norm(np.asarray(r['rim_grasp_candidates_base_m'])-tcp,axis=1))<.022]
                         if near:found=near
+            if (kind=='ring' and not found and spec.get('loose_candidate') and board is not None
+                    and len(settings.get('table_polygon_px',[]))>=3):
+                area=np.zeros((h,w),np.uint8)
+                cv2.fillPoly(area,[np.int32(settings['table_polygon_px'])],255)
+                toy=np.zeros_like(area);cv2.fillPoly(toy,[board],255)
+                area[cv2.dilate(toy,np.ones((15,15),np.uint8))>0]=0
+                free_spec=dict(spec,roi_px=[0,0,w-1,h-1])
+                found=[r for r in _detect(free_spec,kind,hsv,geometry,allowed=area)
+                       if -.005<r['top_height_above_table_m']<.04]
+                for r in found:r['localization']='unique_free_ring_in_current_table_image'
             if len(found)!=1:
                 scene['missing'].append({'kind':kind,'id':spec['id'],'detected_candidates':len(found)})
                 continue
@@ -208,6 +352,7 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
                     cloud=geometry.cloud(pix)
                     if len(cloud)>=15 and np.ptp(cloud@geometry.n)<.012:
                         row['support_z_m']=float(np.median(cloud[:,2]));row['support_uv_px']=[u,v]
+            if kind=='peg':_stack_surface(row,spec,hsv,geometry)
             scene[kind+'s'].append(row)
     pegs=scene['pegs'];all_pegs=len(pegs)==len(settings.get('pegs',[])) and len(pegs)>0
     for ring in scene['rings']:
@@ -224,11 +369,9 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
         elif (on_board is not None and on_board < -10 or
               all_pegs and all(np.linalg.norm((rc-np.array(p['tip_base_m']))@geometry.basis[:,:2])>ring['outer_radius_m']+.012 for p in pegs)):
             ring['support_status']='clear_of_observed_posts'
-            if -.005<ring['top_height_above_table_m']<.04:ring['location']='loose'
-    for peg in pegs:
-        levels=[r['center_base_m'][2] for r in scene['rings'] if r['peg_id']==peg['id']]
-        if levels:peg['support_z_m']=max(levels)
-        peg['stack_bottom_to_top']=None  # A top view alone cannot count hidden identical layers.
+            if -.005<ring['top_height_above_table_m']<.04:
+                ring['location']='loose'
+                _local_table(ring,bgr,geometry)
     if tcp is not None:
         held=[]
         for r in scene['rings']:
@@ -238,4 +381,19 @@ def observe_ring_scene(bgr,depth_m,intrinsics,profile,settings,state):
             if r['support_status']=='clear_of_observed_posts' or above_tip:held.append(r)
         if len(held)==1:
             r=held[0];scene['held_ring_id']=r['id'];r.update(location='held',peg_id=None)
+    for peg in pegs:
+        mounted=[r for r in scene['rings'] if r['location']=='on_peg' and r['peg_id']==peg['id']]
+        peg['observed_ring_ids']=[r['id'] for r in mounted]
+        if mounted:peg['support_z_m']=max(r['center_base_m'][2] for r in mounted)
+        if peg.get('protected_color_face_visible') and peg.get('measurement_source') and not mounted:
+            spec=next(s for s in settings['pegs'] if s['id']==peg['id'])
+            ring_id=spec.get('protected_ring_id')
+            if ring_id:
+                scene['rings'].append({'id':ring_id,'kind':'ring','color':peg['color'],'location':'on_peg',
+                    'peg_id':peg['id'],'center_uv_px':peg['support_uv_px'],'center_base_m':peg['support_center_base_m'],
+                    'inner_radius_m':None,'outer_radius_m':None,'graspable':False,'normal_base':None,
+                    'geometry_status':'protected_marker_visible_hole_not_measured','visible_pixels':peg['protected_color_pixels']})
+                peg['observed_ring_ids']=[ring_id]
+                scene['missing']=[m for m in scene['missing'] if m['id']!=ring_id]
+        peg['stack_bottom_to_top']=None  # A top view alone cannot count hidden identical layers.
     return scene

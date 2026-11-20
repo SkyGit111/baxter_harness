@@ -10,6 +10,10 @@ class RingGeometryError(ValueError):
     pass
 
 
+class RingViewConflict(RingGeometryError):
+    pass
+
+
 class RingAlignmentNeeded(RingGeometryError):
     def __init__(self,dx,dy,allowance,frame):
         self.dx,self.dy,self.allowance,self.frame=dx,dy,allowance,frame
@@ -30,8 +34,18 @@ def validate_settings(settings):
     number(settings.get('servo_step_m',.008),.001,.025,'ring servo step')
     if 'relative_xy_uncertainty_m' in settings:
         number(settings['relative_xy_uncertainty_m'],.0001,.1,'simultaneous hole/peg alignment uncertainty')
+    number(settings.get('tcp_table_error_m',0.),0.,.05,'residual TCP-to-local-table error')
     if type(settings.get('servo_iterations',3)) is not int or not 0<=settings.get('servo_iterations',3)<=6:
         raise ValueError('Invalid ring servo iteration limit')
+    if 'wrist_alignment' in settings:
+        wrist=settings['wrist_alignment']
+        for k in ('resolution','K','D','eef_T_optical','ring_hsv_ranges','peg_tip_hsv_ranges'):
+            if k not in wrist:raise ValueError('Missing wrist alignment '+k)
+        number(wrist['height_uncertainty_m'],.0001,.1,'wrist plane height uncertainty')
+        number(wrist['relative_xy_uncertainty_m'],.0001,.1,'wrist alignment uncertainty')
+        number(wrist['cross_camera_tolerance_m'],.001,.04,'cross-camera displacement agreement')
+        number(wrist.get('max_frame_age_s',1.25),.1,2.,'maximum stationary wrist frame age')
+        number(wrist.get('wait_for_frame_s',1.35),.1,2.,'wrist capture wait')
 
 
 def measured(item,key,n=None):
@@ -108,12 +122,23 @@ def pick_geometry(profile,scene,ring,orientation):
           near+finger+margin<inner*normal[2] and far-finger-margin>outer):
         grasp_xy=rim[:2];mode='rim'
     else:raise RingGeometryError('Open fingers cannot straddle the outer walls or one rim wall')
-    inset=profile['grasp_inset_m'];thickness=s['ring_thickness_m']
-    if not vertical<inset or inset+s['fingertip_below_tcp_m']+abs(axis[2])*span+vertical>=thickness*normal[2]:
-        raise RingGeometryError('Finger contact depth cannot isolate this rim above its support')
-    contact=[*grasp_xy,(center[2] if mode=='outer' else rim[2])-inset]
+    desired=profile['grasp_inset_m'];thickness=s['ring_thickness_m']
+    # Keep the lowest open fingertip above the support. Failure to guarantee
+    # a bite at the high end of the pose error is assessed by the grasp sensor.
+    top=(center[2] if mode=='outer' else rim[2]);finger_depth=s['fingertip_below_tcp_m']+abs(axis[2])*span
+    if ring.get('local_table_upper_z_m') is not None:
+        upper=measured(ring,'local_table_upper_z_m');mid=measured(ring,'local_table_z_m')
+        if mid>upper or type(ring.get('local_table_depth_count')) is not int or ring['local_table_depth_count']<=0:
+            raise RingGeometryError('Invalid measured local tabletop interval')
+        available=top-upper-finger_depth-s.get('tcp_table_error_m',0.)
+    else:available=thickness*normal[2]-finger_depth-vertical
+    inset=min(desired,available-.0005)
+    if inset<=0:raise RingGeometryError('No fingertip contact depth above the local tabletop')
+    contact=[*grasp_xy,top-inset]
     return contact,{'ring_id':ring['id'],'color':color(ring),'inner_radius_m':inner,'outer_radius_m':outer,
-                    'rim_radius_m':radial,'grasp_mode':mode,'open_finger_center_radii_m':[near,far]}
+                    'rim_radius_m':radial,'grasp_mode':mode,'open_finger_center_radii_m':[near,far],
+                    'requested_grasp_inset_m':desired,'effective_grasp_inset_m':inset,'vertical_uncertainty_m':vertical,
+                    'local_table_upper_z_m':ring.get('local_table_upper_z_m'),'tcp_table_error_m':s.get('tcp_table_error_m',0.)}
 
 
 def release_geometry(profile,scene,state,ring,peg):
@@ -124,7 +149,13 @@ def release_geometry(profile,scene,state,ring,peg):
     if rod<=0 or support>=tip[2]:raise RingGeometryError('Unverified free peg above the current ring stack')
     tcp=tcp_from_eef(state['eef_m'],state['eef_xyzw'],profile)
     vertical=s['vertical_uncertainty_m']+fit_error(ring,'depth_plane_p90_m')+fit_error(peg,'depth_plane_p90_m')
-    margin=s.get('relative_xy_uncertainty_m',s['horizontal_uncertainty_m'])+fit_error(ring,'inner_boundary_p90_m')+fit_error(peg,'outer_boundary_p90_m');thick=s['ring_thickness_m']
+    wrist=scene.get('wrist_alignment');thick=s['ring_thickness_m']
+    if wrist is not None:
+        inner=measured(wrist,'inner_radius_m');rod=measured(wrist,'peg_radius_m');optical_error=measured(wrist,'uncertainty_m')
+        margin=optical_error+measured(wrist,'inner_radius_error_m')+measured(wrist,'peg_radius_error_m')
+    else:
+        optical_error=s.get('relative_xy_uncertainty_m',s['horizontal_uncertainty_m'])
+        margin=optical_error+fit_error(ring,'inner_boundary_p90_m')+fit_error(peg,'outer_boundary_p90_m')
     slope=math.hypot(axis[0],axis[1])/axis[2]; tilt=math.hypot(normal[0],normal[1]);down=outer*tilt+thick
     center_z_above_tcp=center[2]-tcp[2];tip_gap=max(s['release_gap_m']+vertical,
         s['fingertip_below_tcp_m']+center_z_above_tcp-down+vertical+s['release_gap_m'])
@@ -133,12 +164,21 @@ def release_geometry(profile,scene,state,ring,peg):
     # After the rod enters the bore, it guides the fall. Only entry and passage
     # through the ring thickness require unsupported alignment at its tip.
     free_xy=inner*normal[2]-rod/axis[2]-margin-(tip_gap+thick)*slope-thick*tilt
-    if free_xy<=0:raise RingGeometryError('Ring bore cannot clear the peg over the drop with measured uncertainty')
-    contact=[tip[i]+tcp[i]-center[i] for i in (0,1)]+[tip[2]+tip_gap+down-center_z_above_tcp]
+    matched=s.get('matching_parts_verified') is True
+    # A verified toy set permits a gravity-only attempt from above the peg. A
+    # small clearance below image resolution affects success, not tool contact.
+    # A resolved gross size/tilt mismatch still means the observed object is wrong.
+    if free_xy<=0 and not (matched and rod/axis[2]-inner*normal[2]<=margin):
+        raise RingGeometryError('Ring bore cannot clear the peg at entry with measured uncertainty')
+    offset=vector(wrist['offset_xy_m'],2,'wrist hole-to-tip offset') if wrist else [tip[i]-center[i] for i in (0,1)]
+    contact=[tcp[i]+offset[i] for i in (0,1)]+[tip[2]+tip_gap+down-center_z_above_tcp]
     evidence={'ring_id':ring['id'],'peg_id':peg['id'],'color':color(ring),'inner_radius_m':inner,
         'outer_radius_m':outer,'peg_radius_m':rod,'support_z_m':support,'ring_bottom_z_m':center[2]-down,
         'thickness_m':thick,'vertical_uncertainty_m':vertical,
         'peg_tip_base_m':tip,'ring_center_base_m':center,'free_xy_m':free_xy,'drop_m':drop,
+        'alignment_sensor':'wrist' if wrist else 'D455','hole_to_tip_xy_m':offset,'matching_parts_verified':matched,
+        'centering_goal_m':min(.001,inner*normal[2]*.25,max(.00035,optical_error*.5)),
+        'attempt_max_offset_m':min(.002,inner*normal[2]*.45),
         'stack_count_before':peg.get('stack_count'),'finger_bottom_z_m':tcp[2]-s['fingertip_below_tcp_m']}
     return contact,evidence
 
@@ -163,21 +203,25 @@ def resolve(profile,scene,state,skill,uv=None,*,release_peg_id=None):
     return ring,peg
 
 
-def verify_before_open(profile,scene,state,prior):
+def verify_before_open(profile,scene,state,prior,*,servo_budget_spent=False):
     ring,peg=resolve(profile,scene,state,'place',release_peg_id=prior['peg_id'])
     if color(ring)!=prior['color'] or ring['id']!=prior['ring_id']:raise RingGeometryError('Held ring changed during transport')
     _,e=release_geometry(profile,scene,state,ring,peg);s=profile['ring_peg']
-    gap=e['ring_bottom_z_m']-e['peg_tip_base_m'][2];error_xy=math.dist(e['ring_center_base_m'][:2],e['peg_tip_base_m'][:2])
+    gap=e['ring_bottom_z_m']-e['peg_tip_base_m'][2];error_xy=math.hypot(*e['hole_to_tip_xy_m'])
     if gap<=e['vertical_uncertainty_m']:
         raise RingGeometryError('Held ring is too low for free lateral alignment above peg')
     if e['finger_bottom_z_m']<=e['peg_tip_base_m'][2]+e['vertical_uncertainty_m']:
         raise RingGeometryError('Fingertips are below the allowed peg release window')
     if e['ring_bottom_z_m']-e['support_z_m']+e['vertical_uncertainty_m']>s['max_drop_m']:
         raise RingGeometryError('Measured fall exceeds allowed drop')
-    if error_xy>=e['free_xy_m']:
-        raise RingAlignmentNeeded(*(e['peg_tip_base_m'][i]-e['ring_center_base_m'][i] for i in (0,1)),
-                                  e['free_xy_m'],scene.get('frame_number'))
-    return dict(e,release_xy_error_m=error_xy,release_clearance_m=gap)
+    clear=e['free_xy_m']>0 and error_xy<e['free_xy_m']
+    allowance=e['free_xy_m']
+    if e['matching_parts_verified']:
+        allowance=max(allowance,e['attempt_max_offset_m'] if servo_budget_spent else e['centering_goal_m'])
+    if not clear and error_xy>allowance:
+        raise RingAlignmentNeeded(*e['hole_to_tip_xy_m'],allowance,scene.get('frame_number'))
+    return dict(e,release_xy_error_m=error_xy,release_clearance_m=gap,
+                release_basis='resolved_clearance' if clear else 'centered_matching_parts_gravity_attempt')
 
 
 def correction_suffix(profile,state,offset,remaining):
@@ -208,8 +252,19 @@ def verified(action,scene,state):
         if type(before) is int and before>=1 and type(after) is int and after==before+1:return 'place'
         if after is None or before is None:
             # A measured support rise must exclude unchanged height and two added rings.
-            thick=action.get('thickness_m');err=action.get('vertical_uncertainty_m');top=peg.get('support_z_m')
+            thick=action.get('thickness_m');err=action.get('vertical_uncertainty_m')
+            top=peg.get('current_support_z_m',peg.get('support_z_m') if peg.get('current_tip_depth_measured') is not False else None)
             if all(type(x) in (int,float) for x in (top,thick,err)):
                 rise=top-action['support_z_m']
                 if 2*err<rise<2*thick-2*err and abs(rise-thick)<=2*err:return 'place'
+    return None
+
+
+def missed_ring(action,scene,state):
+    if not action or action.get('skill')!='place' or scene.get('obs_id')==action['obs_id'] or state.get('gripping') is not False:return None
+    loose=[r for r in scene.get('rings',[]) if r.get('id')==action['ring_id'] and r.get('color')==action['color']
+           and r.get('location')=='loose' and 'peg_id' in r and r['peg_id'] is None]
+    if len(loose)==1 and scene.get('verified_skill')!='place':
+        return {'ring_id':action['ring_id'],'color':action['color'],'peg_id':action['peg_id'],
+                'center_uv_px':loose[0]['center_uv_px'],'obs_id':scene['obs_id']}
     return None

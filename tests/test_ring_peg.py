@@ -1,6 +1,9 @@
 import copy
+import tempfile
+import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock,patch
 
@@ -8,7 +11,9 @@ from cix_harness import ring_peg
 from cix_harness.primitive_service import PrimitiveService
 from cix_harness.primitives import plan
 from cix_harness.task_plan import workspace_context
+from cix_harness.harness import run
 from tests import test_primitives
+from tests.test_executive import Journal,Robot,ScriptedPlanner,step,check
 from tests.test_primitives import profile
 
 
@@ -29,6 +34,37 @@ def example():
 
 
 class RingTask(unittest.TestCase):
+    def test_wrist_joins_stationary_ros_header_within_50ms_arrival_skew_even_at_low_rate(self):
+        p,scene,state,ring,peg=example();state.update(gripping=True,arm='left');ring['location']='held';scene['held_ring_id']=ring['id']
+        p['ring_peg']['wrist_alignment']={'wait_for_frame_s':.1};stamp=lambda x:NS(to_sec=lambda:x)
+        msg=NS(header=NS(seq=73,frame_id='/left_hand_camera',stamp=stamp(925.45)))
+        robot=NS(wrist_condition=threading.Condition(),wrist_state=(10.97,msg),ros=NS(Time=NS(now=lambda:stamp(926.))))
+        service=PrimitiveService.__new__(PrimitiveService);service.profile=p;service.robot=robot
+        converter=Mock();converter.imgmsg_to_cv2.return_value='pixels'
+        with patch.dict('sys.modules',{'cv_bridge':NS(CvBridge=lambda:converter)}),patch('cix_harness.primitive_service.time.monotonic',return_value=11.),patch('cix_harness.ring_wrist.measure',return_value={'offset_xy_m':[.001,.002]}):
+            result=service._ring_wrist_alignment(scene,state,peg['id'],10.99,10.30)
+            self.assertEqual((result['frame_number'],result['frame_id']),(73,'/left_hand_camera'));self.assertAlmostEqual(result['source_age_s'],.55)
+            converter.imgmsg_to_cv2.assert_called_once_with(msg,desired_encoding='bgr8')
+            with self.assertRaises(ring_peg.RingGeometryError):service._ring_wrist_alignment(scene,state,peg['id'],10.99,10.80)
+            msg.header.frame_id='/right_hand_camera'
+            with self.assertRaises(ring_peg.RingGeometryError):service._ring_wrist_alignment(scene,state,peg['id'],10.99,10.30)
+    def test_harness_replans_a_visible_miss_with_empty_hand_then_verifies_new_place(self):
+        class RingRobot(Robot):
+            def call(self,method,args=(),**kwargs):
+                result=super().call(method,args,**kwargs)
+                if method=='primitive.observe':
+                    miss={'ring_id':'blue','color':'blue','peg_id':'p1','center_uv_px':[150,170],'obs_id':str(self.i)}
+                    result['ring_scene']={'verified_skill':{2:'pick',4:'pick',5:'place'}.get(self.i),'missed_ring':miss if self.i==3 else None}
+                return result
+        with tempfile.TemporaryDirectory() as folder:
+            args=NS(task='将散落蓝环套到蓝杆',route='primitives',execute=True,vlm_port=9110,vlm_model='replay',robot_port=9102,
+                    task_kind='place',max_turns=6,max_recoveries=2,max_grasp_retries=1,max_replans=2,max_planner_calls=20,memory=str(Path(folder)/'memory'))
+            steps=[step('pick','blue ring'),step('place','blue peg')];decisions=[check(uv=[.4,.25]),check('step_done'),check(uv=[.7,.6]),
+                check(uv=[.45,.36]),check('step_done'),check(uv=[.7,.6]),check('step_done'),check('task_done')]
+            planner=ScriptedPlanner([steps,steps],decisions);robot=RingRobot();journal=Journal(folder)
+            self.assertEqual(run(args,journal,robot,planner),0);self.assertEqual(robot.skills,['pick','place','pick','place'])
+            self.assertEqual(len([e for name,e in journal.events if name=='ring_missed_peg']),1)
+            self.assertEqual([e['step']['skill'] for name,e in journal.events if name=='task_step_verified'],['pick','pick','place'])
     def test_visual_servo_moves_once_from_fresh_relative_error_then_checks_next_frame_before_open(self):
         p,scene,state,ring,peg=example();p['calibrated']=True
         ring.update(location='held',center_base_m=[.752,.27,.106]);scene['held_ring_id']=ring['id']
@@ -72,7 +108,15 @@ class RingTask(unittest.TestCase):
         c,e=ring_peg.pick_geometry(p,scene,ring,[0,0,0,1]);self.assertEqual(c[:2],ring['rim_grasp_base_m'][:2])
         with self.assertRaises(ring_peg.RingGeometryError):ring_peg.pick_geometry(p,scene,ring,[0,0,.70710678,.70710678])
         s['fingertip_below_tcp_m']=.008
+        _,shallow=ring_peg.pick_geometry(p,scene,ring,[0,0,0,1]);self.assertLess(shallow['effective_grasp_inset_m'],.001)
+        s['fingertip_below_tcp_m']=.010
         with self.assertRaises(ring_peg.RingGeometryError):ring_peg.pick_geometry(p,scene,ring,[0,0,0,1])
+
+    def test_fresh_local_table_upper_bound_sets_pick_depth_for_thin_ring(self):
+        p,scene,state,ring,peg=example();p.update(grasp_inset_m=.010);p['ring_peg'].update(vertical_uncertainty_m=.012,tcp_table_error_m=.0007)
+        ring.update(local_table_z_m=.030,local_table_upper_z_m=.034,local_table_depth_count=504)
+        contact,e=ring_peg.pick_geometry(p,scene,ring,state['eef_xyzw']);self.assertAlmostEqual(contact[2],.0362)
+        self.assertLess(e['effective_grasp_inset_m'],.004);self.assertEqual(e['local_table_upper_z_m'],.034)
 
     def test_offset_ring_requires_measured_hole_peg_and_stack_before_open(self):
         p,scene,state,ring,peg=example();ring['location']='held';state['gripping']=True;scene['held_ring_id']=ring['id']
@@ -98,6 +142,21 @@ class RingTask(unittest.TestCase):
         self.assertIsNone(ring_peg.verified(e,scene,state));peg['stack_count']=2
         self.assertEqual(ring_peg.verified(e,scene,state),'place');scene['obs_id']='before'
         self.assertIsNone(ring_peg.verified(e,scene,state))
+
+    def test_manually_matched_toy_uses_centered_gravity_attempt_then_recognizes_visible_miss(self):
+        p,scene,state,ring,peg=example();p['ring_peg']['matching_parts_verified']=True
+        ring.update(location='held',center_base_m=[.74,.27,.106],inner_radius_m=.0041);peg['radius_m']=.00445
+        state.update(gripping=True,eef_m=[.74,.27,.105]);scene['held_ring_id']=ring['id']
+        _,e=ring_peg.release_geometry(p,scene,state,ring,peg);e.update(skill='place',obs_id='before')
+        self.assertLess(e['free_xy_m'],0);now=ring_peg.verify_before_open(p,scene,state,e)
+        self.assertEqual(now['release_basis'],'centered_matching_parts_gravity_attempt')
+        ring['center_base_m'][0]+=.0015
+        with self.assertRaises(ring_peg.RingAlignmentNeeded):ring_peg.verify_before_open(p,scene,state,e)
+        self.assertEqual(ring_peg.verify_before_open(p,scene,state,e,servo_budget_spent=True)['release_basis'],now['release_basis'])
+        ring['center_base_m'][0]+=.003
+        with self.assertRaises(ring_peg.RingAlignmentNeeded):ring_peg.verify_before_open(p,scene,state,e,servo_budget_spent=True)
+        state['gripping']=False;ring.update(location='loose',peg_id=None)
+        self.assertEqual(ring_peg.missed_ring(e,scene,state)['ring_id'],ring['id']);self.assertIsNone(ring_peg.verified(e,scene,state))
 
     def test_service_plans_from_observed_shape_and_rejects_stale_or_direct_xyz(self):
         import numpy as np

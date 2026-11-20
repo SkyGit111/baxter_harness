@@ -125,6 +125,7 @@ class PrimitiveService:
         if 'ring_peg' in self.profile:
             obs['ring_scene']=self._ring_scene(obs['state'],obs['id'])
             obs['ring_scene']['verified_skill']=ring_peg.verified(self.ring_last_action,obs['ring_scene'],obs['state'])
+            obs['ring_scene']['missed_ring']=ring_peg.missed_ring(self.ring_last_action,obs['ring_scene'],obs['state'])
         tcp=tcp_from_eef(obs['state']['eef_m'],obs['state']['eef_xyzw'],self.profile)
         views=self.profile.get('observation_tcp_m',[])
         obs['recovery']={'view_indices':[i for i,v in enumerate(views) if math.dist(tcp,v)>=.02],
@@ -141,6 +142,31 @@ class PrimitiveService:
         measured=observe_ring_scene(c.last_color,c.last_depth,c.intrinsics,self.profile,
                                     self.profile['ring_peg']['perception'],state)
         return dict(measured,obs_id=obs_id,frame_number=c.last_number,resolution=[c.intrinsics.width,c.intrinsics.height])
+
+    def _ring_wrist_alignment(self,scene,state,peg_id,captured,settled_since):
+        from cv_bridge import CvBridge
+        from .ring_wrist import measure
+        robot=self.robot;profile=self.profile
+        ring,peg=ring_peg.resolve(profile,scene,state,'place',release_peg_id=peg_id)
+        settings=profile['ring_peg']['wrist_alignment'];max_age=settings.get('max_frame_age_s',1.25)
+        def current():
+            sample=robot.wrist_state
+            if sample is None:return False
+            received,message=sample;now=time.monotonic()
+            if received<max(settled_since,captured-.05) or now-received>max_age:return False
+            if message.header.frame_id.lstrip('/')!=state['arm']+'_hand_camera':return False
+            stamp=message.header.stamp.to_sec();ros_now=robot.ros.Time.now().to_sec()
+            age=ros_now-stamp
+            return stamp>0 and -.05<=age<=max_age and now-max(0.,age)>=settled_since
+        with robot.wrist_condition:
+            if not robot.wrist_condition.wait_for(current,timeout=settings.get('wait_for_frame_s',1.35)):
+                raise ring_peg.RingGeometryError('No fresh post-motion wrist frame for alignment')
+            received,message=robot.wrist_state
+        pixels=CvBridge().imgmsg_to_cv2(message,desired_encoding='bgr8')
+        result=measure(pixels,state,ring,peg,settings)
+        return dict(result,frame_number=int(message.header.seq),ros_stamp_s=float(message.header.stamp.to_sec()),
+                    source_age_s=float(robot.ros.Time.now().to_sec()-message.header.stamp.to_sec()),
+                    arrival_age_s=time.monotonic()-received,frame_id=message.header.frame_id)
 
     def prepare(self,obs_id,skill,uv=None,target_base_m=None,view_index=0):
         started=time.monotonic()
@@ -367,7 +393,7 @@ class PrimitiveService:
         r.motion_remaining-=operations;receipts=[];grasp_verified=False
         r.audit('primitive_dispatch',plan_id=token,skill=skill,stages=stages,timings_s=dict(timings))
         stage=None;stage_started=None;stage_timings={};departed=False;actuation_attempted=False
-        stage_index=0;ring_iterations=0
+        stage_index=0;ring_iterations=0;settled_since=getattr(r,'wrist_after_motion',-math.inf)
         try:
             while stage_index<len(stages):
                 stage,path=stages[stage_index],paths[stage_index]
@@ -406,6 +432,7 @@ class PrimitiveService:
                         command_state='outcome_unknown'
                         motion_detail=r.move_segment(initial,path,start_position,max_travel=p['max_leg_m'],**options)
                         command_state='command_returned'
+                        settled_since=time.monotonic()
                     with _measure(stage_timings,'motion_verification',timings):
                         d,a=r.arrival_error(path[-1][1])
                         if d>r.cfg.get('arrival_position_tolerance_m',.01) or a>.04:
@@ -417,7 +444,17 @@ class PrimitiveService:
                             if not self.ring_planned or self.ring_planned[0]!=token:raise RuntimeError('Matching ring plan required')
                             _,captured,frame=r.camera.capture();measured_state=r.read_state()
                             scene=self._ring_scene(measured_state,'release-'+str(frame))
-                            try:result=ring_peg.verify_before_open(p,scene,measured_state,self.ring_planned[1])
+                            try:
+                                if 'wrist_alignment' in p['ring_peg']:
+                                    try:
+                                        scene['wrist_alignment']=self._ring_wrist_alignment(scene,measured_state,self.ring_planned[1]['peg_id'],captured,settled_since)
+                                        r.audit('ring_wrist_alignment',plan_id=token,d455_frame_number=frame,**scene['wrist_alignment'])
+                                    except ring_peg.RingViewConflict:raise
+                                    except ring_peg.RingGeometryError as error:
+                                        if not p['ring_peg'].get('matching_parts_verified'):raise
+                                        r.audit('ring_wrist_unavailable',plan_id=token,d455_frame_number=frame,reason=str(error))
+                                result=ring_peg.verify_before_open(p,scene,measured_state,self.ring_planned[1],
+                                    servo_budget_spent=ring_iterations>=p['ring_peg'].get('servo_iterations',3))
                             except ring_peg.RingAlignmentNeeded as offset:
                                 if ring_iterations>=p['ring_peg'].get('servo_iterations',3):
                                     raise RuntimeError('Ring alignment budget exhausted: '+str(offset)) from offset
@@ -440,6 +477,9 @@ class PrimitiveService:
                                 r.audit('ring_release_rejected',plan_id=token,frame_number=frame,reason=str(error),
                                         held_ring_id=scene.get('held_ring_id'),missing=scene.get('missing',[]))
                                 raise
+                            r.ready()
+                            if max(abs(r.joints()[j]-initial[j]) for j in initial)>.015 or not r.grip.gripping():
+                                raise RuntimeError('Arm or grasp changed while observing the ring at release')
                             r.audit('ring_release_checked',plan_id=token,frame_number=frame,geometry=result)
                     if stage['open'] and skill=='stack' and 'stack_support' in p:
                         pose=r.limb.endpoint_pose()

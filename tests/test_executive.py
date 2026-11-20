@@ -84,6 +84,17 @@ class ManagedTasks(unittest.TestCase):
                      max_grasp_retries=1,max_replans=2,max_planner_calls=32,
                      memory=str(Path(self.temp.name)/'memory.sqlite'))
 
+    def test_verified_final_stack_and_goal_share_one_camera_checkpoint(self):
+        planner=ScriptedPlanner([[step(),step('stack','yellow cube')]],
+            [check(uv=[.4,.5]),check('step_done'),check(uv=[.7,.5]),check('task_done')])
+        robot=Robot()
+        self.assertEqual(run(self.args,self.log,robot,planner),0)
+        self.assertEqual(robot.skills,['pick','stack'])
+        steps=[fields['step'] for event,fields in self.log.events if event=='task_step_verified']
+        goal=next(fields for event,fields in self.log.events if event=='task_verified')
+        self.assertEqual([s['skill'] for s in steps],['pick','stack'])
+        self.assertEqual(steps[-1]['obs_id'],goal['obs_id'])
+
     def test_full_stack_keeps_plan_checkpoints_and_retrievable_memory(self):
         planner=ScriptedPlanner([[step(),step('stack','yellow cube')]],
             [check(uv=[.4,.5]),check('step_done'),check(uv=[.7,.5]),check('step_done'),check('task_done')])
