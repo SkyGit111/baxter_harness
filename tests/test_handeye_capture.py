@@ -11,10 +11,18 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from cix_harness.handeye_capture import EndpointReader, capture, gate_pose, pose_difference, refine_tag_edges, stationary, tag_from_depth
-from cix_harness.handeye_capture import load_volume_checkpoint, volume_capture_plan
+from cix_harness.handeye_capture import load_volume_checkpoint, volume_capture_plan, verify_optical_profile
 
 
 class HandeyeCapture(unittest.TestCase):
+    def test_restart_uses_measured_d455_thermal_profile_with_bounded_angular_shift(self):
+        old=dict(width=1280,height=720,fx=644.6696,fy=643.9489,ppx=640,ppy=360,
+                 model='distortion.inverse_brown_conrady',coeffs=[0.]*5)
+        self.assertLess(verify_optical_profile(old, dict(old,fx=644.8450,fy=644.1243)),.25)
+        for changed in (dict(old,fx=650.),dict(old,ppx=642),dict(old,model='none')):
+            with self.assertRaises(ValueError):
+                verify_optical_profile(old,changed)
+
     def test_volume_resume_preserves_frozen_groups_camera_and_observation_ids(self):
         with TemporaryDirectory() as folder:
             root=Path(folder)

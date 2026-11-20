@@ -8,6 +8,7 @@ from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
+import uuid
 
 import numpy as np
 
@@ -325,8 +326,11 @@ def volume_capture_plan(path):
 
 def load_volume_checkpoint(out, manifest, poses):
     old = json.loads((out/'manifest.json').read_text(encoding='utf8'))
-    if any(old.get(k) != v for k,v in manifest.items()):
-        raise ValueError('Capture plan, camera, stream calibration or ruler reference changed')
+    for k,v in manifest.items():
+        if k in ('intrinsics','native_depth_intrinsics') and k in old:
+            verify_optical_profile(old[k],v)
+        elif old.get(k) != v:
+            raise ValueError('Capture plan, camera, stream calibration or ruler reference changed: '+k)
     sets = {s: json.loads((out/(s+'.json')).read_text(encoding='utf8')) for s in ('train','holdout')}
     accepted = set()
     frames = set()
@@ -341,9 +345,34 @@ def load_volume_checkpoint(out, manifest, poses):
                     or not np.allclose(poses[key][1], sample['drive_target_base_T_effector'], rtol=0, atol=1e-7)
                     or not all((out/(frame+ext)).is_file() for ext in ('.jpg','.npz'))):
                 raise ValueError('Inconsistent or missing previously recorded volume sample')
+            session = sample.get('capture_session')
+            if session is not None:
+                if (not isinstance(session,str) or Path(session).name!=session or not session.startswith('capture-session-')
+                        or hashlib.sha256((out/session).read_bytes()).hexdigest()!=sample.get('capture_session_sha256')):
+                    raise ValueError('Recorded per-session camera calibration is missing or has changed')
             accepted.add(key)
             frames.add(frame)
     return sets
+
+
+def verify_optical_profile(old, current):
+    # The D455 SDK can report temperature-dependent focal lengths at startup.
+    # Reject changes in sensor mode or distortion. Bound the full-frame pixel
+    # shift, and always deproject each new sample using its actual SDK profile.
+    for k in ('width','height','model','coeffs'):
+        if old[k] != current[k]:
+            raise ValueError('Optical stream mode or distortion changed: '+k)
+    shifts=[]
+    for length,pp,focal in (('width','ppx','fx'),('height','ppy','fy')):
+        values=[float(a[k]) for a in (old,current) for k in (pp,focal)]
+        if not all(map(math.isfinite,values)) or min(old[focal],current[focal]) <= 0:
+            raise ValueError('Invalid SDK focal length or principal point')
+        shifts.append(max(abs((u-old[pp]) * (current[focal]/old[focal]-1) + current[pp]-old[pp])
+                          for u in (0,old[length]-1)))
+    error=math.hypot(*shifts)
+    if error>.75:
+        raise ValueError('SDK optical profile changed by {:.3f} pixels at the image boundary'.format(error))
+    return error
 
 
 def capture(args):
@@ -396,13 +425,14 @@ def capture(args):
             manifest['volume_plan_sha256'] = volume_hash
         if resume:
             sets = load_volume_checkpoint(out,manifest,poses)
-            manifest = json.loads((out/'manifest.json').read_text(encoding='utf8'))
+            original_manifest = json.loads((out/'manifest.json').read_text(encoding='utf8'))
         else:
             write_json(out/'manifest.json',manifest)
             sets={'train':[],'holdout':[]}
             for name in sets:write_json(out/(name+'.json'),[])
         align=rs.align(rs.stream.color)
         aligned_verified=False
+        session_file='capture-session-'+uuid.uuid4().hex+'.json'
         ray=lambda pixel:rs.rs2_deproject_pixel_to_point(intr,pixel,1.)
         began=time.monotonic(); last_notice=began-5; previous_frame=-1
         prior = sorted(sets['train']+sets['holdout'],key=lambda s:s['frame_id'])
@@ -429,12 +459,15 @@ def capture(args):
                 if not aligned_verified:
                     aligned_intr=depth.profile.as_video_stream_profile().get_intrinsics()
                     actual_intrinsics=intrinsics_data(aligned_intr)
-                    if resume and 'aligned_depth_intrinsics' in manifest and manifest['aligned_depth_intrinsics']!=actual_intrinsics:
-                        raise RuntimeError('Aligned depth calibration changed since the recorded capture')
+                    if resume and 'aligned_depth_intrinsics' in original_manifest:
+                        verify_optical_profile(original_manifest['aligned_depth_intrinsics'],actual_intrinsics)
                     if any(abs(getattr(aligned_intr,k)-getattr(intr,k))>.01 for k in ('fx','fy','ppx','ppy','width','height')):
                         raise RuntimeError('SDK aligned-depth intrinsics disagree with the color stream')
                     manifest['aligned_depth_intrinsics']=actual_intrinsics
-                    write_json(out/'manifest.json',manifest)
+                    if not resume or 'aligned_depth_intrinsics' not in original_manifest:
+                        write_json(out/'manifest.json',manifest)
+                    write_json(out/session_file,manifest)
+                    session_digest=hashlib.sha256((out/session_file).read_bytes()).hexdigest()
                     aligned_verified=True
                 # The two RealSense streams use the same capture device. Compare
                 # their sensor stamps only when their domains agree.
@@ -492,7 +525,8 @@ def capture(args):
                     if not cv2.imwrite(str(out/(evidence+'.jpg')),bgr):raise OSError('Could not save color frame')
                     np.savez_compressed(out/(evidence+'.npz'),aligned_z16=z16)
                     record=dict(info,arm='right',tag_family='tag36h11',tag_id=0,camera_serial=args.serial,
-                                frame_id=evidence,stationary_frames=list(window))
+                                frame_id=evidence,stationary_frames=list(window),
+                                capture_session=session_file,capture_session_sha256=session_digest)
                     sets[split].append(record)
                     write_json(out/(split+'.json'),sets[split])
                     accepted.append(info['base_T_effector'])
