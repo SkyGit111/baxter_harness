@@ -22,6 +22,7 @@ class ContinuousIK:
         robot = (URDF.from_xml_string(robot_description) if robot_description is not None
                  else URDF.from_parameter_server(key='robot_description'))
         chain = kdl_tree_from_urdf_model(robot).getChain('base', arm+'_gripper')
+        self.chain = chain
         self.names = [chain.getSegment(i).getJoint().getName() for i in range(chain.getNrOfSegments())
                       if chain.getSegment(i).getJoint().getType() != getattr(kdl.Joint, 'None')]
         if len(self.names) != 7:

@@ -489,3 +489,59 @@ robot_effector_frame：
 - [原语配置模板](../config/baxter-primitives.example.json)：字段结构，不可当真实标定直接使用。
 
 现场最短执行顺序：打印实测 → 刚性安装 → 核对 ROS 与相机 → 稳定检测 → 手动多姿态采样 → 求解 → 独立验证 → TCP 与桌面核验 → 更新本地配置 → 只读检查 → 交付记录。
+
+## 使用当前右手标志物和 D455 采集原始观测
+
+在加载 ROS 和 Baxter 工作区环境的控制主机上运行。采集进程独占指定 D455，同时订阅右臂的 endpoint 和关节遥测，并用真实 URDF 的 FK 核对末端位姿。每个姿态让标签清晰可见、静止至少半秒。转动不同轴，保持标签与右夹爪的安装关系固定。
+
+```bash
+python3 -u -m cix_harness.handeye_capture \
+  --serial 241122306976 --output-dir site/right-tag-new-run \
+  --train 12 --holdout 4 --duration-s 480
+```
+
+固定识别 tag36h11、ID 0。用尺沿黑框外沿取得宽高时，可增加 `--width-m` 和 `--height-m`，单位均为米。默认以 1280×720 取彩色，640×480 取深度并对齐彩色。可用 `--color-mode 640x480` 复核旧分辨率。对解码出的每条边沿黑到白方向取强度剖面，拟合四条直线，其交点给出规范角点。采样器用 D455 对齐深度独立拟合平面，与四条角点光线求交，再计算标签姿态和实测边长。日志保存解码角点、精拟合角点、边缘像素残差与两路实际内参。有尺量值时会报告尺度矛盾。右臂位置和姿态重复、标签不清、深度不足、时间不匹配或 FK 不一致时会打印原因，并继续等待到本轮时限。
+
+每个已收姿态保存彩色图、对齐原始深度、内参与畸变、四角坐标、几何残差和多帧时序。新目录下的 `train.json` 和 `holdout.json` 是互斥样本，可分别传给 `python3 -m cix_harness.handeye --fit … --holdout …`，阈值和产物见该命令 `--help`。限时结束时已收记录仍可读取。若使用外部姿态控制程序，可传入 `--pose-gate <路径>` 将记录绑定到实测到位的目标 ID。
+
+若现场准备使用自动采姿，先在控制主机加载 Baxter ROS 和 MoveIt。记录当前起始位置上三个有物理意义的距离，单位均为米。
+
+- `R` 为以 `right_gripper` 原点为中心、包含整套夹指、固定板和支架的半径。
+- `D_TOOL` 为整套附件到桌面和附近外部物体的最小初始净距。
+- `D_ARM` 为整条右臂各活动连杆到桌面和附近外部物体的最小初始净距。MoveIt 保存的场景可能没有桌面，该值用于逐连杆检查局部扫动范围。
+
+第一次运行下列命令只做预检。程序计算相对当前起姿的小范围多轴转腕，逐点进行 KDL 和 MoveIt 全身检查。默认在 `right_gripper` 附加包络球。已有实测安装位置时，可用 `--attachment-boxes boxes.json` 提供覆盖标板、支架及任何超出原 URDF 的夹指的多个盒，例如 `{"frame":"right_gripper","units":"m","boxes":[{"size_m":[长,宽,厚],"xyz":[中心x,中心y,中心z],"xyzw":[qx,qy,qz,qw]}]}`。这些值应来自实物安装记录。
+
+```bash
+python3 -m cix_harness.handeye_drive --tool-radius-m "$R" --clearance-m "$D_TOOL" \
+  --body-clearance-m "$D_ARM" --robot-clock-offset-s "$CLOCK_OFFSET" --output preview.jsonl
+```
+
+预检通过后，使采集程序使用一个全新的目录 `RUN` 和 `--pose-gate "$RUN/request.json"`，采集数量与驱动的 `--count` 对应。待空的 `train.json` 与 `holdout.json` 出现，使用相同参数启动驱动，添加 `--drive --capture-dir "$RUN"`，并将 `--output` 改为新的执行日志。驱动等待当前目标 ID 对应的静止观测写入才前进。停止或掉线后用新观测检查现场。
+
+若手臂伸展导致原地侧倾不可行，可在上述预检和随后执行的命令中都添加 `--wrist-lattice --count 8`，采集端对应 `--train 5 --holdout 3`。驱动沿抓手朝向组合轴向转动和较小的侧倾，允许 TCP 在初始点周围 16 mm 内补偿，下移最多 3 mm。日志中的 `wrist_lattice` 记录通过端点检查的个数、可区分姿态数和拒绝统计。它选择两两至少相隔 15° 的姿态，对每条实际执行的关节插值重新做碰撞、限位和净空检查。姿态数量、训练转轴激励及独立留出误差分别决定这组数据能否用于求解。
+
+```bash
+python3 -m cix_harness.handeye --fit "$RUN/train.json" --holdout "$RUN/holdout.json" \
+  --max-mm "$TASK_MM" --max-deg "$TASK_DEG" --output "$RUN/handeye.json" \
+  --optical-frame "$COLOR_OPTICAL_FRAME" --extrinsics-output "$RUN/extrinsics.json"
+```
+
+刚性误差阈值由物体和夹指的空间余量确定。输出报告含逐姿态误差、训练集旋转激励、最大误差和 RMS。训练和留出一致性通过时生成 `table_survey` 可读取的外参候选，接着用独立物理点检查绝对坐标。用 `--camera 原外参.yaml` 可以冻结并核验已有的 easy_handeye eye-on-base 外参。读取旧的累积 `get_sample_list` 快照时，需明确传入 `--holdout-includes-fit`，程序先核对完整训练前缀再取新增姿态。
+
+### 新样本暂不足以重新拟合时
+
+若评估 11 月 17 日保存原始 RGB 图像后重算边线得到的解，用 `handeye_frozen` 同时固定相机到基座变换和标签到右手变换。它从原检测器配置读取四角的物理坐标。历史 IPPE 的 y 轴从解码角 3 指向角 0，新 RGB-D 采集器的 y 轴从角 0 指向角 3；换算到历史标签坐标需要右乘绕标签 x 轴的 180° 旋转。工具在读取新数据前由角点定义确定这一换算。
+
+```bash
+python3 -m cix_harness.handeye_frozen \
+  --hypothesis "$AUDIT/edge-refit100.json" \
+  --fit-provenance "$AUDIT/common_time_fit_provenance.json" \
+  --detector-config "$AUDIT/opencv_detector_config.json" \
+  --capture-dir "$RUN" --first-new-utc-day 2026-11-20 \
+  --max-mm 10 --max-deg 3 --output "$AUDIT/new-poses-against-frozen.json"
+```
+
+每个 `--capture-dir` 指向采集器新建、含 `manifest.json`、`train.json`、`holdout.json` 的目录，可重复提供。这个历史假设从未见过今天的两份数据，因此评估会检查两份中的每一次有效观测。它保留相近姿态的误差，对重复姿态只计一次，对时间戳重复的数据报错。一个静止窗口里的连续帧共同构成一次观测。至少三个互异的新姿态且所有误差低于或等于本次的 10 mm、3° 才通过该项刚性一致性检查。报告记录数据摘要、每次的位置与角误差、基座三轴误差以及最大的误差。单个姿态超差不能区分相机外参偏移、标记固定方式改变和深度测量误差。
+
+若要利用今天的数据拟合新解，另开一批采集时用 `--train 9 --holdout 3`，按到达顺序将第 4、8、12 个不同姿态留出。转动方向应覆盖至少两个独立轴，并尽量让保留姿态分布在任务涉及的区域。完成拟合后按上一节用 `handeye` 检查这三个预先保留的观测。
