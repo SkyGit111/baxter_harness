@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 
 from .__main__ import Journal, run as run_vla
+from .api_planner import DEFAULT_API_MODEL, ResponsesTaskPlanner
 from .contract import instruction
 from .executive import ExecutiveJournal, TaskExecutive
 from .memory import EpisodeMemory, scope_key
@@ -38,7 +39,6 @@ def run(args, journal, robot=None, planner=None):
         raise RuntimeError('Managed VLA tasks require a task bridge, not a diagnostic/primitive profile')
     provider=getattr(args,'planner_provider','local')
     if planner is None and provider=='api':
-        from .api_planner import ResponsesTaskPlanner
         planner=ResponsesTaskPlanner(args.api_model,args.api_base_url,args.api_key_env,args.api_timeout,journal,
             auth=getattr(args,'api_auth','api-key'),credential_path=getattr(args,'chatgpt_credentials',None),
             image_mode=getattr(args,'api_images','scene_wrist'))
@@ -79,7 +79,7 @@ def main(argv=None):
     p.add_argument('--route', choices=['primitives', 'vla','hybrid'], default='primitives')
     p.add_argument('--arms',choices=['auto','left','right','both'],default='auto')
     p.add_argument('--planner-provider',choices=['local','api'],default='local')
-    p.add_argument('--api-model',default='gpt-6-astra')
+    p.add_argument('--api-model',default=DEFAULT_API_MODEL,help='Responses planner model (default: %(default)s)')
     p.add_argument('--api-base-url',default='https://api.openai.com/v1')
     p.add_argument('--api-key-env',default='OPENAI_API_KEY')
     p.add_argument('--api-auth',choices=['api-key','chatgpt'],default='api-key')

@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from cix_harness.api_planner import ResponsesTaskPlanner
+from cix_harness.api_planner import DEFAULT_API_MODEL, ResponsesTaskPlanner
 from cix_harness.contract import image_data
 from cix_harness.planner_images import select_images
 from cix_harness.task_plan import compact_state,validate_check
@@ -95,7 +95,7 @@ def load_run(folder, index=0, checkpoint=0):
     return obs, context
 
 
-def compare(obs,context,*,call_api=False,model='gpt-6-astra',auth='api-key',credential_path=None,repeats=1):
+def compare(obs,context,*,call_api=False,model=DEFAULT_API_MODEL,auth='api-key',credential_path=None,repeats=1):
     manifest={mode:select_images(obs,mode)[1] for mode in ('scene','scene_wrist')}
     result={'mode':'saved_observation_readonly','robot_calls':0,'api_requested':call_api,
             'obs_id':obs.get('id'),'selection':obs.get('_replay'),'images':manifest,'context':context,'trials':[],
@@ -134,7 +134,7 @@ def main(argv=None):
     p.add_argument('--checkpoint',type=int,default=0,help='Zero-based checkpoint call within this frame')
     p.add_argument('--output',type=Path,help='New local JSON result file')
     p.add_argument('--call-api',action='store_true')
-    p.add_argument('--model',default='gpt-6-astra')
+    p.add_argument('--model',default=DEFAULT_API_MODEL,help='Responses planner model (default: %(default)s)')
     p.add_argument('--auth',choices=['api-key','chatgpt'],default='api-key')
     p.add_argument('--credentials',type=Path)
     p.add_argument('--repeats',type=int,choices=range(1,4),default=1)

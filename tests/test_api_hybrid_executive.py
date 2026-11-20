@@ -47,7 +47,7 @@ class APIPlanner(unittest.TestCase):
         with patch('cix_harness.api_planner.build_opener',return_value=opener):
             self.assertEqual(client.plan(obs(),{'route':'hybrid'}),{'steps':[]})
         request=opener.open.call_args.args[0];body=json.loads(request.data)
-        self.assertFalse(body['store']);self.assertEqual(body['model'],'gpt-6-astra')
+        self.assertFalse(body['store']);self.assertEqual(body['model'],'gpt-6.2-astra')
         self.assertEqual(body['input'][1]['content'][1]['type'],'input_image')
         self.assertIn('backend',body['text']['format']['schema']['properties']['steps']['items']['required'])
 

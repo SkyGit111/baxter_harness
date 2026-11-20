@@ -6,7 +6,7 @@
 
 使用 Codex 开发时，仓库根目录的 [AGENTS.md](AGENTS.md) 规定怎样把改进落实到正常入口并验证。排查 Baxter 运行失败或执行过慢时，可调用 [`$baxter-run-repair`](.agents/skills/baxter-run-repair/SKILL.md)。Codex 在新运行开始时发现仓库指令，技能通过名称和描述匹配任务。[OpenAI 的 AGENTS.md 指南](https://developers.openai.com/codex/guides/agents-md) · [OpenAI 的 SKILL.md 指南](https://developers.openai.com/codex/skills)
 
-机器人高层通过 [task_plan.py](cix_harness/task_plan.py) 组装计划与检查提示，再由 [api_planner.py](cix_harness/api_planner.py) 发送 Responses 请求。仓库开发指令和 Codex 技能由开发助手读取。要在现有 API 规划命令中指定 GPT‑6.2 Astra，可传 `--api-model gpt-6.2-astra`；当前默认仍为 `gpt-6-astra`。[GPT‑6.2 Astra 官方模型说明](https://developers.openai.com/api/docs/models/gpt-6.2-astra)
+机器人高层通过 [task_plan.py](cix_harness/task_plan.py) 组装计划与检查提示，再由 [api_planner.py](cix_harness/api_planner.py) 发送 Responses 请求。仓库开发指令和 Codex 技能由开发助手读取。选择 `--planner-provider api` 后，高层默认使用 GPT‑6.2 Astra（`gpt-6.2-astra`）。`--api-model` 可指定账号可用的其他模型。腕图回放的 `--call-api` 使用同一默认模型，可通过 `--model` 覆盖。[GPT‑6.2 Astra 官方模型说明](https://developers.openai.com/api/docs/models/gpt-6.2-astra)
 
 **版本提示：交接文档的旧现状以本文下述更新为补充。11 月 17 日完成双臂与全桌版本的离线准备；最后一次真机验收仍是 11 月 13 日的左臂抓取。**
 
@@ -67,7 +67,7 @@ flowchart TD
 **本轮重构的实际内容：**
 
 - `task_plan.py`、`executive.py`：混合计划的每一步有独立 `backend=primitives/vla/code`。已验证失败后可以重新规划并更换后端；历史成功步骤仍保留。目标点必须重新绑定当前图像，模型不能凭旧点直接执行。代码结果保留在本次工作记忆中，供后续选择和重规划使用。
-- `api_planner.py`：Responses API 图像输入、结构化计划/检查点、环境变量或独立 ChatGPT 授权、超时、拒绝/未完成响应检查、调用耗时和 token 用量记录。默认 `gpt-6-astra`，模型名和 HTTPS endpoint 可配置；不要求本地 VLM 同时运行。官方文档列出了该模型与图像输入/结构化输出支持：[模型文档](https://developers.openai.com/api/docs/models/gpt-6-astra)、[Responses 接口](https://developers.openai.com/api/reference/resources/responses/methods/create)。本次账号已通过实际请求；其他账号仍以自身目录和权限为准。
+- `api_planner.py`：Responses API 图像输入、结构化计划/检查点、环境变量或独立 ChatGPT 授权、超时、拒绝/未完成响应检查、调用耗时和 token 用量记录。默认 `gpt-6.2-astra`，模型名和 HTTPS endpoint 可配置；不要求本地 VLM 同时运行。官方文档列出了该模型与图像输入/结构化输出支持：[模型文档](https://developers.openai.com/api/docs/models/gpt-6.2-astra)、[Responses 接口](https://developers.openai.com/api/reference/resources/responses/methods/create)。本次账号已通过实际请求；其他账号仍以自身目录和权限为准。
 - `hybrid.py`：从实际服务发现可用后端，再把工具目录交给高层。不可用、契约不匹配或本体适配未放行的 VLA 不进入可执行工具集。收到不明执行结果时停止，不立即换另一个后端重做可能已经完成的动作。
 - `baxter.py`、`primitive_service.py`：新增 `supervised_hybrid_task`。同一桥进程串行承载原语和 VLA，两者共用运动预算和租约，服从原语 TCP 几何与接触边界的交集。切换后端会使另一后端的旧观测/计划失效；单路线配置不会因为客户端选择 hybrid 就自动开放另一种运动接口。
 - `code_tool.py`：解释受限 Python 语法，用 `data` 读取本轮数据、用 `result` 返回计算结果；支持计算、选择、排序和有限循环，也可返回候选技能组合数据。使用 AST 解释和资源限制，没有调用 Python `eval/exec`。不具备文件、网络、shell 或电机访问权限；它的结果须回到规划与验证流程，不能冒充物理任务完成。
@@ -95,7 +95,7 @@ python -m pip install -r deploy/chatgpt-auth-requirements.txt
 python -m cix_harness.chatgpt_auth login
 python -m cix_harness.chatgpt_auth models
 python -m cix_harness.harness --planner-provider api --api-auth chatgpt \
-  --api-model gpt-6-astra --route hybrid --task '把青色方块叠到黄色方块上' --task-kind stack
+  --api-model gpt-6.2-astra --route hybrid --task '把青色方块叠到黄色方块上' --task-kind stack
 ```
 
 认证文件默认保存在用户配置目录，使用仅当前用户可读写的权限；可用 `--credentials`（认证工具）和 `--chatgpt-credentials`（任务入口）指定同一私有路径。不要提交凭据、打印令牌或复用其他应用的登录文件。高层可以在已登录的控制电脑上运行，通过 SSH 连接机器人桥；无需把账号令牌复制到板子。若迁移到另一台主机，应停止原主机刷新，确保轮换令牌只有一个刷新拥有者。`status` 查询登录状态，`logout` 清除本地令牌并尝试服务端注销，不能确认服务端注销时会明确报告。
@@ -105,7 +105,7 @@ python -m cix_harness.harness --planner-provider api --api-auth chatgpt \
 如使用 API Key，在高层机器的 `OPENAI_API_KEY` 环境变量中设置，不将密钥写进配置或 Git。随后可预览：
 
 ```bash
-python3 -m cix_harness.harness --planner-provider api --api-model gpt-6-astra \
+python3 -m cix_harness.harness --planner-provider api --api-model gpt-6.2-astra \
   --route hybrid --task '把青色方块叠到黄色方块上' --task-kind stack
 ```
 
