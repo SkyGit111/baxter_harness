@@ -64,6 +64,7 @@ class Robot:
             assert self.prepared[0]==args[0]
             token,skill=self.prepared;self.prepared=None;self.skills.append(skill)
             outcome=self.outcomes.pop(0) if self.outcomes else None
+            if isinstance(outcome,dict):return {'plan_id':token,'skill':skill,**outcome}
             if isinstance(outcome,Exception):raise outcome
             if outcome=='empty_grasp':
                 return {'plan_id':token,'skill':skill,'applied':True,'status':'failed','failure_code':outcome,
@@ -96,6 +97,22 @@ class ManagedTasks(unittest.TestCase):
         found=memory.retrieve(self.args.task,scope_key(robot.call('healthz'),'primitives','test'))
         self.assertEqual(found[0]['outcome'],'verified');self.assertEqual(len(found[0]['recipe']),2)
         self.assertNotIn('uv',json.dumps(found));self.assertNotIn('eef_m',json.dumps(found))
+
+    def test_partial_motion_receipt_is_journaled_and_never_replayed(self):
+        for unknown in (False,True):
+            with self.subTest(unknown=unknown):
+                planner=ScriptedPlanner([[step(),step('stack','yellow cube')]],[check(uv=[.4,.5])])
+                previous={'stage_index':0,'stage':{'kind':'move'},'eef_m':[.62,.18,.1],'gripping':False,'duration_s':3.38}
+                failed={'stage_index':1,'phase':'transit','stage':{'kind':'move'},'command_state':'outcome_unknown' if unknown else 'not_dispatched','timings_s':{'trajectory_preflight':.2}}
+                robot=Robot([{'status':'failed','applied':True,'completed_stages':[previous],'failed_stage':failed,
+                              'failure_code':'execution_failed','message':'marker clearance','confirmed_commands':1,'recoverable':False,'retryable':False,
+                              'outcome_uncertain':unknown,'stopped':True,'stop_attempted':True}])
+                self.assertEqual(run(self.args,self.log,robot,planner),2)
+                receipt=[fields for name,fields in self.log.events if name=='primitive_result'][-1]
+                self.assertEqual(receipt['completed_stages'],[previous]);self.assertEqual(receipt['failed_stage'],failed)
+                self.assertEqual(robot.skills,['pick']);self.assertEqual(robot.i,1)
+                state=[fields for name,fields in self.log.events if name=='task_finished'][-1]
+                self.assertEqual(state['status'],'unknown' if unknown else 'blocked')
 
     def test_preview_cannot_be_learned_as_success(self):
         self.args.execute=False

@@ -79,8 +79,10 @@ class MoveItPrimitivePath(unittest.TestCase):
         self.service.prepared = ('p', time.monotonic(), self.start,
                                  [{'kind': 'move', 'motion_phase': 'transit'}], [self.knots], 1, 'move_to', False)
         self.guard._scene.side_effect = RuntimeError('state service disconnected')
-        with self.assertRaisesRegex(RuntimeError, 'service disconnected'):
-            self.service.execute('p')
+        receipt=self.service.execute('p')
+        self.assertIn('service disconnected',receipt['message'])
+        self.assertIs(receipt['applied'],False);self.assertFalse(receipt['stop_attempted'])
+        self.assertEqual(receipt['failed_stage']['command_state'],'not_dispatched')
         self.r.move_segment.assert_not_called()
         self.r.grip.command_position.assert_not_called()
         self.assertIsNone(self.guard.execution_reference)

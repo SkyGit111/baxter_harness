@@ -6,6 +6,7 @@ silently enables additional robot RPCs.
 """
 from .contract import ACTION_SPEC
 from .primitives import SKILLS
+from .primitive_runner import finish_execution_failure,log_execution_receipt
 from .task_plan import VLA_SKILLS
 from .rpc import HttpRpcClient
 from .rollout import predict, rollout, validate_motion_model
@@ -185,14 +186,12 @@ def run(args, log, executive, robot=None, model=None, code_tool=None):
         if not args.execute: return finish('preview')
         # A lost response may mean physical motion happened. Never retry this call.
         receipt = robot.call('primitive.execute', (prepared['plan_id'],), timeout_s=600)
-        if receipt.get('applied') is not True or receipt.get('plan_id') != prepared['plan_id']:
-            raise RuntimeError('Invalid primitive acknowledgement')
-        log('primitive_result', **receipt); turns += 1
+        log_execution_receipt(log,receipt,prepared['plan_id']); turns += 1
         if receipt.get('status') == 'failed':
             if (skill != 'pick' or receipt.get('failure_code') != 'empty_grasp' or
                 receipt.get('recoverable') is not True or receipt.get('stopped') is not True or
-                receipt.get('gripping') is not False):
-                raise RuntimeError('Primitive failure is not safe to recover automatically')
+                receipt.get('gripping') is not False or receipt.get('applied') is not True):
+                return finish_execution_failure(log,receipt)
             if empty_grasps >= max_grasp_retries or recoveries >= max_recoveries:
                 return finish('grasp_recovery_budget_exhausted')
             if not executive.recovery_allowed('empty_grasp'): return finish('recovery_policy_stop')

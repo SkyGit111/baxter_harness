@@ -49,6 +49,7 @@ class CallChain:
             if event=='primitive_plan' and item.get('moveit_full_path'):
                 row['moveit_full_path']=item['moveit_full_path']
             if event=='primitive_result':
+                row.update({k:item[k] for k in ('applied','outcome_uncertain','stopped','stop_attempted','retryable','message','failed_stage','confirmed_commands') if k in item})
                 row['stages']=[{k:s[k] for k in ('stage_index','phase','duration_s','timings_s','motion_detail','moveit') if k in s}
                                for s in item.get('completed_stages',[])]
             self.rows.append(row)
@@ -81,6 +82,8 @@ class TimingSummary:
         elif event=='primitive_result':
             for stage in fields.get('completed_stages',[]):
                 self.add('primitive_stage.'+stage.get('stage',{}).get('kind','unknown'),stage.get('duration_s'))
+            failed=fields.get('failed_stage')
+            if isinstance(failed,dict):self.add('primitive_failed_stage.'+failed.get('phase','unknown'),failed.get('duration_s'))
 
     def snapshot(self,wall_seconds):
         result={}

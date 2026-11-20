@@ -48,6 +48,7 @@ def stage_rows(receipts, targets, state, skill, segments):
                'measured_eef_displacement_m': math.dist(previous_eef, end) if previous_eef and end else None}
         if receipt.get('moveit'):
             row['moveit'] = receipt['moveit']
+        if 'command_state' in receipt:row['command_state']=receipt['command_state']
         if stage.get('kind') == 'move':
             row['requested_rotation_deg'] = angle_degrees(last_orientation, stage.get('xyzw'))
             last_orientation = stage.get('xyzw')
@@ -118,6 +119,7 @@ def summarize(folder, audit_path=None):
                 plan['receipts'].append(event['failed_stage'])
             plan['row'].update(execution_status=event.get('status'), execute_timings_s=event.get('timings_s'),
                                failure_code=event.get('failure_code'))
+            plan['row'].update({key:event[key] for key in ('applied','message','outcome_uncertain','stopped','stop_attempted','retryable','confirmed_commands') if key in event})
         elif name in ('stop', 'task_step_failed') or (name == 'component_timing' and event.get('succeeded') is False):
             report['failures'].append({k:event[k] for k in
                 ('t','event','component','method','duration_s','failure_code','reason') if k in event})

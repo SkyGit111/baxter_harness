@@ -142,9 +142,11 @@ class PrimitiveTimings(unittest.TestCase):
         self.prepared([{'kind':'move'},{'kind':'gripper','open':True}])
         self.r.move_segment.side_effect=self.clock.work(.8,error=RuntimeError('motor link lost'))
         self.r.grip.stop.side_effect=self.clock.work(.1,True)
-        with self.assertRaisesRegex(RuntimeError,'motor link lost'):self.service.execute('p')
+        receipt=self.service.execute('p');self.assertIn('motor link lost',receipt['message'])
+        self.assertIsNone(receipt['applied']);self.assertTrue(receipt['outcome_uncertain'])
+        self.assertFalse(receipt['recoverable']);self.assertFalse(receipt['retryable'])
         failed=self.events('primitive_failed')[0]
-        self.assertEqual(failed['completed_stages'],0)
+        self.assertEqual(failed['completed_stages'],[])
         self.assertEqual(failed['failed_stage']['status'],'failed')
         self.assertAlmostEqual(failed['failed_stage']['duration_s'],.8)
         self.assertAlmostEqual(failed['failed_stage']['timings_s']['motion'],.8)
@@ -154,10 +156,35 @@ class PrimitiveTimings(unittest.TestCase):
         self.r.grip.command_position.assert_not_called()
         self.assertIsNone(self.service.prepared)
 
+    def test_clear_view_second_preflight_keeps_first_measured_stage_and_stops(self):
+        from cix_harness.collision import ArmCollisionError
+        stages=[{'kind':'move','motion_phase':'clearance'},{'kind':'move','motion_phase':'transit'}]
+        self.prepared(stages)
+        self.service.prepared=(*self.service.prepared[:-2],'clear_view',False)
+        self.r.cfg['planning']={'trajectory_mode':'continuous'}
+        self.r.move_segment.side_effect=self.clock.work(3.38,{'command_samples':84})
+        def curve(initial,path,holding,departing,phase):
+            self.clock.advance(.2)
+            if phase=='transit':raise ArmCollisionError('Inter-arm clearance below 0.0400 m')
+        self.service._check_curve=curve
+        result=self.service.execute('p')
+        self.assertEqual(result['status'],'failed');self.assertTrue(result['applied'])
+        self.assertEqual(result['confirmed_commands'],1);self.assertFalse(result['outcome_uncertain'])
+        self.assertFalse(result['retryable']);self.assertFalse(result['recoverable']);self.assertTrue(result['stopped'])
+        self.assertEqual(result['completed_stages'][0]['stage_index'],0)
+        self.assertEqual(result['completed_stages'][0]['motion_detail']['command_samples'],84)
+        self.assertEqual(result['failed_stage']['stage_index'],1)
+        self.assertEqual(result['failed_stage']['command_state'],'not_dispatched')
+        self.assertAlmostEqual(result['failed_stage']['timings_s']['trajectory_preflight'],.2)
+        self.assertIn('Inter-arm clearance',result['message']);self.r.move_segment.assert_called_once()
+        self.r.limb.set_joint_positions.assert_called_once()
+        with self.assertRaisesRegex(ValueError,'never replay'):self.service.execute('p')
+
     def test_gripper_timeout_records_command_duration_without_settle_or_success(self):
         self.prepared([{'kind':'gripper','open':True}])
         self.r.grip.command_position.side_effect=self.clock.work(.6,False)
-        with self.assertRaisesRegex(RuntimeError,'timeout'):self.service.execute('p')
+        receipt=self.service.execute('p');self.assertIn('timeout',receipt['message'])
+        self.assertIsNone(receipt['applied']);self.assertTrue(receipt['outcome_uncertain'])
         failed=self.events('primitive_failed')[0]
         self.assertAlmostEqual(failed['failed_stage']['timings_s']['gripper_command'],.6)
         self.assertEqual(failed['timings_s']['gripper_settle'],0.)

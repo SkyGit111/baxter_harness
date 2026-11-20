@@ -9,7 +9,7 @@ from urllib.request import Request, build_opener
 
 from .rpc import NoRedirect, MAX_BYTES
 from .task_plan import VisualTaskPlanner
-from .planner_images import IMAGE_SYSTEM, select_images
+from .planner_images import AUX_WRIST_MAX_AGE_S, IMAGE_SYSTEM, select_images
 
 DEFAULT_API_MODEL = 'gpt-6.2-astra'
 
@@ -58,7 +58,7 @@ def completed_stream(stream, timing_observer=None):
 class ResponsesTaskPlanner(VisualTaskPlanner):
     def __init__(self, model=DEFAULT_API_MODEL, base_url='https://api.openai.com/v1',
                  key_env='OPENAI_API_KEY', timeout=120, log=None,
-                 auth='api-key', credential_path=None, image_mode='scene_wrist', wrist_max_age_s=.75):
+                 auth='api-key', credential_path=None, image_mode='scene_wrist', wrist_max_age_s=AUX_WRIST_MAX_AGE_S):
         parsed=urlparse(base_url)
         if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError('API base URL must be HTTPS without credentials/query/fragment')

@@ -244,7 +244,10 @@ class DualBridgeTests(unittest.TestCase):
             right.angles[right.names[0]]+=.02
             left.ready()
         left.move_segment=Mock(side_effect=interrupted)
-        with self.assertRaises(PeerStateChangedError):bridge.execute('left',prepared['plan_id'])
+        receipt=bridge.execute('left',prepared['plan_id'])
+        self.assertEqual(receipt['failure_type'],'PeerStateChangedError')
+        self.assertTrue(receipt['outcome_uncertain']);self.assertFalse(receipt['retryable'])
+        self.assertEqual(receipt['selected_arm'],'left');self.assertEqual(receipt['status'],'failed')
         left.limb.set_joint_positions.assert_called_once();left.grip.stop.assert_called_once()
         right.limb.set_joint_positions.assert_not_called();right.grip.command_position.assert_not_called()
         for service in bridge.services.values():self.assertIsNone(service.prepared)

@@ -48,6 +48,7 @@ class WristFreshnessTest(unittest.TestCase):
         repeat=self.arm.observe()
         self.arm.wrist_condition.wait_for.assert_called_once()
         self.assertNotIn('wrist_image',repeat)
+        self.assertEqual(repeat['camera_metadata']['wrist']['omitted_reason'],'already_used')
 
     def test_wait_for_post_motion_frame_before_capturing_scene(self):
         self.arm.note_wrist(self.message)

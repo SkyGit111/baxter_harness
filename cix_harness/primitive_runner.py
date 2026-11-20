@@ -79,6 +79,24 @@ def action(skill,evidence):
     return {'decision':'act','reason':'none','skill':skill,'uv':None,'evidence':evidence}
 
 
+def log_execution_receipt(log, receipt, plan_id):
+    if not isinstance(receipt,dict) or receipt.get('plan_id')!=plan_id:
+        raise RuntimeError('Invalid primitive acknowledgement')
+    if receipt.get('status')=='failed':
+        if 'applied' not in receipt or not any(receipt['applied'] is value for value in (True,False,None)):
+            raise RuntimeError('Invalid failed primitive acknowledgement')
+    elif receipt.get('applied') is not True:
+        raise RuntimeError('Invalid primitive acknowledgement')
+    log('primitive_result',**receipt)
+
+
+def finish_execution_failure(log,receipt):
+    uncertain=receipt.get('outcome_uncertain') is not False or (receipt.get('stop_attempted') is True and receipt.get('stopped') is not True)
+    log('finish',status=receipt.get('failure_code','execution_failed'),plan_id=receipt['plan_id'],
+        evidence=receipt.get('message',''),outcome_uncertain=uncertain,replayed=False)
+    return 2
+
+
 def run(args,log,robot=None,planner=decide,recovery_allowed=None):
     from .timing import timed_rpc
     robot=timed_rpc(robot or HttpRpcClient(args.robot_port),log)
@@ -137,15 +155,13 @@ def run(args,log,robot=None,planner=decide,recovery_allowed=None):
         if not args.execute:return 0
         # A lost response can follow real motion: never automatically retry this call.
         receipt=robot.call('primitive.execute',(prepared['plan_id'],),timeout_s=600)
-        if receipt.get('applied') is not True or receipt.get('plan_id')!=prepared['plan_id']:
-            raise RuntimeError('Invalid primitive acknowledgement')
-        log('primitive_result',**receipt);actions+=1
+        log_execution_receipt(log,receipt,prepared['plan_id']);actions+=1
         history.append(feedback(decision,receipt))
         if receipt.get('status','completed')=='failed':
             if (decision['skill']!='pick' or receipt.get('failure_code')!='empty_grasp'
                 or receipt.get('recoverable') is not True or receipt.get('stopped') is not True
-                or receipt.get('gripping') is not False):
-                raise RuntimeError('Primitive failure is not safe to recover automatically')
+                or receipt.get('gripping') is not False or receipt.get('applied') is not True):
+                return finish_execution_failure(log,receipt)
             if empty_grasps>=max_grasp_retries or recoveries>=max_recoveries:
                 log('finish',status='grasp_recovery_budget_exhausted');return 2
             if recovery_allowed and not recovery_allowed('empty_grasp'):

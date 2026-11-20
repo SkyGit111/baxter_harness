@@ -50,6 +50,13 @@ def _measure(timings, name, aggregate=None):
             aggregate[name]=aggregate.get(name,0.)+seconds
 
 
+def _peer_path_check(robot,skill,holding):
+    check=getattr(type(robot),'check_other_arm_path',None)
+    if skill=='clear_view' and holding is False:
+        return getattr(type(robot),'check_empty_clear_view_path',check)
+    return check
+
+
 class PrimitiveService:
     def __init__(self,robot):
         self.robot=robot
@@ -146,9 +153,7 @@ class PrimitiveService:
         with _measure(timings,'grounding'):
             target=(ground_pixel(uv,depth,r.camera.intrinsics,p) if uv is not None else target_base_m)
             if target is not None:target=vector(target,3,'base target')
-        peer_check=getattr(type(r),'check_other_arm_path',None)
-        if skill=='clear_view' and obs['state'].get('gripping') is False:
-            peer_check=getattr(type(r),'check_empty_clear_view_path',peer_check)
+        peer_check=_peer_path_check(r,skill,obs['state'].get('gripping'))
         attempts=[];last_error=None;moveit_receipt=None
         for yaw,candidate in candidate_profiles(p,obs['state'],skill,r.cfg.get('planning',{})):
             attempt_started=time.monotonic()
@@ -298,7 +303,10 @@ class PrimitiveService:
                 self.moveit.execution_reference = None
         timings['execute_total']=time.monotonic()-started
         result['timings_s']=timings
-        self.robot.audit('primitive_completed' if result['status']=='completed' else 'primitive_recovery_available',**result)
+        if result['status']=='completed':self.robot.audit('primitive_completed',**result)
+        else:
+            self.robot.audit('primitive_failed',error=result['message'],**result)
+            if result['recoverable']:self.robot.audit('primitive_recovery_available',**result)
         return result
 
     def _execute(self,plan_id,timings,started):
@@ -310,7 +318,7 @@ class PrimitiveService:
         stage=None;stage_started=None;stage_timings={};departed=False;actuation_attempted=False
         try:
             for stage_index,(stage,path) in enumerate(zip(stages,paths)):
-                stage_started=time.monotonic();stage_timings={}
+                stage_started=time.monotonic();stage_timings={};command_state='not_dispatched'
                 phase=stage_phase(stages,stage_index,skill);motion_detail=None;moveit_receipt=None
                 r.audit('primitive_stage_started',plan_id=token,stage_index=stage_index,
                         skill=skill,backend='primitives',phase=phase,stage=stage)
@@ -331,7 +339,7 @@ class PrimitiveService:
                         with _measure(stage_timings,'trajectory_preflight',timings):
                             departing=skill=='pick' and grasp_verified and not departed
                             self._check_curve(initial,path,holding,departing,phase)
-                            peer_check=getattr(type(r),'check_other_arm_path',None)
+                            peer_check=_peer_path_check(r,skill,holding)
                             if callable(peer_check):peer_check(r,[path])
                             # Preflight may be expensive; do not start from a pose which changed meanwhile.
                             if max(abs(r.joints()[n]-initial[n]) for n in initial)>.015:
@@ -340,8 +348,11 @@ class PrimitiveService:
                         options={'continuous':True,'motion_phase':phase}
                     r.motion_context={'plan_id':token,'stage_index':stage_index,'skill':skill,'backend':'primitives','phase':phase}
                     with _measure(stage_timings,'motion',timings):
+                        start_position=r.endpoint_position()
                         actuation_attempted=True
-                        motion_detail=r.move_segment(initial,path,r.endpoint_position(),max_travel=p['max_leg_m'],**options)
+                        command_state='outcome_unknown'
+                        motion_detail=r.move_segment(initial,path,start_position,max_travel=p['max_leg_m'],**options)
+                        command_state='command_returned'
                     with _measure(stage_timings,'motion_verification',timings):
                         d,a=r.arrival_error(path[-1][1])
                         if d>r.cfg.get('arrival_position_tolerance_m',.01) or a>.04:
@@ -350,8 +361,10 @@ class PrimitiveService:
                 elif stage['kind']=='gripper':
                     with _measure(stage_timings,'gripper_command',timings):
                         actuation_attempted=True
+                        command_state='outcome_unknown'
                         if not r.grip.command_position(100. if stage['open'] else 0.,block=True,timeout=2):
                             raise RuntimeError('Gripper command timeout')
+                        command_state='command_returned'
                     with _measure(stage_timings,'gripper_settle',timings):
                         time.sleep(.25)
                     with _measure(stage_timings,'gripper_verification',timings):
@@ -377,29 +390,37 @@ class PrimitiveService:
             failed_stage=None
             if stage_started is not None:
                 failed_stage={'stage':stage,'stage_index':stage_index,'phase':phase,'status':'failed','duration_s':time.monotonic()-stage_started,
-                              'timings_s':dict(stage_timings)}
-            if self.moveit is not None and not actuation_attempted:
+                              'timings_s':dict(stage_timings),'command_state':command_state}
+            stop_attempted=self.moveit is None or actuation_attempted
+            stopped=None;stop_error=None
+            if not stop_attempted:
                 r.motion_remaining+=operations
-                timings['execute_total']=time.monotonic()-started
-                r.audit('primitive_failed',plan_id=token,status='failed',applied=False,error=str(error),
-                        completed_stages=len(receipts),failed_stage=failed_stage,timings_s=dict(timings))
-                raise
-            stopped=False
-            with _measure(timings,'stop'):
-                try:
-                    r.limb.set_joint_positions(r.joints())
-                    if r.grip.stop(block=False) is False:raise RuntimeError('Gripper stop rejected')
-                    r.ready();stopped=True
-                except Exception as stop_error:r.ros.logwarn('Primitive stop failed: %s',stop_error)
-            timings['execute_total']=time.monotonic()-started
-            r.audit('primitive_failed',plan_id=token,status='failed',error=str(error),completed_stages=len(receipts),
-                    failed_stage=failed_stage,timings_s=dict(timings))
-            if isinstance(error,EmptyGrasp) and stopped:
-                return {'plan_id':token,'skill':skill,'applied':True,'status':'failed',
-                        'failure_code':'empty_grasp','recoverable':True,'stopped':True,
-                        'completed_stages':receipts,'failed_stage':failed_stage,'gripping':False,
-                        'motion_remaining':r.motion_remaining}
-            raise
+            else:
+                stopped=False
+                with _measure(timings,'stop'):
+                    stop_errors=[]
+                    try:r.limb.set_joint_positions(r.joints())
+                    except Exception as failure:stop_errors.append('arm hold: '+str(failure))
+                    try:
+                        if r.grip.stop(block=False) is False:raise RuntimeError('Gripper stop rejected')
+                    except Exception as failure:stop_errors.append('gripper stop: '+str(failure))
+                    try:r.ready()
+                    except Exception as failure:stop_errors.append('stop verification: '+str(failure))
+                    stopped=not stop_errors
+                    if stop_errors:
+                        stop_error='; '.join(stop_errors);r.ros.logwarn('Primitive stop failed: %s',stop_error)
+            if not isinstance(error,Exception):raise
+            measured_commands=sum(item['stage']['kind'] in ('move','gripper') for item in receipts)
+            uncertain=bool(failed_stage and failed_stage['command_state']=='outcome_unknown')
+            applied=(True if measured_commands or (failed_stage and command_state=='command_returned')
+                     else None if uncertain else False)
+            empty=isinstance(error,EmptyGrasp)
+            return {'plan_id':token,'skill':skill,'status':'failed','failure_code':'empty_grasp' if empty else 'execution_failed',
+                    'failure_type':type(error).__name__,'message':str(error),'applied':applied,
+                    'completed_stages':receipts,'completed_stage_count':len(receipts),'confirmed_commands':measured_commands,
+                    'failed_stage':failed_stage,'outcome_uncertain':uncertain or stopped is False,'recoverable':bool(empty and stopped),
+                    'retryable':False,'stop_attempted':stop_attempted,'stopped':stopped,'stop_error':stop_error,
+                    'gripping':False if empty else None,'motion_remaining':r.motion_remaining}
         finally:
             if actuation_attempted:
                 r.wrist_after_motion=time.monotonic()

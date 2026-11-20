@@ -209,6 +209,28 @@ class RecoveryProtocol(unittest.TestCase):
         r.move_segment.assert_not_called();r.grip.command_position.assert_not_called()
         self.assertEqual(result['stages'][-1],{'kind':'verify_grasp','held':True})
 
+    def test_empty_clear_view_revalidates_the_same_tool_geometry_at_every_stage(self):
+        service,r,modules=self.make_service()
+        service.observation=({'id':'o','state':state(False)},time.monotonic(),None)
+        r.cfg['planning']={'trajectory_mode':'continuous'}
+        r.cfg['primitives']['calibrated']=True
+        r.armed=True
+        r.grip.gripping.return_value=False
+        r.arrival_error.return_value=(0.,0.)
+        service._check_curve=Mock(return_value={'nominal_duration_s':1.,'joint_speed_limit_rad_s':.12})
+        empty=Mock()
+        regular=Mock(side_effect=AssertionError('Held-object geometry used for empty clear_view'))
+        with patch.object(type(r),'check_empty_clear_view_path',empty,create=True), \
+             patch.object(type(r),'check_other_arm_path',regular,create=True),patch.dict('sys.modules',modules):
+            prepared=service.prepare('o','clear_view',view_index=1)
+            receipt=service.execute(prepared['plan_id'])
+        self.assertEqual(receipt['status'],'completed')
+        moves=sum(s['kind']=='move' for s in prepared['stages'])
+        self.assertGreater(moves,1)
+        self.assertEqual(empty.call_count,1+moves)
+        regular.assert_not_called()
+        r.grip.command_position.assert_not_called()
+
     def test_model_mismatch_never_becomes_recoverable_ik_error(self):
         service,r,modules=self.make_service()
         r.continuous_ik.solve.side_effect=ValueError('KDL and measured endpoint disagree')

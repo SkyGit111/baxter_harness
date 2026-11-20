@@ -358,7 +358,8 @@ class TaskExecutive:
         """Consume executor facts, not model claims. Automatic recovery is not task completion."""
         if name == 'finish':
             if fields.get('status') != 'done': self.failures.append(fields.get('status', 'stopped'))
-            self.finish('verified' if fields.get('status') == 'done' and self.task_verified else 'blocked')
+            if fields.get('outcome_uncertain') is True:self.finish('unknown')
+            else:self.finish('verified' if fields.get('status') == 'done' and self.task_verified else 'blocked')
             return
         if name == 'recovery':
             self.recoveries.append(fields.get('kind', 'unknown'))
@@ -387,7 +388,10 @@ class TaskExecutive:
             self.primitive_evidence=primitive_measurements(fields)
             self.applied+=self.primitive_evidence['commands_applied'] or 0
             self.released=self.primitive_evidence['confirmed_release'] is True
-            if fields.get('status') == 'failed': self.failed(fields.get('failure_code', 'execution_failed'))
+            if fields.get('status') == 'failed':
+                self.failed(fields.get('failure_code','execution_failed'))
+                self.feedback.update({k:fields[k] for k in ('applied','message','outcome_uncertain','stopped','failed_stage','confirmed_commands') if k in fields})
+                if fields.get('recoverable') is False:self.current['status']='failed'
             elif fields.get('status') == 'completed' and fields.get('applied') is True:
                 self.primitive_ok = True; self.current['status'] = 'awaiting_verification'; self.dispatch = None
                 # Verify_grasp stages belong to this primitive. Do not mistake a planned release for a drop.

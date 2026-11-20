@@ -354,6 +354,14 @@ class Baxter:
             obs['camera_metadata']['wrist']={'source':self.cfg['arm']+'_wrist','arm':self.cfg['arm'],
                                             'frame_number':getattr(wrist[1].header,'seq',None),
                                             'age_s':round(ended-wrist[0],4)}
+        elif auxiliary_wrist:
+            candidate=getattr(self,'wrist_state',None)
+            if candidate is None:reason='no_frame_received'
+            elif candidate[0]<=getattr(self,'wrist_after_motion',-math.inf):reason='captured_before_motion_ended'
+            elif candidate[0]<=getattr(self,'last_aux_wrist',-math.inf):reason='already_used'
+            else:reason='stale_at_observation'
+            obs['camera_metadata']['wrist']={'arm':self.cfg['arm'],'omitted_reason':reason,
+                                            'age_s':round(ended-candidate[0],4) if candidate else None}
         obs['timings_s']={'wrist_wait':before_camera-began,'camera_capture':after_camera-before_camera,'state_read':after_state-after_camera,
                           'wrist_image':ended-after_state,'baxter_observe_total':ended-began}
         return obs

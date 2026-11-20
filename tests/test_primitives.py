@@ -70,17 +70,22 @@ class Execution(unittest.TestCase):
     def test_ik_tracking_failure_prevents_release(self):
         s,r=self.service([{'kind':'move'},{'kind':'gripper','open':True}],True)
         r.arrival_error.return_value=(.03,0.)
-        with self.assertRaisesRegex(RuntimeError,'reach target'):s.execute('token')
+        receipt=s.execute('token');self.assertIn('reach target',receipt['message'])
+        self.assertTrue(receipt['applied']);self.assertIs(receipt['recoverable'],False)
+        self.assertEqual(receipt['failed_stage']['command_state'],'command_returned')
         r.grip.command_position.assert_not_called()
     def test_failed_stop_never_returns_recoverable_empty_grasp(self):
         s,r=self.service([{'kind':'gripper','open':False},{'kind':'verify_grasp','held':True}])
         r.limb.set_joint_positions.side_effect=RuntimeError('Stop unavailable')
-        with self.assertRaisesRegex(RuntimeError,'Empty grasp'):s.execute('token')
+        receipt=s.execute('token');self.assertIn('Empty grasp',receipt['message'])
+        self.assertFalse(receipt['recoverable']);self.assertFalse(receipt['stopped'])
+        self.assertIn('unavailable',receipt['stop_error'])
         with self.assertRaises(ValueError):s.execute('token')
     def test_object_lost_after_lift_is_not_reported_as_empty_grasp(self):
         s,r=self.service([{'kind':'verify_grasp','held':True},{'kind':'verify_grasp','held':True}],True)
         r.grip.gripping.side_effect=[True,True,False]
-        with self.assertRaisesRegex(RuntimeError,'lost'):s.execute('token')
+        receipt=s.execute('token');self.assertIn('lost',receipt['message'])
+        self.assertEqual(receipt['status'],'failed');self.assertFalse(receipt['recoverable'])
     def test_success_and_no_replay(self):
         s,r=self.service([{'kind':'gripper','open':True}])
         self.assertTrue(s.execute('token')['applied'])

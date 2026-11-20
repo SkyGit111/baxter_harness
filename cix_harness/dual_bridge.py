@@ -263,7 +263,17 @@ class DualBridge:
                 self.check_running_arm(arm)
                 result=self.services[arm].execute(plan_id)
                 result['selected_arm']=arm
-                result['arm_states']={selected:self.robots[selected].read_state() for selected in ARMS}
+                result['arm_states']={};state_errors={}
+                for selected in ARMS:
+                    try:result['arm_states'][selected]=self.robots[selected].read_state()
+                    except Exception as error:state_errors[selected]=str(error)
+                if state_errors:
+                    result['arm_state_errors']=state_errors
+                    if result['status']=='completed':
+                        result.update(status='failed',failure_code='post_execution_observation_failed',
+                                      message='Post-execution arm telemetry unavailable',outcome_uncertain=True,
+                                      retryable=False,stopped=None,stop_attempted=False)
+                    result['recoverable']=False
                 result.setdefault('timings_s',{})['dual_execute_total']=time.monotonic()-began
                 return result
             finally:

@@ -66,6 +66,8 @@ def select_images(obs, mode='scene_wrist', max_wrist_age_s=AUX_WRIST_MAX_AGE_S):
     reason='disabled' if mode=='scene' else 'missing'
     wrist=metadata.get('wrist',{})
     age=_age(wrist.get('age_s',state.get('wrist_age_s')))
+    if mode=='scene_wrist' and 'wrist_image' not in obs and wrist.get('omitted_reason'):
+        reason=wrist['omitted_reason']
     if mode=='scene_wrist' and 'wrist_image' in obs:
         if arm is None:reason='unknown_arm'
         elif wrist.get('arm',arm)!=arm:reason='arm_mismatch'
