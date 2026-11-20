@@ -2,6 +2,10 @@
 
 接手开发请先阅读 [项目完整交接](docs/项目完整交接.md)，包含当前路线、源码地图、现场验证边界、部署流程与后续计划。
 
+使用 Codex 开发时，仓库根目录的 [AGENTS.md](AGENTS.md) 规定怎样把改进落实到正常入口并验证。排查 Baxter 运行失败或执行过慢时，可调用 [`$baxter-run-repair`](.agents/skills/baxter-run-repair/SKILL.md)。Codex 在新运行开始时发现仓库指令，技能通过名称和描述匹配任务。[OpenAI 的 AGENTS.md 指南](https://developers.openai.com/codex/guides/agents-md) · [OpenAI 的 SKILL.md 指南](https://developers.openai.com/codex/skills)
+
+机器人高层通过 [task_plan.py](cix_harness/task_plan.py) 组装计划与检查提示，再由 [api_planner.py](cix_harness/api_planner.py) 发送 Responses 请求。仓库开发指令和 Codex 技能由开发助手读取。要在现有 API 规划命令中指定 GPT‑6.2 Astra，可传 `--api-model gpt-6.2-astra`；当前默认仍为 `gpt-6-astra`。[GPT‑6.2 Astra 官方模型说明](https://developers.openai.com/api/docs/models/gpt-6.2-astra)
+
 **版本提示：交接文档的旧现状以本文下述更新为补充。11 月 17 日完成双臂与全桌版本的离线准备；最后一次真机验收仍是 11 月 13 日的左臂抓取。**
 
 ## 2026-11-17 全桌与双臂 Agent 版本
